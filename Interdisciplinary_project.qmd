@@ -1,0 +1,276 @@
+---
+title: "Interdisciplinary project"
+format: html
+editor: visual
+---
+
+
+```{r}
+# Load libraries
+library(GEOquery)
+library(Biobase)
+library(caret)
+library(janitor)
+library(survival)
+library(data.table)
+library(glmnet)
+library(matrixStats)
+library(randomForest)
+library(pbapply)
+library(dplyr)
+library(sva)
+library(devtools)
+library(limma)
+#GSE104293 -> glima 68 68 for survival
+
+```
+
+```{r}
+GSE7904 <- getGEO(filename = "GSE7904_series_matrix.txt")
+GSE9574 <- getGEO(filename = "GSE9574_series_matrix.txt")
+GSE15852 <- getGEO(filename = "GSE15852_series_matrix.txt")
+GSE29431 <- getGEO(filename = "GSE29431_series_matrix.txt")
+GSE45827 <- getGEO(filename = "GSE45827_series_matrix.txt")
+GSE54002 <- getGEO(filename = "GSE54002_series_matrix.txt")
+
+metadata_GSE7904 <- pData(GSE7904)
+metadata_GSE9574 <- pData(GSE9574)
+metadata_GSE15852<- pData(GSE15852)
+metadata_GSE29431 <- pData(GSE29431)
+metadata_GSE45827 <- pData(GSE45827)
+metadata_GSE54002 <- pData(GSE54002)
+
+
+
+# Recode into a new 'Status' column
+metadata_GSE7904 <- metadata_GSE7904 %>%
+  mutate(Status = case_when(
+    characteristics_ch1 == "NB" ~ "cell",
+    characteristics_ch1 == "NO" ~ "control",
+    TRUE ~ "tumor" # Captures Basal, BRCA1, and non-BLC
+  ))
+
+
+metadata_GSE9574<- metadata_GSE9574%>%
+  mutate(Status = case_when(
+    characteristics_ch1 == "disease-state: normal (reduction mammoplasty)" ~ "control",
+    TRUE ~ "tumor"
+  ))
+
+metadata_GSE15852<- metadata_GSE15852%>%
+  mutate(Status = case_when(
+    source_name_ch1 == "normal breast tissue" ~ "control",
+    TRUE ~ "tumor"
+  ))
+
+metadata_GSE29431 <- metadata_GSE29431 %>%
+  mutate(Status = case_when(
+    grepl("^Normal", title, ignore.case = TRUE) ~ "control",
+    TRUE ~ "tumor"
+  ))
+
+
+metadata_GSE45827 <- metadata_GSE45827 %>%
+  mutate(Status = case_when(
+    grepl("CellLine",source_name_ch1,ignore.case=TRUE) ~ "cell",
+    grepl("Human Normal",source_name_ch1,ignore.case=TRUE) ~ "control",
+    TRUE ~ "tumor"
+  ))
+
+metadata_GSE54002<- metadata_GSE54002%>%
+  mutate(Status = case_when(
+    characteristics_ch1 == "tumor/nontumor: Non-tumor" ~ "control",
+    TRUE ~ "tumor"
+  ))
+
+
+# List of all your metadata objects
+metadata_list <- list(
+  GSE7904 = metadata_GSE7904,
+  GSE9574 = metadata_GSE9574,
+  GSE15852 = metadata_GSE15852,
+  GSE29431 = metadata_GSE29431,
+  GSE45827 = metadata_GSE45827,
+  GSE54002 = metadata_GSE54002
+)
+
+# Filter each to keep only control and tumor, then add a Study ID
+cleaned_metadata_list <- lapply(names(metadata_list), function(x) {
+  metadata_list[[x]] %>%
+    filter(Status %in% c("control", "tumor")) %>%
+    mutate(Study = x, SampleID = rownames(.)) %>%
+    select(SampleID, Status, Study)
+})
+
+# Combine into one master metadata table
+master_metadata <- bind_rows(cleaned_metadata_list)
+rownames(master_metadata) <- master_metadata$SampleID
+
+table(metadata_GSE54002$Status)
+```
+
+#Filter expression matrices
+
+```{r}
+
+check_and_log_fixed <- function(gse_obj) {
+  ex <- exprs(gse_obj)
+  
+  # Only transform if raw (max > 50)
+  if (max(ex, na.rm = TRUE) > 50) {
+    message("Log-transforming raw data with flooring...")
+    
+    # Floor negative values to a small positive number (e.g., 1) 
+    # so that log2(1) = 0
+    ex[ex <= 0] <- 1 
+    exprs(gse_obj) <- log2(ex)
+    
+  } else {
+    message("Data is already log-scaled.")
+  }
+  return(gse_obj)
+}
+
+# Apply the fixed function
+GSE7904  <- check_and_log_fixed(GSE7904)
+GSE9574  <- check_and_log_fixed(GSE9574)
+GSE15852 <- check_and_log_fixed(GSE15852)
+# List of expression objects
+exp_list <- list(
+  GSE7904 = exprs(GSE7904),
+  GSE9574 = exprs(GSE9574),
+  GSE15852 = exprs(GSE15852),
+  GSE29431 = exprs(GSE29431),
+  GSE45827 = exprs(GSE45827),
+  GSE54002 = exprs(GSE54002)
+)
+
+# Filter matrices to include only the 'control' and 'tumor' samples
+exp_filtered <- lapply(names(exp_list), function(x) {
+  samples_to_keep <- master_metadata$SampleID[master_metadata$Study == x]
+  exp_list[[x]][, samples_to_keep, drop = FALSE]
+})
+
+# Find common probes/genes across ALL datasets
+common_probes<- Reduce(intersect, lapply(exp_filtered, rownames))
+length(common_probes)
+
+# Subset all matrices to these common genes and column-bind
+merged_expression <- do.call(cbind, lapply(exp_filtered, function(x) x[common_probes, ]))
+dim(merged_expression)
+
+
+fData(GSE15852)
+```
+#Batch Correction
+```{r}
+
+mod <- model.matrix(~as.factor(Status), data = master_metadata)
+
+# Run ComBat to remove the 'Study' effect
+# This might take a minute depending on your RAM
+final_expression_clean <- ComBat(dat = merged_expression, 
+                                 batch = master_metadata$Study, 
+                                 mod = mod,
+                                 par.prior = TRUE) # Uses parametric empirical Bayes
+```
+```{r}
+# 1. Transpose the matrix (PCA expects samples as rows, genes as columns)
+pca_data <- t(final_expression_clean)
+
+# 2. Run PCA (scale. = TRUE is recommended for gene expression)
+pca_res <- prcomp(pca_data, scale. = TRUE)
+
+# 3. Create a plotting dataframe
+# We join the PCA coordinates with your master_metadata
+pca_plot_df <- data.frame(
+  SampleID = rownames(pca_res$x),
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Study = master_metadata$Study,
+  Status = master_metadata$Status
+)
+
+# 4. Calculate variance explained for the axis labels
+var_explained <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+# 5. Plot coloring by Study
+ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Status)) +
+  geom_point(alpha = 0.7, size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Merged Breast Cancer Datasets (Post-ComBat)",
+    subtitle = "Checking for remaining Batch Effects",
+    x = paste0("PC1 (", var_explained[1], "%)"),
+    y = paste0("PC2 (", var_explained[2], "%)")
+  ) +
+  scale_color_brewer(palette = "Set1") # Good for distinguishing 5-6 studies
+
+
+```
+```{r}
+library(pheatmap)
+library(matrixStats)
+
+# 1. Sort the metadata and the expression matrix by 'Status'
+# This ensures all 'control' are on the left and 'tumor' on the right
+ordered_indices <- order(master_metadata$Status)
+metadata_sorted <- master_metadata[ordered_indices, ]
+expression_sorted <- final_expression_clean[, ordered_indices]
+
+# 2. Select the top 50 genes (as you did before)
+rv <- rowVars(expression_sorted)
+idx <- order(rv, decreasing = TRUE)[1:50]
+
+# 3. Plot without column clustering
+pheatmap(expression_sorted[idx, ], 
+         annotation_col = metadata_sorted[, "Status", drop=FALSE],
+         cluster_cols = FALSE,   # This stops the patients from being clustered
+         show_colnames = FALSE, 
+         main = "Top 50 Varied Genes: Grouped by Status",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         scale = "row")         # Highly recommended to see gene-wise changes
+```
+
+
+
+```{r}
+library(randomForest)
+library(caret)
+
+# 1. Prepare Data
+# Transpose expression matrix: Samples as rows, Genes as columns
+X <- t(final_expression_clean)
+y <- as.factor(master_metadata$Status)
+
+# 2. Split into Training (70%) and Testing (30%)
+set.seed(123) # For reproducibility
+trainIndex <- createDataPartition(y, p = 0.7, list = FALSE)
+
+X_train <- X[trainIndex, ]
+y_train <- y[trainIndex]
+X_test  <- X[-trainIndex, ]
+y_test  <- y[-trainIndex]
+
+# 3. Train Random Forest 
+# We use 'sampsize' to handle class imbalance (undersampling the majority class)
+table(y_train) # Check your counts
+min_class <- min(table(y_train))
+
+rf_model <- randomForest(
+  x = X_train, 
+  y = y_train, 
+  ntree = 500, 
+  importance = TRUE,
+  sampsize = c(min_class, min_class) # Forces equal representation in each tree
+)
+
+# 4. Evaluate the Model
+predictions <- predict(rf_model, X_test)
+conf_matrix <- confusionMatrix(predictions, y_test)
+print(conf_matrix)
+
+# 5. Find Top Biomarkers (Important Genes)
+varImpPlot(rf_model, n.var = 20, main = "Top 20 Gene Predictors for Breast Cancer")
+```
+
