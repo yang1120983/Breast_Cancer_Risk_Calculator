@@ -480,6 +480,32 @@ cat("Selected genes for multiclass:", length(genes_mc), "\n")
 X_mc <- t(e_mc[intersect(genes_mc, rownames(e_mc)), , drop = FALSE])
 ```
 
+## PCA (multiclass, merged)
+
+```{r, fig.cap="PCA of merged multiclass expression (after imputation + scaling). Points coloured by PAM50 subtype."}
+#| message: false
+#| warning: false
+# PCA is for visualisation only; we impute/scale using whole merged dataset (not CV-safe).
+imp_mc_all <- impute_fit(X_mc)
+X_mc_i_all <- impute_apply(X_mc, imp_mc_all)
+sc_mc_all <- standardize_fit(X_mc_i_all)
+X_mc_s_all <- standardize_apply(X_mc_i_all, sc_mc_all)
+
+pca_mc <- prcomp(X_mc_s_all, center = FALSE, scale. = FALSE)
+pca_mc_df <- data.frame(
+  PC1 = pca_mc$x[, 1],
+  PC2 = pca_mc$x[, 2],
+  truth = y_mc,
+  dataset_id = pMat_big_mc$dataset_id[ok_mc]
+)
+
+ggplot(pca_mc_df, aes(x = PC1, y = PC2, color = truth)) +
+  geom_point(alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "Subtype", title = "Multiclass PCA (merged)") +
+  theme(legend.position = "right")
+```
+
 ```{r}
 #| message: false
 #| warning: false
@@ -588,6 +614,58 @@ ggplot(tab_mc_df, aes(x = pred, y = truth, fill = Freq)) +
   theme_bw() +
   labs(x = "Predicted", y = "True", title = paste0("Multiclass confusion matrix: ", best_model_mc)) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Best model separation (multiclass)
+
+```{r, fig.cap="Best multiclass model: PCA view with refit predictions on the full merged dataset (visualisation only)."}
+#| message: false
+#| warning: false
+fit_predict_best_multiclass <- function(best_model, X, y) {
+  y <- factor(y)
+  imp <- impute_fit(X)
+  X_i <- impute_apply(X, imp)
+
+  if (best_model %in% c("kNN", "SVM_RBF", "Multinom")) {
+    sc <- standardize_fit(X_i)
+    X_s <- standardize_apply(X_i, sc)
+  } else {
+    X_s <- X_i
+  }
+
+  if (best_model == "kNN") {
+    pred <- class::knn(train = X_s, test = X_s, cl = y, k = 7)
+    return(list(pred = pred))
+  }
+  if (best_model == "SVM_RBF") {
+    fit <- e1071::svm(x = X_s, y = y, kernel = "radial", cost = 1, gamma = 1 / ncol(X_s))
+    pred <- predict(fit, X_s)
+    return(list(pred = pred))
+  }
+  if (best_model == "RF") {
+    fit <- randomForest::randomForest(x = X_s, y = y)
+    pred <- predict(fit, X_s)
+    return(list(pred = pred))
+  }
+  if (best_model == "Multinom") {
+    if (!requireNamespace("nnet", quietly = TRUE)) stop("Package 'nnet' not installed; can't fit Multinom.")
+    fit <- nnet::multinom(y ~ ., data = data.frame(y = y, X_s), trace = FALSE, MaxNWts = 50000)
+    pred <- predict(fit, newdata = data.frame(X_s))
+    return(list(pred = pred))
+  }
+  stop("Unknown multiclass model name: ", best_model)
+}
+
+pred_full_mc <- fit_predict_best_multiclass(best_model_mc, X_mc, y_mc)$pred
+
+pca_mc_pred_df <- pca_mc_df %>%
+  mutate(pred = pred_full_mc)
+
+ggplot(pca_mc_pred_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = truth, shape = pred), alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "True", shape = "Pred (refit)", title = paste0("Best multiclass model separation: ", best_model_mc)) +
+  theme(legend.position = "right")
 ```
 
 ## Binary DE gene selection (merged dataset)
@@ -716,7 +794,7 @@ best_threshold_f1 <- function(truth, score_pos, positive = "Normal") {
   cand[which.max(f1)]
 }
 
-run_repeated_cv_binary <- function(X, y, K = 4, repeats = 20, positive = "Normal") {
+run_repeated_cv_binary <- function(X, y, K = 4, repeats = 20, positive = "Normal", use_weights = TRUE) {
   y <- factor(y)
   n <- nrow(X)
 
@@ -757,44 +835,67 @@ run_repeated_cv_binary <- function(X, y, K = 4, repeats = 20, positive = "Normal
       win_prob <- attr(pred_knn, "prob")
       score_knn <- ifelse(pred_knn == positive, win_prob, 1 - win_prob)
       m_knn <- binary_metrics(y_test, pred_knn, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary", model="kNN", rep=r, fold=k, m_knn))
-      all_preds <- rbind(all_preds, data.frame(task="binary", model="kNN", rep=r, fold=k, truth=y_test, pred=pred_knn))
-      all_scores <- rbind(all_scores, data.frame(task="binary", model="kNN", rep=r, fold=k, truth=y_test, score_normal=score_knn))
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model="kNN", rep=r, fold=k, m_knn))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model="kNN", rep=r, fold=k, truth=y_test, pred=pred_knn))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model="kNN", rep=r, fold=k, truth=y_test, score_normal=score_knn))
 
-      # ---- weighted SVM ----
+      # ---- SVM ----
       svm_fit <- e1071::svm(
         x = X_train_s, y = y_train, kernel = "radial",
         cost = 1, gamma = 1 / ncol(X_train_s),
-        class.weights = cw, probability = TRUE
+        probability = TRUE,
+        class.weights = if (use_weights) cw else NULL
       )
       pred_svm <- predict(svm_fit, X_test_s, probability = TRUE)
       prob_svm <- attr(pred_svm, "probabilities")
       score_svm <- if ("Normal" %in% colnames(prob_svm)) prob_svm[, "Normal"] else prob_svm[, 1]
       m_svm <- binary_metrics(y_test, pred_svm, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary", model="SVM_RBF_w", rep=r, fold=k, m_svm))
-      all_preds <- rbind(all_preds, data.frame(task="binary", model="SVM_RBF_w", rep=r, fold=k, truth=y_test, pred=pred_svm))
-      all_scores <- rbind(all_scores, data.frame(task="binary", model="SVM_RBF_w", rep=r, fold=k, truth=y_test, score_normal=score_svm))
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                     rep=r, fold=k, m_svm))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_svm))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=score_svm))
 
-      # ---- weighted RF ----
-      rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train, classwt = cw)
+      # ---- RF ----
+      rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train, classwt = if (use_weights) cw else NULL)
       pred_rf <- predict(rf_fit, X_test_i)
       prob_rf <- predict(rf_fit, X_test_i, type = "prob")
       score_rf <- if ("Normal" %in% colnames(prob_rf)) prob_rf[, "Normal"] else prob_rf[, 1]
       m_rf <- binary_metrics(y_test, pred_rf, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary", model="RF_w", rep=r, fold=k, m_rf))
-      all_preds <- rbind(all_preds, data.frame(task="binary", model="RF_w", rep=r, fold=k, truth=y_test, pred=pred_rf))
-      all_scores <- rbind(all_scores, data.frame(task="binary", model="RF_w", rep=r, fold=k, truth=y_test, score_normal=score_rf))
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "RF_w", "RF"),
+                                     rep=r, fold=k, m_rf))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "RF_w", "RF"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_rf))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "RF_w", "RF"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=score_rf))
 
-      # ---- weighted logistic regression ----
-      w <- ifelse(y_train == positive, pos_w, 1)
-      glm_fit <- glm(y_train ~ ., data = data.frame(y_train = y_train, X_train_s), family = binomial(), weights = w)
+      # ---- Logistic regression ----
+      w <- if (use_weights) ifelse(y_train == positive, pos_w, 1) else rep(1, length(y_train))
+      glm_fit <- glm(y_train ~ ., data = data.frame(y_train = y_train, X_train_s),
+                     family = binomial(), weights = w)
       p_hat <- predict(glm_fit, newdata = data.frame(X_test_s), type = "response")
       pred_glm <- ifelse(p_hat >= 0.5, positive, setdiff(levels(y_train), positive)[1])
       pred_glm <- factor(pred_glm, levels = levels(y_train))
       m_glm <- binary_metrics(y_test, pred_glm, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary", model="Logistic_w", rep=r, fold=k, m_glm))
-      all_preds <- rbind(all_preds, data.frame(task="binary", model="Logistic_w", rep=r, fold=k, truth=y_test, pred=pred_glm))
-      all_scores <- rbind(all_scores, data.frame(task="binary", model="Logistic_w", rep=r, fold=k, truth=y_test, score_normal=p_hat))
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                     rep=r, fold=k, m_glm))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_glm))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=p_hat))
     }
   }
 
@@ -816,7 +917,37 @@ cat("Binary class counts:\n")
 print(table(y_bin2))
 
 res_bin <- run_repeated_cv_binary(X_bin, y_bin2, K = 4, repeats = 20, positive = "Normal")
-perf_bin <- res_bin$perf
+res_bin_unw <- run_repeated_cv_binary(X_bin, y_bin2, K = 4, repeats = 20, positive = "Normal", use_weights = FALSE)
+
+perf_bin <- bind_rows(res_bin$perf, res_bin_unw$perf)
+preds_bin <- bind_rows(res_bin$preds, res_bin_unw$preds)
+scores_bin <- bind_rows(res_bin$scores, res_bin_unw$scores)
+```
+
+## PCA (binary, merged)
+
+```{r, fig.cap="PCA of merged binary expression (after imputation + scaling). Points coloured by class."}
+#| message: false
+#| warning: false
+# PCA is for visualisation only; we impute/scale using whole merged dataset (not CV-safe).
+imp_bin_all <- impute_fit(X_bin)
+X_bin_i_all <- impute_apply(X_bin, imp_bin_all)
+sc_bin_all <- standardize_fit(X_bin_i_all)
+X_bin_s_all <- standardize_apply(X_bin_i_all, sc_bin_all)
+
+pca_bin <- prcomp(X_bin_s_all, center = FALSE, scale. = FALSE)
+pca_bin_df <- data.frame(
+  PC1 = pca_bin$x[, 1],
+  PC2 = pca_bin$x[, 2],
+  truth = y_bin2,
+  dataset_id = pMat_big_bin$dataset_id[ok_bin]
+)
+
+ggplot(pca_bin_df, aes(x = PC1, y = PC2, color = truth)) +
+  geom_point(alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "Class", title = "Binary PCA (merged)") +
+  theme(legend.position = "right")
 ```
 
 ```{r, fig.cap="Binary performance: balanced metrics across models (stratified repeated 4-fold CV)."}
@@ -829,27 +960,42 @@ perf_bin_long <- perf_bin %>%
     values_to = "value"
   )
 
-ggplot(perf_bin_long, aes(x = model, y = value, fill = model)) +
+perf_bin_long_w <- perf_bin_long %>% filter(setting == "weighted")
+perf_bin_long_unw <- perf_bin_long %>% filter(setting == "unweighted")
+
+p_w <- ggplot(perf_bin_long_w, aes(x = model, y = value, fill = model)) +
   geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
   facet_wrap(~metric, scales = "free_y") +
   theme_bw() +
-  labs(x = "", y = "", title = "Binary model comparison (imbalance-aware metrics)") +
+  labs(x = "", y = "", title = "Binary model comparison (weighted)") +
   theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+
+p_unw <- ggplot(perf_bin_long_unw, aes(x = model, y = value, fill = model)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_bw() +
+  labs(x = "", y = "", title = "Binary model comparison (unweighted)") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+
+print(p_w)
+print(p_unw)
 ```
 
 ```{r, fig.cap="Binary: confusion matrix for best model after threshold tuning (max F1 for Normal)."}
 #| message: false
 #| warning: false
-best_model_bin <- perf_bin %>%
-  group_by(model) %>%
+best_run_bin <- perf_bin %>%
+  group_by(setting, model) %>%
   summarise(mean = mean(balanced_accuracy, na.rm = TRUE), .groups = "drop") %>%
   arrange(desc(mean)) %>%
   slice(1) %>%
-  pull(model)
+  slice(1)
 
-cat("Best binary model by mean balanced accuracy:", best_model_bin, "\n")
+best_setting_bin <- best_run_bin$setting[1]
+best_model_bin <- best_run_bin$model[1]
+cat("Best binary run by mean balanced accuracy:", best_setting_bin, "/", best_model_bin, "\n")
 
-score_best <- res_bin$scores %>% filter(model == best_model_bin)
+score_best <- scores_bin %>% filter(setting == best_setting_bin, model == best_model_bin)
 thr_best <- best_threshold_f1(score_best$truth, score_best$score_normal, positive = "Normal")
 cat("Chosen threshold (max pooled F1 for Normal):", round(thr_best, 4), "\n")
 
@@ -867,10 +1013,30 @@ ggplot(tab_bin_df, aes(x = pred, y = truth, fill = Freq)) +
   theme(legend.position = "right")
 ```
 
+## Best model separation (binary)
+
+```{r, fig.cap="Best binary model: score separation with chosen threshold (pooled CV scores)."}
+#| message: false
+#| warning: false
+sep_df <- score_best %>%
+  mutate(truth = factor(truth, levels = c("Cancer", "Normal")))
+
+ggplot(sep_df, aes(x = score_normal, fill = truth)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = thr_best, linetype = 2, linewidth = 1) +
+  theme_bw() +
+  labs(
+    x = "Predicted P(Normal)",
+    y = "Density",
+    fill = "True class",
+    title = paste0("Binary separation (", best_model_bin, "): pooled CV scores + threshold")
+  )
+```
+
 ```{r, fig.cap="Binary: pooled ROC and PR curves for the best model."}
 #| message: false
 #| warning: false
-curve_best <- res_bin$scores %>% filter(model == best_model_bin)
+curve_best <- scores_bin %>% filter(setting == best_setting_bin, model == best_model_bin)
 truth01 <- as.integer(curve_best$truth == "Normal")
 score <- curve_best$score_normal
 
@@ -919,22 +1085,22 @@ print(p2)
 #| warning: false
 # Weighted binary: probability metrics (pooled CV predictions)
 model_auc <- res_bin$scores %>%
-  group_by(model) %>%
+  group_by(setting, model) %>%
   summarise(
     roc_auc = auc_roc(truth == "Normal", score_normal),
     pr_auc = auc_pr(truth == "Normal", score_normal),
     .groups = "drop"
   )
 
-knitr::kable(model_auc, caption = "Binary (weighted): probability metrics (pooled CV predictions)")
+knitr::kable(model_auc, caption = "Binary: probability metrics (pooled CV predictions), weighted vs unweighted")
 ```
 
 ```{r}
 #| message: false
 #| warning: false
-# Weighted binary: aggregate metrics table (mean ± SD) plus ROC/PR AUC
+# Binary: aggregate metrics table (mean ± SD) plus ROC/PR AUC, weighted vs unweighted
 model_summary <- perf_bin %>%
-  group_by(model) %>%
+  group_by(setting, model) %>%
   summarise(
     accuracy_mean = mean(accuracy, na.rm = TRUE),
     accuracy_sd = sd(accuracy, na.rm = TRUE),
@@ -948,7 +1114,7 @@ model_summary <- perf_bin %>%
     f1_sd = sd(f1_normal, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  left_join(model_auc, by = "model") %>%
+  left_join(model_auc, by = c("setting", "model")) %>%
   mutate(
     accuracy = sprintf("%.3f \u00B1 %.3f", accuracy_mean, accuracy_sd),
     balanced_accuracy = sprintf("%.3f \u00B1 %.3f", balanced_accuracy_mean, balanced_accuracy_sd),
@@ -958,233 +1124,62 @@ model_summary <- perf_bin %>%
     roc_auc = round(roc_auc, 3),
     pr_auc = round(pr_auc, 3)
   ) %>%
-  select(model, accuracy, balanced_accuracy, sensitivity, precision, f1, roc_auc, pr_auc)
+  select(setting, model, accuracy, balanced_accuracy, sensitivity, precision, f1, roc_auc, pr_auc)
 
-knitr::kable(model_summary, caption = "Binary (weighted): summary metrics per model")
+knitr::kable(model_summary, caption = "Binary: summary metrics per model (weighted vs unweighted)")
 ```
 
-### Binary models (unweighted) – Normal vs Cancer
+## How many DE genes do we need? (binary)
 
-```{r}
+```{r, fig.cap="Binary: best balanced accuracy vs number of DE genes (weighted models only)."}
 #| message: false
 #| warning: false
-run_repeated_cv_binary_unweighted <- function(X, y, K = 4, repeats = 20, positive = "Normal") {
-  y <- factor(y)
-  n <- nrow(X)
+# Goal: find the smallest top-N DE gene set that achieves strong performance.
+# We evaluate a grid of N, run the weighted CV once per N, and take the best mean balanced accuracy across models.
 
-  perf <- data.frame()
-  all_preds <- data.frame()
-  all_scores <- data.frame()
+de_gene_sweep <- function(e_bin_de, y_bin_de, n_grid = c(5, 10, 20, 30, 40, 50, 75, 100, 150, 200),
+                          K = 4, repeats = 10, positive = "Normal") {
+  design_bin <- model.matrix(~ y_bin_de)
+  fit_bin <- eBayes(lmFit(e_bin_de, design_bin))
 
-  for (r in seq_len(repeats)) {
-    folds <- make_stratified_folds(y, K = K)
-    for (k in seq_len(K)) {
-      test_id <- folds[[k]]
-      train_id <- setdiff(seq_len(n), test_id)
+  out <- list()
+  for (n_genes in n_grid) {
+    tt <- topTable(fit_bin, n = n_genes, sort.by = "P")
+    genes <- rownames(tt)
+    X <- t(e_bin_de[intersect(genes, rownames(e_bin_de)), , drop = FALSE])
 
-      X_train <- X[train_id, , drop = FALSE]
-      X_test  <- X[test_id, , drop = FALSE]
-      y_train <- y[train_id]
-      y_test  <- y[test_id]
+    # If something went wrong (e.g., no overlap), skip safely
+    if (ncol(X) < 2) next
 
-      imp <- impute_fit(X_train)
-      X_train_i <- impute_apply(X_train, imp)
-      X_test_i  <- impute_apply(X_test, imp)
+    res_w <- run_repeated_cv_binary(X, y_bin_de, K = K, repeats = repeats, positive = positive, use_weights = TRUE)
+    perf_w <- res_w$perf
 
-      sc <- standardize_fit(X_train_i)
-      X_train_s <- standardize_apply(X_train_i, sc)
-      X_test_s  <- standardize_apply(X_test_i, sc)
+    best <- perf_w %>%
+      group_by(model) %>%
+      summarise(mean_bal_acc = mean(balanced_accuracy, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(mean_bal_acc)) %>%
+      slice(1)
 
-      # ---- kNN ----
-      pred_knn <- class::knn(train = X_train_s, test = X_test_s, cl = y_train, k = 7, prob = TRUE)
-      win_prob <- attr(pred_knn, "prob")
-      score_knn <- ifelse(pred_knn == positive, win_prob, 1 - win_prob)
-      m_knn <- binary_metrics(y_test, pred_knn, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary_unw", model="kNN", rep=r, fold=k, m_knn))
-      all_preds <- rbind(all_preds, data.frame(task="binary_unw", model="kNN", rep=r, fold=k, truth=y_test, pred=pred_knn))
-      all_scores <- rbind(all_scores, data.frame(task="binary_unw", model="kNN", rep=r, fold=k, truth=y_test, score_normal=score_knn))
-
-      # ---- SVM (unweighted) ----
-      svm_fit <- e1071::svm(x = X_train_s, y = y_train, kernel = "radial", cost = 1, gamma = 1 / ncol(X_train_s), probability = TRUE)
-      pred_svm <- predict(svm_fit, X_test_s, probability = TRUE)
-      prob_svm <- attr(pred_svm, "probabilities")
-      score_svm <- if ("Normal" %in% colnames(prob_svm)) prob_svm[, "Normal"] else prob_svm[, 1]
-      m_svm <- binary_metrics(y_test, pred_svm, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary_unw", model="SVM_RBF", rep=r, fold=k, m_svm))
-      all_preds <- rbind(all_preds, data.frame(task="binary_unw", model="SVM_RBF", rep=r, fold=k, truth=y_test, pred=pred_svm))
-      all_scores <- rbind(all_scores, data.frame(task="binary_unw", model="SVM_RBF", rep=r, fold=k, truth=y_test, score_normal=score_svm))
-
-      # ---- RF (unweighted) ----
-      rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train)
-      pred_rf <- predict(rf_fit, X_test_i)
-      prob_rf <- predict(rf_fit, X_test_i, type = "prob")
-      score_rf <- if ("Normal" %in% colnames(prob_rf)) prob_rf[, "Normal"] else prob_rf[, 1]
-      m_rf <- binary_metrics(y_test, pred_rf, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary_unw", model="RF", rep=r, fold=k, m_rf))
-      all_preds <- rbind(all_preds, data.frame(task="binary_unw", model="RF", rep=r, fold=k, truth=y_test, pred=pred_rf))
-      all_scores <- rbind(all_scores, data.frame(task="binary_unw", model="RF", rep=r, fold=k, truth=y_test, score_normal=score_rf))
-
-      # ---- Logistic regression (unweighted) ----
-      glm_fit <- glm(y_train ~ ., data = data.frame(y_train = y_train, X_train_s), family = binomial())
-      p_hat <- predict(glm_fit, newdata = data.frame(X_test_s), type = "response")
-      pred_glm <- ifelse(p_hat >= 0.5, positive, setdiff(levels(y_train), positive)[1])
-      pred_glm <- factor(pred_glm, levels = levels(y_train))
-      m_glm <- binary_metrics(y_test, pred_glm, positive = positive)
-      perf <- rbind(perf, data.frame(task="binary_unw", model="Logistic", rep=r, fold=k, m_glm))
-      all_preds <- rbind(all_preds, data.frame(task="binary_unw", model="Logistic", rep=r, fold=k, truth=y_test, pred=pred_glm))
-      all_scores <- rbind(all_scores, data.frame(task="binary_unw", model="Logistic", rep=r, fold=k, truth=y_test, score_normal=p_hat))
-    }
+    out[[as.character(n_genes)]] <- data.frame(
+      n_genes = n_genes,
+      best_model = best$model[1],
+      best_mean_balanced_accuracy = best$mean_bal_acc[1]
+    )
   }
-
-  list(perf = perf, preds = all_preds, scores = all_scores)
+  bind_rows(out)
 }
-```
 
-```{r}
-#| message: false
-#| warning: false
-res_bin_unw <- run_repeated_cv_binary_unweighted(X_bin, y_bin2, K = 4, repeats = 20, positive = "Normal")
-perf_bin_unw <- res_bin_unw$perf
-```
+sweep_res <- de_gene_sweep(e_bin_de, y_bin_de,
+                          n_grid = c(5, 10, 20, 30, 40, 50, 75, 100, 150, 200),
+                          K = 4, repeats = 10, positive = "Normal")
 
-```{r, fig.cap="Binary (unweighted): balanced metrics across models (stratified repeated 4-fold CV)."}
-#| message: false
-#| warning: false
-perf_bin_unw_long <- perf_bin_unw %>%
-  pivot_longer(
-    cols = c(accuracy, balanced_accuracy, recall_normal, precision_normal, f1_normal),
-    names_to = "metric",
-    values_to = "value"
-  )
+knitr::kable(sweep_res, caption = "Binary DE gene sweep (weighted CV): best mean balanced accuracy by top-N DE genes")
 
-ggplot(perf_bin_unw_long, aes(x = model, y = value, fill = model)) +
-  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
-  facet_wrap(~metric, scales = "free_y") +
-  theme_bw() +
-  labs(x = "", y = "", title = "Binary (unweighted) model comparison") +
-  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
-```
-
-```{r, fig.cap="Binary (unweighted): confusion matrix for best model after threshold tuning (max F1 for Normal)."}
-#| message: false
-#| warning: false
-best_model_bin_unw <- perf_bin_unw %>%
-  group_by(model) %>%
-  summarise(mean = mean(balanced_accuracy, na.rm = TRUE), .groups = "drop") %>%
-  arrange(desc(mean)) %>%
-  slice(1) %>%
-  pull(model)
-
-cat("Best unweighted binary model by mean balanced accuracy:", best_model_bin_unw, "\n")
-
-score_best_unw <- res_bin_unw$scores %>% filter(model == best_model_bin_unw)
-thr_best_unw <- best_threshold_f1(score_best_unw$truth, score_best_unw$score_normal, positive = "Normal")
-cat("Chosen threshold (max pooled F1 for Normal):", round(thr_best_unw, 4), "\n")
-
-pred_tuned_unw <- ifelse(score_best_unw$score_normal >= thr_best_unw, "Normal", setdiff(levels(y_bin2), "Normal")[1])
-tab_bin_unw <- table(truth = score_best_unw$truth, pred = pred_tuned_unw)
-tab_bin_df_unw <- as.data.frame(tab_bin_unw)
-
-ggplot(tab_bin_df_unw, aes(x = pred, y = truth, fill = Freq)) +
-  geom_tile() +
-  geom_text(aes(label = Freq), size = 5) +
-  scale_fill_gradient(low = "white", high = "#41AB5D") +
-  theme_bw() +
-  labs(x = "Predicted", y = "True", title = paste0("Binary (unweighted) confusion matrix: ", best_model_bin_unw)) +
-  theme(legend.position = "right")
-```
-
-```{r, fig.cap="Binary (unweighted): pooled ROC and PR curves for the best model."}
-#| message: false
-#| warning: false
-curve_best_unw <- res_bin_unw$scores %>% filter(model == best_model_bin_unw)
-truth01_unw <- as.integer(curve_best_unw$truth == "Normal")
-score_unw <- curve_best_unw$score_normal
-
-roc_thresh_unw <- sort(unique(score_unw), decreasing = TRUE)
-roc_df_unw <- lapply(roc_thresh_unw, function(t) {
-  pred <- score_unw >= t
-  tp <- sum(pred & truth01_unw == 1)
-  fn <- sum(!pred & truth01_unw == 1)
-  fp <- sum(pred & truth01_unw == 0)
-  tn <- sum(!pred & truth01_unw == 0)
-  tibble(
-    threshold = t,
-    tpr = if ((tp + fn) == 0) NA_real_ else tp / (tp + fn),
-    fpr = if ((fp + tn) == 0) NA_real_ else fp / (fp + tn)
-  )
-}) %>% bind_rows()
-
-pr_df_unw <- pr_curve_df(truth01_unw, score_unw)
-
-p1u <- ggplot(roc_df_unw, aes(x = fpr, y = tpr)) +
+ggplot(sweep_res, aes(x = n_genes, y = best_mean_balanced_accuracy)) +
   geom_line(color = "#2C7FB8", linewidth = 1) +
-  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  geom_point(size = 2) +
   theme_bw() +
-  labs(
-    x = "False Positive Rate",
-    y = "True Positive Rate",
-    title = paste0("ROC curve (AUC = ", round(auc_roc(truth01_unw, score_unw), 3), ")")
-  )
-
-p2u <- ggplot(pr_df_unw, aes(x = recall, y = precision)) +
-  geom_line(color = "#41AB5D", linewidth = 1) +
-  theme_bw() +
-  labs(
-    x = "Recall (Normal)",
-    y = "Precision (Normal)",
-    title = paste0("PR curve (AUC = ", round(auc_pr(truth01_unw, score_unw), 3), ")")
-  )
-
-print(p1u)
-print(p2u)
-```
-
-```{r}
-#| message: false
-#| warning: false
-# Unweighted binary: probability metrics (pooled CV predictions)
-model_auc_unw <- res_bin_unw$scores %>%
-  group_by(model) %>%
-  summarise(
-    roc_auc = auc_roc(truth == "Normal", score_normal),
-    pr_auc = auc_pr(truth == "Normal", score_normal),
-    .groups = "drop"
-  )
-
-knitr::kable(model_auc_unw, caption = "Binary (unweighted): probability metrics (pooled CV predictions)")
-```
-
-```{r}
-#| message: false
-#| warning: false
-# Unweighted binary: aggregate metrics table (mean ± SD) plus ROC/PR AUC
-model_summary_unw <- perf_bin_unw %>%
-  group_by(model) %>%
-  summarise(
-    accuracy_mean = mean(accuracy, na.rm = TRUE),
-    accuracy_sd = sd(accuracy, na.rm = TRUE),
-    balanced_accuracy_mean = mean(balanced_accuracy, na.rm = TRUE),
-    balanced_accuracy_sd = sd(balanced_accuracy, na.rm = TRUE),
-    sensitivity_mean = mean(recall_normal, na.rm = TRUE),
-    sensitivity_sd = sd(recall_normal, na.rm = TRUE),
-    precision_mean = mean(precision_normal, na.rm = TRUE),
-    precision_sd = sd(precision_normal, na.rm = TRUE),
-    f1_mean = mean(f1_normal, na.rm = TRUE),
-    f1_sd = sd(f1_normal, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  left_join(model_auc_unw, by = "model") %>%
-  mutate(
-    accuracy = sprintf("%.3f \u00B1 %.3f", accuracy_mean, accuracy_sd),
-    balanced_accuracy = sprintf("%.3f \u00B1 %.3f", balanced_accuracy_mean, balanced_accuracy_sd),
-    sensitivity = sprintf("%.3f \u00B1 %.3f", sensitivity_mean, sensitivity_sd),
-    precision = sprintf("%.3f \u00B1 %.3f", precision_mean, precision_sd),
-    f1 = sprintf("%.3f \u00B1 %.3f", f1_mean, f1_sd),
-    roc_auc = round(roc_auc, 3),
-    pr_auc = round(pr_auc, 3)
-  ) %>%
-  select(model, accuracy, balanced_accuracy, sensitivity, precision, f1, roc_auc, pr_auc)
-
-knitr::kable(model_summary_unw, caption = "Binary (unweighted): summary metrics per model")
+  scale_x_continuous(breaks = sweep_res$n_genes) +
+  labs(x = "Top-N DE genes", y = "Best mean balanced accuracy (weighted CV)", title = "How many DE genes do we need?") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```
