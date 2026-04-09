@@ -1,0 +1,465 @@
+---
+title: "Breast cancer"
+format: html
+editor: visual
+---
+
+```{r}
+library(GEOquery)
+library(randomForest)
+library(caret)
+library(e1071)
+library(class)
+```
+
+## 1. Load GSE15852
+
+```{r}
+gse15852 <- getGEO(filename = "GSE15852_series_matrix.txt.gz")
+```
+
+```{r}
+expr1 <- exprs(gse15852)
+pheno1 <- pData(gse15852)
+
+dim(expr1)
+head(pheno1)
+colnames(pheno1)
+```
+
+```{r}
+table(pheno1$`characteristics_ch1.1`)
+```
+
+```{r}
+labels1 <- ifelse(
+  pheno1$characteristics_ch1.1 == "histopathological exam: normal",
+  "normal",
+  "tumor"
+)
+
+table(labels1)
+```
+
+```{r}
+expr1 <- exprs(gse15852)
+dim(expr1)
+table(labels1)
+```
+
+## 2. Load GSE9574
+
+```{r}
+gse9574 <- getGEO(filename = "GSE9574_series_matrix.txt.gz")
+
+expr2 <- exprs(gse9574)
+pheno2 <- pData(gse9574)
+```
+
+```{r}
+labels2 <- ifelse(
+  grepl("tumor|cancer", pheno2$source_name_ch1, ignore.case = TRUE),
+  "tumor",
+  "normal"
+)
+
+table(labels2)
+```
+
+```{r}
+colnames(pheno2)
+head(pheno2)
+```
+
+```{r}
+table(pheno2$`source_name_ch1`)
+```
+
+## 3. Load GSE25066
+
+```{r}
+gse25066 <- getGEO(filename = "GSE25066_series_matrix.txt.gz")
+
+expr3 <- exprs(gse25066)
+pheno3 <- pData(gse25066)
+```
+
+```{r}
+dim(expr3)
+colnames(pheno3)
+head(pheno3)
+```
+
+```{r}
+table(pheno3$`characteristics_ch1.20`)
+```
+
+```{r}
+labels3 <- ifelse(
+  grepl("Normal", pheno3$characteristics_ch1.20, ignore.case = TRUE),
+  "normal",
+  "tumor"
+)
+
+table(labels3)
+```
+
+## 4. Merging 3 datasets
+
+```{r}
+dim(expr1)
+dim(expr2)
+dim(expr3)
+
+table(labels1)
+table(labels2)
+table(labels3)
+```
+
+```{r}
+common_genes <- Reduce(intersect, list(
+  rownames(expr1),
+  rownames(expr2),
+  rownames(expr3)
+))
+
+length(common_genes)
+```
+
+```{r}
+expr1 <- expr1[common_genes, ]
+expr2 <- expr2[common_genes, ]
+expr3 <- expr3[common_genes, ]
+```
+
+```{r}
+merged_expr <- cbind(expr1, expr2, expr3)
+
+dim(merged_expr)
+```
+
+```{r}
+labels <- c(labels1, labels2, labels3)
+
+batch <- c(
+  rep("GSE15852", length(labels1)),
+  rep("GSE9574", length(labels2)),
+  rep("GSE25066", length(labels3))
+)
+
+table(labels)
+table(batch)
+```
+
+```{r}
+# Normalization
+library(limma)
+
+merged_expr <- normalizeBetweenArrays(merged_expr)
+```
+
+```{r}
+# Batch Effect Correction using ComBat
+
+library(sva)
+
+combat_expr <- ComBat(
+  dat = merged_expr,
+  batch = batch,
+  mod = model.matrix(~labels)
+)
+```
+
+```{r}
+# check whether merge successfully
+pca <- prcomp(t(combat_expr))
+
+plot(
+  pca$x[,1],
+  pca$x[,2],
+  col = as.factor(labels),
+  pch = 16,
+  main = "PCA after ComBat",
+  xlab = "PC1 (Principal Component 1)",
+  ylab = "PC2 (Principal Component 2)"
+)
+```
+
+```{r}
+# Handling imbalance - Downsampling tumor samples
+
+set.seed(1)
+
+tumor_idx <- which(labels == "tumor")
+normal_idx <- which(labels == "normal")
+
+tumor_sampled <- sample(tumor_idx, length(normal_idx))
+
+final_idx <- c(tumor_sampled, normal_idx)
+
+final_expr <- combat_expr[, final_idx]
+final_labels <- labels[final_idx]
+
+table(final_labels)
+```
+
+## 5.1 EDA of merged dataset (after downsampling) 
+
+```{r}
+# balanced dataset
+table(final_labels)
+prop.table(table(final_labels))
+```
+
+```{r}
+boxplot(
+  final_expr,
+  outline = FALSE,
+  las = 2,
+  main = "Boxplot after Downsampling",
+  ylab = "Expression"
+)
+```
+
+The boxplot shows comparable expression distributions across samples after normalization and batch correction.
+
+```{r}
+# PCA
+
+pca_final <- prcomp(t(final_expr))
+
+plot(
+  pca_final$x[,1],
+  pca_final$x[,2],
+  col = as.factor(final_labels),
+  pch = 16,
+  main = "PCA after Downsampling",
+  xlab = "PC1",
+  ylab = "PC2"
+)
+
+legend("topright",
+       legend = c("tumor","normal"),
+       col = c(1,2),
+       pch = 16)
+```
+
+PCA after downsampling shows a more balanced distribution of tumor and normal samples, with partial separation between the two classes.
+
+## 5.2 Machine Learning
+
+```{r}
+# Step 1：train/test split
+
+set.seed(1)
+
+n <- ncol(final_expr)
+train_idx <- sample(1:n, size = 0.7*n)
+
+train_data <- t(final_expr[, train_idx])
+test_data  <- t(final_expr[, -train_idx])
+
+train_labels <- final_labels[train_idx]
+test_labels  <- final_labels[-train_idx]
+```
+
+```{r}
+# Step 2：Random Forest
+
+rf_model <- randomForest(
+  x = train_data,
+  y = as.factor(train_labels),
+  ntree = 100
+)
+```
+
+```{r}
+pred <- predict(rf_model, test_data)
+```
+
+## 5.3 Evaluation
+
+```{r}
+# Accuracy
+
+accuracy <- mean(pred == test_labels)
+accuracy
+```
+
+```{r}
+# Precision / Recall / F1
+
+confusionMatrix(pred, as.factor(test_labels))
+```
+
+## 6. Feature selection
+
+```{r}
+# Step 1：Feature Selection（t-test）
+p_values <- apply(final_expr, 1, function(x) {
+  t.test(x ~ final_labels)$p.value
+})
+```
+
+```{r}
+# Step 2：top 100 genes
+top_genes <- names(sort(p_values))[1:100]
+
+# Step 3：building new data
+expr_selected <- final_expr[top_genes, ]
+```
+
+```{r}
+# Step 4：Train / Test Split
+set.seed(1)
+
+n <- ncol(expr_selected)
+train_idx <- sample(1:n, 0.7*n)
+
+train_data <- t(expr_selected[, train_idx])
+test_data  <- t(expr_selected[, -train_idx])
+
+train_labels <- final_labels[train_idx]
+test_labels  <- final_labels[-train_idx]
+```
+
+```{r}
+# Step 5：Random Forest（Improved Model）
+rf_model_fs <- randomForest(
+  x = train_data,
+  y = as.factor(train_labels),
+  ntree = 100
+)
+
+pred_fs <- predict(rf_model_fs, test_data)
+```
+
+```{r}
+# Accuracy
+acc_fs <- mean(pred_fs == test_labels)
+acc_fs
+
+# Confusion Matrix
+confusionMatrix(pred_fs, as.factor(test_labels))
+
+```
+
+## 7. Model Selection
+
+```{r}
+# SVM model
+
+svm_model <- svm(
+  x = train_data,
+  y = as.factor(train_labels),
+  kernel = "linear"
+)
+
+pred_svm <- predict(svm_model, test_data)
+
+acc_svm <- mean(pred_svm == test_labels)
+acc_svm
+
+confusionMatrix(pred_svm, as.factor(test_labels))
+```
+
+```{r}
+# KNN
+
+pred_knn <- knn(
+  train = train_data,
+  test = test_data,
+  cl = train_labels,
+  k = 5
+)
+
+# unified levels
+pred_knn <- factor(pred_knn, levels = c("normal", "tumor"))
+test_labels <- factor(test_labels, levels = c("normal", "tumor"))
+
+# accuracy
+acc_knn <- mean(pred_knn == test_labels)
+acc_knn
+
+# confusion matrix
+confusionMatrix(pred_knn, test_labels)
+```
+
+```{r}
+model_results <- data.frame(
+  Model = c("RF (full)", "RF (feature selection)", "SVM (feature selection)", "KNN (feature selection)"),
+  Accuracy = c(accuracy, acc_fs, acc_svm, acc_knn)
+)
+
+model_results
+```
+
+## 8. ROC curve
+
+-   ROC curves were used to evaluate the performance of different classification models.
+
+```{r}
+library(pROC)
+
+# RF
+prob_rf <- predict(rf_model_fs, test_data, type = "prob")[, "tumor"]
+
+# SVM
+svm_model <- svm(
+  x = train_data,
+  y = as.factor(train_labels),
+  kernel = "linear",
+  probability = TRUE
+)
+
+pred_svm <- predict(svm_model, test_data, probability = TRUE)
+
+prob_svm <- attr(pred_svm, "probabilities")[, "tumor"]
+
+# KNN
+pred_knn <- knn(
+  train = train_data,
+  test = test_data,
+  cl = train_labels,
+  k = 5,
+  prob = TRUE
+)
+
+prob_knn <- ifelse(pred_knn == "tumor",
+                   attr(pred_knn, "prob"),
+                   1 - attr(pred_knn, "prob"))
+
+# Draw ROC
+# convert label
+test_binary <- ifelse(test_labels == "tumor", 1, 0)
+
+roc_rf  <- roc(test_binary, prob_rf)
+roc_svm <- roc(test_binary, prob_svm)
+roc_knn <- roc(test_binary, prob_knn)
+
+# draw plots
+plot(roc_rf, col = "red",   lwd = 2, main = "ROC Curve Comparison")
+plot(roc_svm,col = "blue", lwd = 2, add = TRUE)
+plot(roc_knn,col = "purple", lwd = 2, add = TRUE)
+
+legend("bottomright",
+       legend = c("RF", "SVM", "KNN"),
+       col = c("red", "blue","purple"),
+       lwd = 2)
+```
+
+-   RF has the best discriminative performance, SVM performs comparably well but slightly worse than RF, KNN performs worse due to high-dimensional data.
+
+-   The curve is very steep indicates that the models achieve high sensitivity with low false positives. Good performance overall.
+
+```{r}
+auc(roc_rf)
+auc(roc_svm)
+auc(roc_knn)
+```
+
+-   RF（0.9674）close to 1 (strong performance)
+
+-   All three models have an AUC \> 0.9
+
+-   Indicating that the data itself is highly separable (strong biological signal)
