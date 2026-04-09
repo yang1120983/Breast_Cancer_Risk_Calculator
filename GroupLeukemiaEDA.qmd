@@ -37,12 +37,12 @@ set.seed(3888)
 ```{r}
 #| message: false
 #| warning: false
-datasets_multiclass <- c("GSE25066")          # PAM50 multiclass (example; not merged yet)
-datasets_binary <- c("GSE15852", "GSE54002")  # Binary Normal vs Cancer (merged below)
+datasets_multiclass <- c("GSE25066","GSE45827")          # PAM50 multiclass (example; not merged yet)
+datasets_binary <- c("GSE15852", "GSE29431","GSE9574", "GSE7904")  # Binary Normal vs Cancer (merged below)
 
 normal_keywords <- c(
   "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
-  "healthy", "control", "adjacent normal", "benign"
+  "healthy", "control", "adjacent normal", "benign", "none"
 )
 ```
 
@@ -50,10 +50,72 @@ normal_keywords <- c(
 #| message: false
 #| warning: false
 load_geo_eset <- function(gse_id) {
-  g <- GEOquery::getGEO(gse_id)
-  if (inherits(g, "ExpressionSet")) return(g)
-  if (is.list(g) && length(g) >= 1) return(g[[1]])
-  stop("Could not load ExpressionSet for ", gse_id)
+  geo_cache_dir <- file.path("data", "geo-cache")
+  if (!dir.exists(geo_cache_dir)) dir.create(geo_cache_dir, recursive = TRUE)
+
+  # Helper: build HTTPS URL for the series matrix
+  gse_matrix_url <- function(id, host = "ftp.ncbi.nlm.nih.gov") {
+    num <- sub("^GSE", "", id)
+    prefix <- substr(num, 1, max(1, nchar(num) - 3))
+    series_dir <- paste0("GSE", prefix, "nnn")
+    paste0(
+      "https://", host, "/geo/series/",
+      series_dir, "/", id, "/matrix/",
+      id, "_series_matrix.txt.gz"
+    )
+  }
+
+  # Prefer normal GEOquery path first (uses destdir cache)
+  g <- tryCatch(
+    GEOquery::getGEO(gse_id, destdir = geo_cache_dir),
+    error = function(e) e
+  )
+  if (!inherits(g, "error")) {
+    if (inherits(g, "ExpressionSet")) return(g)
+    if (is.list(g) && length(g) >= 1) return(g[[1]])
+  }
+
+  # Fallback: explicit HTTPS download with longer timeout + retries + resume, then load from file
+  destfile <- file.path(geo_cache_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+  urls <- c(
+    gse_matrix_url(gse_id, host = "ftp.ncbi.nlm.nih.gov"),
+    gse_matrix_url(gse_id, host = "download.ncbi.nlm.nih.gov")
+  )
+
+  # R's options(timeout=) does not reliably control libcurl; set curl handle timeout directly.
+  h <- curl::new_handle()
+  curl::handle_setopt(h,
+                      connecttimeout = 60,
+                      timeout = 1800,
+                      low_speed_time = 300,
+                      low_speed_limit = 1000)
+
+  ok <- FALSE
+  for (u in urls) {
+    for (attempt in 1:6) {
+      try({
+        size_before <- if (file.exists(destfile)) file.info(destfile)$size else 0
+        curl::curl_download(u, destfile, quiet = FALSE, mode = "wb", handle = h, resume = TRUE)
+        size_after <- if (file.exists(destfile)) file.info(destfile)$size else 0
+        ok <- size_after > 0 && size_after >= size_before
+      }, silent = TRUE)
+      if (ok) break
+      # If we are not making progress, reset the partial file and retry.
+      if (file.exists(destfile) && attempt >= 2) file.remove(destfile)
+      Sys.sleep(3 * attempt)
+    }
+    if (ok) break
+  }
+
+  if (!ok) {
+    stop("Could not download series matrix for ", gse_id, " after retries.\nTried URLs:\n- ",
+         paste(urls, collapse = "\n- "))
+  }
+
+  g2 <- GEOquery::getGEO(filename = destfile)
+  if (inherits(g2, "ExpressionSet")) return(g2)
+  if (is.list(g2) && length(g2) >= 1) return(g2[[1]])
+  stop("Could not load ExpressionSet for ", gse_id, " from cached file: ", destfile)
 }
 
 clean_first_symbol <- function(s) {
@@ -144,22 +206,52 @@ infer_multiclass_label <- function(pMat) {
     setdiff(cols_try, grep("pam50", cols_try, ignore.case = TRUE, value = TRUE))
   )
 
+  # Canonical subtype dictionary (handles common naming variations across datasets)
+  # You can extend this list if you see new spellings.
+  subtype_variants <- list(
+    "Luminal A"    = c("luminal a", "lum a", "luma", "lum-a", "lum_a", "luminala", "lumina"),
+    "Luminal B"    = c("luminal b", "lum b", "lumb", "lum-b", "lum_b", "luminalb"),
+    "Basal"        = c("basal", "basal-like", "basal like", "basallike", "basal_like", "basal type", "basaltype", "basal/tumor"),
+    "HER2"         = c("her2", "her2+", "her-2", "her 2", "her2-enriched", "her2 enriched", "her2enriched", "erb-b2", "erbb2", "erbb2+", "her2e"),
+    "Normal-like"  = c("normal-like", "normal like", "normallike", "normal_like", "normal")
+  )
+
+  normalize_label_text <- function(x) {
+    x <- tolower(as.character(x))
+    x[is.na(x)] <- ""
+    # Light normalization: trim and collapse non-alphanumeric into single spaces
+    x <- trimws(gsub("[^a-z0-9]+", " ", x))
+    x
+  }
+
+  map_to_subtype <- function(x_raw) {
+    x_norm <- normalize_label_text(x_raw)
+    if (x_norm == "") return(NA_character_)
+
+    # If there is a PAM50 tag embedded in the string, parse after it first
+    if (grepl("pam50_class", x_norm, fixed = TRUE)) {
+      x_parsed <- extract_after_scalar(x_raw, prefix = "pam50_class:\\s*")
+      x_norm <- normalize_label_text(x_parsed)
+    }
+
+    # Match against variants (substring match on normalized text)
+    for (canon in names(subtype_variants)) {
+      v <- subtype_variants[[canon]]
+      if (any(vapply(v, function(kw) grepl(kw, x_norm, fixed = TRUE), logical(1)))) {
+        return(canon)
+      }
+    }
+    NA_character_
+  }
+
   for (cn in cols_try) {
     x <- as.character(pMat[[cn]])
-    # If entries contain "pam50_class:" parse after it; else use raw
-    has_pam50_tag <- any(grepl("pam50_class:", x, ignore.case = TRUE))
-    lab <- if (has_pam50_tag) {
-      vapply(x, extract_after_scalar, character(1), prefix = "pam50_class:\\s*")
-    } else {
-      x
-    }
-    lab <- trimws(lab)
-    lab[lab == ""] <- NA_character_
+    lab <- vapply(x, map_to_subtype, character(1))
     y <- factor(lab)
     y <- droplevels(y[!is.na(y)])
     # Accept if 2+ levels and not degenerate
     if (nlevels(y) >= 2) {
-      return(list(label = factor(lab), label_col = cn, parsed_pam50 = has_pam50_tag))
+      return(list(label = factor(lab), label_col = cn, parsed_pam50 = any(grepl("pam50_class:", x, ignore.case = TRUE))))
     }
   }
 
@@ -189,6 +281,17 @@ impute_apply <- function(X, fit) {
     if (any(idx)) X2[idx, j] <- fit$median[j]
   }
   X2
+}
+
+# Standardisation for distance-based / margin-based models (fit on training only)
+standardize_fit <- function(X_train) {
+  mu <- colMeans(X_train)
+  sdv <- apply(X_train, 2, sd)
+  sdv[sdv == 0] <- 1
+  list(mu = mu, sd = sdv)
+}
+standardize_apply <- function(X, fit) {
+  sweep(sweep(X, 2, fit$mu, "-"), 2, fit$sd, "/")
 }
 ```
 
