@@ -1,0 +1,1254 @@
+---
+title: "Group Breast Cancer EDA + Modelling (Merged Binary GEOs)"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    df-print: paged
+    toc: true
+editor: visual
+---
+
+This notebook builds a **merged binary dataset** from multiple GEO studies and compares **weighted vs unweighted** models using repeated CV.
+
+```{r}
+#| message: false
+#| warning: false
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(class)
+library(e1071)
+library(randomForest)
+library(cvTools)
+library(sva)
+
+```
+
+```{r}
+#| message: false
+#| warning: false
+set.seed(3888)
+```
+
+## Dataset registry + merge helpers
+
+```{r}
+#| message: false
+#| warning: false
+datasets_multiclass <- c("GSE25066","GSE45827")          # PAM50 multiclass (example; not merged yet)
+datasets_binary <- c("GSE15852", "GSE29431","GSE9574", "GSE7904")  # Binary Normal vs Cancer (merged below)
+
+normal_keywords <- c(
+  "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
+  "healthy", "control", "adjacent normal", "benign", "none"
+)
+```
+
+```{r}
+#| message: false
+#| warning: false
+load_geo_eset <- function(gse_id) {
+  geo_cache_dir <- file.path("data", "geo-cache")
+  if (!dir.exists(geo_cache_dir)) dir.create(geo_cache_dir, recursive = TRUE)
+
+  # Helper: build HTTPS URL for the series matrix
+  gse_matrix_url <- function(id, host = "ftp.ncbi.nlm.nih.gov") {
+    num <- sub("^GSE", "", id)
+    prefix <- substr(num, 1, max(1, nchar(num) - 3))
+    series_dir <- paste0("GSE", prefix, "nnn")
+    paste0(
+      "https://", host, "/geo/series/",
+      series_dir, "/", id, "/matrix/",
+      id, "_series_matrix.txt.gz"
+    )
+  }
+
+  # Prefer normal GEOquery path first (uses destdir cache)
+  g <- tryCatch(
+    GEOquery::getGEO(gse_id, destdir = geo_cache_dir),
+    error = function(e) e
+  )
+  if (!inherits(g, "error")) {
+    if (inherits(g, "ExpressionSet")) return(g)
+    if (is.list(g) && length(g) >= 1) return(g[[1]])
+  }
+
+  # Fallback: explicit HTTPS download with longer timeout + retries + resume, then load from file
+  destfile <- file.path(geo_cache_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+  urls <- c(
+    gse_matrix_url(gse_id, host = "ftp.ncbi.nlm.nih.gov"),
+    gse_matrix_url(gse_id, host = "download.ncbi.nlm.nih.gov")
+  )
+
+  # R's options(timeout=) does not reliably control libcurl; set curl handle timeout directly.
+  h <- curl::new_handle()
+  curl::handle_setopt(h,
+                      connecttimeout = 60,
+                      timeout = 1800,
+                      low_speed_time = 300,
+                      low_speed_limit = 1000)
+
+  ok <- FALSE
+  for (u in urls) {
+    for (attempt in 1:6) {
+      try({
+        size_before <- if (file.exists(destfile)) file.info(destfile)$size else 0
+        curl::curl_download(u, destfile, quiet = FALSE, mode = "wb", handle = h, resume = TRUE)
+        size_after <- if (file.exists(destfile)) file.info(destfile)$size else 0
+        ok <- size_after > 0 && size_after >= size_before
+      }, silent = TRUE)
+      if (ok) break
+      # If we are not making progress, reset the partial file and retry.
+      if (file.exists(destfile) && attempt >= 2) file.remove(destfile)
+      Sys.sleep(3 * attempt)
+    }
+    if (ok) break
+  }
+
+  if (!ok) {
+    stop("Could not download series matrix for ", gse_id, " after retries.\nTried URLs:\n- ",
+         paste(urls, collapse = "\n- "))
+  }
+
+  g2 <- GEOquery::getGEO(filename = destfile)
+  if (inherits(g2, "ExpressionSet")) return(g2)
+  if (is.list(g2) && length(g2) >= 1) return(g2[[1]])
+  stop("Could not load ExpressionSet for ", gse_id, " from cached file: ", destfile)
+}
+
+clean_first_symbol <- function(s) {
+  if (is.na(s) || trimws(as.character(s)) == "") return(NA_character_)
+  s <- trimws(as.character(s))
+  parts <- strsplit(s, " /// ", fixed = TRUE)[[1]]
+  trimws(parts[1])
+}
+
+collapse_to_genes <- function(eset) {
+  e <- exprs(eset)
+  fd <- fData(eset)
+  sym_col <- grep("gene\\s*symbol|symbol", colnames(fd), ignore.case = TRUE, value = TRUE)[1]
+  gene_sym_raw <- if (!is.na(sym_col)) as.character(fd[, sym_col]) else rep(NA_character_, nrow(fd))
+has_symbol <- !is.na(gene_sym_raw) & trimws(gene_sym_raw) != ""
+gene_sym <- rep(NA_character_, length(gene_sym_raw))
+gene_sym[has_symbol] <- vapply(gene_sym_raw[has_symbol], clean_first_symbol, character(1))
+  gene_sym <- ifelse(is.na(gene_sym) | gene_sym == "", rownames(e), gene_sym)
+  e_g <- limma::avereps(e, ID = gene_sym)
+
+  # Feature table: keep one row per gene symbol where possible, otherwise minimal table
+  fd$.__gene_sym__ <- gene_sym
+  fd_g <- fd %>%
+    tibble::as_tibble() %>%
+    mutate(.__gene_sym__ = fd$.__gene_sym__) %>%
+    group_by(.__gene_sym__) %>%
+    slice(1) %>%
+    ungroup() %>%
+    tibble::column_to_rownames(".__gene_sym__")
+
+  list(eMat_g = e_g, fMat_g = fd_g, pMat = pData(eset))
+}
+
+infer_binary_label <- function(pMat, normal_keywords) {
+  # Prefer characteristics_ch* columns first, then everything else
+  cols_char <- grep("^characteristics_ch", colnames(pMat), value = TRUE)
+  cols_other <- setdiff(colnames(pMat), cols_char)
+  cols_try <- c(cols_char, cols_other)
+
+  has_kw <- function(x) {
+    x <- tolower(as.character(x))
+    x[is.na(x)] <- ""
+    any(vapply(
+      normal_keywords,
+      function(kw) any(grepl(kw, x, fixed = TRUE)),
+      logical(1)
+    ))
+  }
+
+  for (cn in cols_try) {
+    x <- pMat[[cn]]
+    if (!has_kw(x)) next
+    xlow <- tolower(as.character(x))
+    xlow[is.na(xlow)] <- ""
+    is_normal <- Reduce(`|`, lapply(normal_keywords, function(kw) grepl(kw, xlow, fixed = TRUE)))
+    label <- ifelse(is_normal, "Normal", "Cancer")
+    label[xlow == ""] <- NA_character_
+    label <- factor(label, levels = c("Cancer", "Normal"))
+    tab <- table(label, useNA = "no")
+    if (length(tab) >= 2 && all(tab > 0)) {
+      return(list(label = label, label_col = cn))
+    }
+  }
+
+  list(label = factor(rep(NA_character_, nrow(pMat)), levels = c("Cancer", "Normal")),
+       label_col = NA_character_)
+}
+
+extract_after_scalar <- function(x, prefix) {
+  # scalar-safe extractor for strings like "pam50_class: Basal"
+  if (length(x) > 1) x <- x[which(!is.na(x))[1]]
+  if (length(x) == 0 || is.na(x)) return(NA_character_)
+  x <- as.character(x)
+  m <- regexpr(prefix, x, ignore.case = TRUE)
+  if (m[1] == -1) return(NA_character_)
+  out <- substring(x, m[1] + attr(m, "match.length"))
+  trimws(out)
+}
+
+infer_multiclass_label <- function(pMat) {
+  cols_char <- grep("^characteristics_ch", colnames(pMat), value = TRUE)
+  cols_other <- setdiff(colnames(pMat), cols_char)
+  cols_try <- c(cols_char, cols_other)
+
+  # Prefer columns that look like PAM50
+  cols_try <- c(
+    intersect(cols_try, grep("pam50", cols_try, ignore.case = TRUE, value = TRUE)),
+    setdiff(cols_try, grep("pam50", cols_try, ignore.case = TRUE, value = TRUE))
+  )
+
+  # Canonical subtype dictionary (handles common naming variations across datasets)
+  # You can extend this list if you see new spellings.
+  subtype_variants <- list(
+    "Luminal A"    = c("luminal a", "lum a", "luma", "lum-a", "lum_a", "luminala", "lumina"),
+    "Luminal B"    = c("luminal b", "lum b", "lumb", "lum-b", "lum_b", "luminalb"),
+    "Basal"        = c("basal", "basal-like", "basal like", "basallike", "basal_like", "basal type", "basaltype", "basal/tumor"),
+    "HER2"         = c("her2", "her2+", "her-2", "her 2", "her2-enriched", "her2 enriched", "her2enriched", "erb-b2", "erbb2", "erbb2+", "her2e"),
+    "Normal-like"  = c("normal-like", "normal like", "normallike", "normal_like", "normal")
+  )
+
+  normalize_label_text <- function(x) {
+    x <- tolower(as.character(x))
+    x[is.na(x)] <- ""
+    # Light normalization: trim and collapse non-alphanumeric into single spaces
+    x <- trimws(gsub("[^a-z0-9]+", " ", x))
+    x
+  }
+
+  map_to_subtype <- function(x_raw) {
+    x_norm <- normalize_label_text(x_raw)
+    if (x_norm == "") return(NA_character_)
+
+    # If there is a PAM50 tag embedded in the string, parse after it first
+    if (grepl("pam50_class", x_norm, fixed = TRUE)) {
+      x_parsed <- extract_after_scalar(x_raw, prefix = "pam50_class:\\s*")
+      x_norm <- normalize_label_text(x_parsed)
+    }
+
+    # Match against variants (substring match on normalized text)
+    for (canon in names(subtype_variants)) {
+      v <- subtype_variants[[canon]]
+      if (any(vapply(v, function(kw) grepl(kw, x_norm, fixed = TRUE), logical(1)))) {
+        return(canon)
+      }
+    }
+    NA_character_
+  }
+
+  for (cn in cols_try) {
+    x <- as.character(pMat[[cn]])
+    lab <- vapply(x, map_to_subtype, character(1))
+    y <- factor(lab)
+    y <- droplevels(y[!is.na(y)])
+    # Accept if 2+ levels and not degenerate
+    if (nlevels(y) >= 2) {
+      return(list(label = factor(lab), label_col = cn, parsed_pam50 = any(grepl("pam50_class:", x, ignore.case = TRUE))))
+    }
+  }
+
+  list(label = factor(rep(NA_character_, nrow(pMat))), label_col = NA_character_, parsed_pam50 = FALSE)
+}
+
+rbind_fill <- function(dfs) {
+  all_cols <- Reduce(union, lapply(dfs, colnames))
+  dfs2 <- lapply(dfs, function(d) {
+    miss <- setdiff(all_cols, colnames(d))
+    for (m in miss) d[[m]] <- NA
+    d[, all_cols, drop = FALSE]
+  })
+  do.call(rbind, dfs2)
+}
+
+# Missing-value handling for merged expression matrices (use training-fold stats only)
+impute_fit <- function(X_train) {
+  meds <- apply(X_train, 2, function(v) stats::median(v, na.rm = TRUE))
+  meds[is.na(meds)] <- 0
+  list(median = meds)
+}
+impute_apply <- function(X, fit) {
+  X2 <- X
+  for (j in seq_len(ncol(X2))) {
+    idx <- is.na(X2[, j])
+    if (any(idx)) X2[idx, j] <- fit$median[j]
+  }
+  X2
+}
+
+# Standardisation for distance-based / margin-based models (fit on training only)
+standardize_fit <- function(X_train) {
+  mu <- colMeans(X_train)
+  sdv <- apply(X_train, 2, sd)
+  sdv[sdv == 0] <- 1
+  list(mu = mu, sd = sdv)
+}
+standardize_apply <- function(X, fit) {
+  sweep(sweep(X, 2, fit$mu, "-"), 2, fit$sd, "/")
+}
+
+
+apply_combat_correction <- function(eMat, pMat, label_col, batch_col = "dataset_id", par_prior = TRUE) {
+
+  keep <- !is.na(pMat[[label_col]]) & pMat[[label_col]] != ""
+  eMat2 <- eMat[, keep, drop = FALSE]
+  pMat2 <- pMat[keep, , drop = FALSE]
+
+  if (!all(colnames(eMat2) == rownames(pMat2))) {
+    if (all(colnames(eMat2) %in% rownames(pMat2))) {
+      pMat2 <- pMat2[colnames(eMat2), , drop = FALSE]
+    } else {
+      stop("Sample names in expression matrix and phenotype data do not match.")
+    }
+  }
+
+  gene_ok <- apply(eMat2, 1, function(x) {
+    sum(!is.na(x)) > 1 && stats::sd(x, na.rm = TRUE) > 0
+  })
+  eMat2 <- eMat2[gene_ok, , drop = FALSE]
+
+  group <- as.factor(pMat2[[label_col]])
+  batch <- as.factor(pMat2[[batch_col]])
+  mod <- model.matrix(~ group)
+
+  eMat_combat <- sva::ComBat(
+    dat = as.matrix(eMat2),
+    batch = batch,
+    mod = mod,
+    par.prior = par_prior,
+    prior.plots = FALSE
+  )
+
+  list(
+    eMat = eMat_combat,
+    pMat = pMat2
+  )
+}
+
+summarise_top_genes <- function(top_table, n = 20) {
+  top_table %>%
+    tibble::rownames_to_column("Gene") %>%
+    dplyr::select(Gene, logFC, AveExpr, P.Value, adj.P.Val) %>%
+    dplyr::slice_head(n = n)
+}
+
+
+```
+
+```{r}
+#| message: false
+#| warning: false
+build_merged_binary_dataset <- function(gse_ids, normal_keywords) {
+  pieces <- lapply(gse_ids, function(id) {
+    eset <- load_geo_eset(id)
+    cc <- collapse_to_genes(eset)
+    lab <- infer_binary_label(cc$pMat, normal_keywords)
+
+    p <- cc$pMat
+    p$dataset_id <- id
+    p$label_col_detected <- lab$label_col
+    p$label_binary <- as.character(lab$label)
+
+    list(id = id, e = cc$eMat_g, p = p, f = cc$fMat_g)
+  })
+
+  # Merge expression by UNION of genes; pad missing genes with NA
+  all_genes <- Reduce(union, lapply(pieces, function(x) rownames(x$e)))
+  if (length(all_genes) == 0) stop("No genes found across binary datasets.")
+
+  pad_to_all_genes <- function(e, all_genes) {
+    miss <- setdiff(all_genes, rownames(e))
+    if (length(miss) > 0) {
+      pad <- matrix(NA_real_, nrow = length(miss), ncol = ncol(e),
+                    dimnames = list(miss, colnames(e)))
+      e <- rbind(e, pad)
+    }
+    e[all_genes, , drop = FALSE]
+  }
+
+  e_big <- do.call(cbind, lapply(pieces, function(x) pad_to_all_genes(x$e, all_genes)))
+
+  # Merge phenotype by union of columns
+  p_big <- rbind_fill(lapply(pieces, `[[`, "p"))
+
+  # Merge feature data by union of gene rows (keep only genes present in e_big)
+  f_big_all <- rbind_fill(lapply(pieces, function(x) {
+    ff <- x$f
+    ff$dataset_id <- x$id
+    tibble::rownames_to_column(ff, var = "gene_id")
+  }))
+  # Keep one row per gene_id (prefer the first dataset that has it)
+  f_big <- f_big_all %>%
+    group_by(gene_id) %>%
+    slice(1) %>%
+    ungroup() %>%
+    filter(gene_id %in% rownames(e_big)) %>%
+    tibble::column_to_rownames("gene_id")
+
+  list(eMat = e_big, pMat = p_big, fMat = f_big, all_genes = all_genes, pieces = pieces)
+}
+
+build_merged_multiclass_dataset <- function(gse_ids) {
+  pieces <- lapply(gse_ids, function(id) {
+    eset <- load_geo_eset(id)
+    cc <- collapse_to_genes(eset)
+    lab <- infer_multiclass_label(cc$pMat)
+
+    p <- cc$pMat
+    p$dataset_id <- id
+    p$label_col_detected <- lab$label_col
+    p$label_multiclass <- as.character(lab$label)
+
+    list(id = id, e = cc$eMat_g, p = p, f = cc$fMat_g)
+  })
+
+  all_genes <- Reduce(union, lapply(pieces, function(x) rownames(x$e)))
+  if (length(all_genes) == 0) stop("No genes found across multiclass datasets.")
+
+  pad_to_all_genes <- function(e, all_genes) {
+    miss <- setdiff(all_genes, rownames(e))
+    if (length(miss) > 0) {
+      pad <- matrix(NA_real_, nrow = length(miss), ncol = ncol(e),
+                    dimnames = list(miss, colnames(e)))
+      e <- rbind(e, pad)
+    }
+    e[all_genes, , drop = FALSE]
+  }
+
+  e_big <- do.call(cbind, lapply(pieces, function(x) pad_to_all_genes(x$e, all_genes)))
+  p_big <- rbind_fill(lapply(pieces, `[[`, "p"))
+
+  f_big_all <- rbind_fill(lapply(pieces, function(x) {
+    ff <- x$f
+    ff$dataset_id <- x$id
+    tibble::rownames_to_column(ff, var = "gene_id")
+  }))
+  f_big <- f_big_all %>%
+    group_by(gene_id) %>%
+    slice(1) %>%
+    ungroup() %>%
+    filter(gene_id %in% rownames(e_big)) %>%
+    tibble::column_to_rownames("gene_id")
+
+  list(eMat = e_big, pMat = p_big, fMat = f_big, all_genes = all_genes, pieces = pieces)
+}
+
+merged_bin <- build_merged_binary_dataset(datasets_binary, normal_keywords)
+eMat_big_bin <- merged_bin$eMat
+pMat_big_bin <- merged_bin$pMat
+fMat_big_bin <- merged_bin$fMat
+combat_bin <- apply_combat_correction(
+  eMat = eMat_big_bin,
+  pMat = pMat_big_bin,
+  label_col = "label_binary",
+  batch_col = "dataset_id"
+)
+
+eMat_big_bin <- combat_bin$eMat
+pMat_big_bin <- combat_bin$pMat
+fMat_big_bin <- fMat_big_bin[rownames(eMat_big_bin), , drop = FALSE]
+
+cat("Merged binary expression dims (genes x samples):", paste(dim(eMat_big_bin), collapse=" x "), "\n")
+print(table(pMat_big_bin$dataset_id))
+print(table(pMat_big_bin$label_binary, useNA = "ifany"))
+```
+
+```{r}
+#| message: false
+#| warning: false
+merged_mc <- build_merged_multiclass_dataset(datasets_multiclass)
+eMat_big_mc <- merged_mc$eMat
+pMat_big_mc <- merged_mc$pMat
+fMat_big_mc <- merged_mc$fMat
+combat_mc <- apply_combat_correction(
+  eMat = eMat_big_mc,
+  pMat = pMat_big_mc,
+  label_col = "label_multiclass",
+  batch_col = "dataset_id"
+)
+
+eMat_big_mc <- combat_mc$eMat
+pMat_big_mc <- combat_mc$pMat
+fMat_big_bin <- fMat_big_bin[rownames(eMat_big_bin), , drop = FALSE]
+
+cat("Merged multiclass expression dims (genes x samples):", paste(dim(eMat_big_mc), collapse=" x "), "\n")
+print(table(pMat_big_mc$dataset_id))
+print(table(pMat_big_mc$label_multiclass, useNA = "ifany"))
+```
+
+## Multiclass modelling (merged dataset)
+
+```{r}
+#| message: false
+#| warning: false
+macro_f1 <- function(truth, pred) {
+  truth <- factor(truth)
+  pred <- factor(pred, levels = levels(truth))
+  lvls <- levels(truth)
+  f1s <- c()
+  for (k in lvls) {
+    tp <- sum(pred == k & truth == k, na.rm = TRUE)
+    fp <- sum(pred == k & truth != k, na.rm = TRUE)
+    fn <- sum(pred != k & truth == k, na.rm = TRUE)
+    prec <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+    rec  <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+    f1   <- if (is.na(prec) || is.na(rec) || (prec + rec) == 0) NA_real_ else 2 * prec * rec / (prec + rec)
+    f1s <- c(f1s, f1)
+  }
+  mean(f1s, na.rm = TRUE)
+}
+
+select_genes_one_vs_rest <- function(eMat_g, y, n_per_class = 25) {
+  ok <- !is.na(y) & y != ""
+  e <- eMat_g[, ok, drop = FALSE]
+  y <- factor(y[ok])
+
+  lvls_orig <- levels(y)
+  lvls_safe <- make.names(lvls_orig)
+  names(lvls_safe) <- lvls_orig
+
+  design <- model.matrix(~ 0 + y)
+  colnames(design) <- lvls_safe[lvls_orig]
+  fit <- lmFit(e, design)
+
+  genes <- character(0)
+  for (lvl in lvls_orig) {
+    others <- setdiff(lvls_orig, lvl)
+    if (length(others) == 0) next
+    lvl_s <- unname(lvls_safe[lvl])
+    others_s <- unname(lvls_safe[others])
+    contrast_str <- paste0(lvl_s, " - (", paste0(others_s, collapse = " + "), ")/", length(others_s))
+    cont <- makeContrasts(contrasts = contrast_str, levels = design)
+    fit2 <- contrasts.fit(fit, cont)
+    fit2 <- eBayes(fit2)
+    tt <- topTable(fit2, n = n_per_class, sort.by = "P")
+    genes <- union(genes, rownames(tt))
+  }
+  genes
+}
+
+ok_mc <- !is.na(pMat_big_mc$label_multiclass) & pMat_big_mc$label_multiclass != ""
+y_mc <- factor(pMat_big_mc$label_multiclass[ok_mc])
+e_mc <- eMat_big_mc[, ok_mc, drop = FALSE]
+
+cat("Multiclass class counts (merged):\n")
+print(table(y_mc))
+
+genes_mc <- select_genes_one_vs_rest(e_mc, y = y_mc, n_per_class = 25)
+cat("Selected genes for multiclass:", length(genes_mc), "\n")
+
+X_mc <- t(e_mc[intersect(genes_mc, rownames(e_mc)), , drop = FALSE])
+```
+
+## PCA (multiclass, merged)
+
+```{r, fig.cap="PCA of merged multiclass expression (after imputation + scaling). Points coloured by PAM50 subtype."}
+#| message: false
+#| warning: false
+# PCA is for visualisation only; we impute/scale using whole merged dataset (not CV-safe).
+imp_mc_all <- impute_fit(X_mc)
+X_mc_i_all <- impute_apply(X_mc, imp_mc_all)
+sc_mc_all <- standardize_fit(X_mc_i_all)
+X_mc_s_all <- standardize_apply(X_mc_i_all, sc_mc_all)
+
+pca_mc <- prcomp(X_mc_s_all, center = FALSE, scale. = FALSE)
+pca_mc_df <- data.frame(
+  PC1 = pca_mc$x[, 1],
+  PC2 = pca_mc$x[, 2],
+  truth = y_mc,
+  dataset_id = pMat_big_mc$dataset_id[ok_mc]
+)
+
+ggplot(pca_mc_df, aes(x = PC1, y = PC2, color = truth)) +
+  geom_point(alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "Subtype", title = "Multiclass PCA (merged)") +
+  theme(legend.position = "right")
+```
+
+```{r}
+#| message: false
+#| warning: false
+run_repeated_cv_multiclass <- function(X, y, K = 5, repeats = 10) {
+  y <- factor(y)
+  n <- nrow(X)
+  perf <- data.frame()
+  all_preds <- data.frame()
+
+  has_multinom <- requireNamespace("nnet", quietly = TRUE)
+
+  for (r in seq_len(repeats)) {
+    folds <- cvTools::cvFolds(n, K)
+    for (k in seq_len(K)) {
+      test_id <- folds$subsets[folds$which == k]
+      train_id <- setdiff(seq_len(n), test_id)
+
+      X_train <- X[train_id, , drop = FALSE]
+      X_test  <- X[test_id, , drop = FALSE]
+      y_train <- y[train_id]
+      y_test  <- y[test_id]
+
+      imp <- impute_fit(X_train)
+      X_train_i <- impute_apply(X_train, imp)
+      X_test_i  <- impute_apply(X_test, imp)
+
+      sc <- standardize_fit(X_train_i)
+      X_train_s <- standardize_apply(X_train_i, sc)
+      X_test_s  <- standardize_apply(X_test_i, sc)
+
+      # kNN
+      pred_knn <- class::knn(train = X_train_s, test = X_test_s, cl = y_train, k = 7)
+      perf <- rbind(perf, data.frame(task="multiclass", model="kNN", rep=r, fold=k,
+                                     accuracy=mean(pred_knn == y_test),
+                                     macro_f1=macro_f1(y_test, pred_knn)))
+      all_preds <- rbind(all_preds, data.frame(task="multiclass", model="kNN", rep=r, fold=k, truth=y_test, pred=pred_knn))
+
+      # SVM
+      svm_fit <- e1071::svm(x = X_train_s, y = y_train, kernel = "radial", cost = 1, gamma = 1 / ncol(X_train_s))
+      pred_svm <- predict(svm_fit, X_test_s)
+      perf <- rbind(perf, data.frame(task="multiclass", model="SVM_RBF", rep=r, fold=k,
+                                     accuracy=mean(pred_svm == y_test),
+                                     macro_f1=macro_f1(y_test, pred_svm)))
+      all_preds <- rbind(all_preds, data.frame(task="multiclass", model="SVM_RBF", rep=r, fold=k, truth=y_test, pred=pred_svm))
+
+      # RF (use imputed, not scaled)
+      rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train)
+      pred_rf <- predict(rf_fit, X_test_i)
+      perf <- rbind(perf, data.frame(task="multiclass", model="RF", rep=r, fold=k,
+                                     accuracy=mean(pred_rf == y_test),
+                                     macro_f1=macro_f1(y_test, pred_rf)))
+      all_preds <- rbind(all_preds, data.frame(task="multiclass", model="RF", rep=r, fold=k, truth=y_test, pred=pred_rf))
+
+      if (has_multinom) {
+        mn_fit <- nnet::multinom(y_train ~ ., data = data.frame(y_train = y_train, X_train_s),
+                                 trace = FALSE, MaxNWts = 50000)
+        pred_mn <- predict(mn_fit, newdata = data.frame(X_test_s))
+        perf <- rbind(perf, data.frame(task="multiclass", model="Multinom", rep=r, fold=k,
+                                       accuracy=mean(pred_mn == y_test),
+                                       macro_f1=macro_f1(y_test, pred_mn)))
+        all_preds <- rbind(all_preds, data.frame(task="multiclass", model="Multinom", rep=r, fold=k, truth=y_test, pred=pred_mn))
+      }
+    }
+  }
+
+  list(perf = perf, preds = all_preds)
+}
+
+res_mc <- run_repeated_cv_multiclass(X_mc, y_mc, K = 5, repeats = 10)
+```
+
+```{r, fig.cap="Multiclass (merged): accuracy and macro-F1 across models (repeated 5-fold CV)."}
+#| message: false
+#| warning: false
+perf_mc <- res_mc$perf %>%
+  pivot_longer(cols = c(accuracy, macro_f1), names_to = "metric", values_to = "value")
+
+ggplot(perf_mc, aes(x = model, y = value, fill = model)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_bw() +
+  labs(x = "", y = "", title = "Multiclass (merged) model comparison") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r, fig.cap="Multiclass (merged): confusion matrix for best model (by mean macro-F1)."}
+#| message: false
+#| warning: false
+best_model_mc <- perf_mc %>%
+  filter(metric == "macro_f1") %>%
+  group_by(model) %>%
+  summarise(mean = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>%
+  pull(model)
+
+cat("Best multiclass model by mean macro-F1:", best_model_mc, "\n")
+
+preds_best_mc <- res_mc$preds %>% filter(model == best_model_mc)
+tab_mc <- table(truth = preds_best_mc$truth, pred = preds_best_mc$pred)
+tab_mc_df <- as.data.frame(tab_mc)
+
+ggplot(tab_mc_df, aes(x = pred, y = truth, fill = Freq)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#2C7FB8") +
+  theme_bw() +
+  labs(x = "Predicted", y = "True", title = paste0("Multiclass confusion matrix: ", best_model_mc)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Best model separation (multiclass)
+
+```{r, fig.cap="Best multiclass model: PCA view with refit predictions on the full merged dataset (visualisation only)."}
+#| message: false
+#| warning: false
+fit_predict_best_multiclass <- function(best_model, X, y) {
+  y <- factor(y)
+  imp <- impute_fit(X)
+  X_i <- impute_apply(X, imp)
+
+  if (best_model %in% c("kNN", "SVM_RBF", "Multinom")) {
+    sc <- standardize_fit(X_i)
+    X_s <- standardize_apply(X_i, sc)
+  } else {
+    X_s <- X_i
+  }
+
+  if (best_model == "kNN") {
+    pred <- class::knn(train = X_s, test = X_s, cl = y, k = 7)
+    return(list(pred = pred))
+  }
+  if (best_model == "SVM_RBF") {
+    fit <- e1071::svm(x = X_s, y = y, kernel = "radial", cost = 1, gamma = 1 / ncol(X_s))
+    pred <- predict(fit, X_s)
+    return(list(pred = pred))
+  }
+  if (best_model == "RF") {
+    fit <- randomForest::randomForest(x = X_s, y = y)
+    pred <- predict(fit, X_s)
+    return(list(pred = pred))
+  }
+  if (best_model == "Multinom") {
+    if (!requireNamespace("nnet", quietly = TRUE)) stop("Package 'nnet' not installed; can't fit Multinom.")
+    fit <- nnet::multinom(y ~ ., data = data.frame(y = y, X_s), trace = FALSE, MaxNWts = 50000)
+    pred <- predict(fit, newdata = data.frame(X_s))
+    return(list(pred = pred))
+  }
+  stop("Unknown multiclass model name: ", best_model)
+}
+
+pred_full_mc <- fit_predict_best_multiclass(best_model_mc, X_mc, y_mc)$pred
+
+pca_mc_pred_df <- pca_mc_df %>%
+  mutate(pred = pred_full_mc)
+
+ggplot(pca_mc_pred_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = truth, shape = pred), alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "True", shape = "Pred (refit)", title = paste0("Best multiclass model separation: ", best_model_mc)) +
+  theme(legend.position = "right")
+```
+
+## Binary DE gene selection (merged dataset)
+
+```{r}
+#| message: false
+#| warning: false
+# Binary DE gene selection on the MERGED binary dataset
+ok_bin_de <- !is.na(pMat_big_bin$label_binary) & pMat_big_bin$label_binary != ""
+y_bin_de <- factor(pMat_big_bin$label_binary[ok_bin_de], levels = c("Cancer", "Normal"))
+e_bin_de <- eMat_big_bin[, ok_bin_de, drop = FALSE]
+
+tab_bin_de <- table(y_bin_de)
+cat("Binary class table (merged):\n"); print(tab_bin_de)
+if (nlevels(y_bin_de) < 2 || any(tab_bin_de == 0)) {
+  stop("Merged binary labels must contain at least two classes with non-zero counts. Check label inference per dataset.")
+}
+
+design_bin <- model.matrix(~ y_bin_de)
+fit_bin <- eBayes(lmFit(e_bin_de, design_bin))
+top_bin <- topTable(fit_bin, n = 50, sort.by = "P")
+genes_bin <- rownames(top_bin)
+cat("Selected genes for binary (merged):", length(genes_bin), "\n")
+top_bin
+```
+
+## Model zoo + repeated CV (binary: merged datasets)
+
+```{r}
+#| message: false
+#| warning: false
+make_stratified_folds <- function(y, K = 4) {
+  y <- factor(y)
+  folds <- vector("list", K)
+  idx_by_class <- split(seq_along(y), y)
+  for (cl in names(idx_by_class)) {
+    idx <- sample(idx_by_class[[cl]])
+    groups <- split(idx, rep(1:K, length.out = length(idx)))
+    for (k in seq_len(K)) folds[[k]] <- c(folds[[k]], groups[[k]])
+  }
+  lapply(folds, sort)
+}
+
+auc_roc <- function(truth_pos, score_pos) {
+  truth_pos <- as.integer(truth_pos)
+  score_pos <- as.numeric(score_pos)
+  pos <- truth_pos == 1
+  neg <- truth_pos == 0
+  n_pos <- sum(pos)
+  n_neg <- sum(neg)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  r <- rank(score_pos, ties.method = "average")
+  (sum(r[pos]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+pr_curve_df <- function(truth_pos, score_pos) {
+  ord <- order(score_pos, decreasing = TRUE)
+  y <- as.integer(truth_pos[ord])
+  s <- score_pos[ord]
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+  fn_total <- sum(y == 1)
+  precision <- tp / pmax(tp + fp, 1)
+  recall <- tp / pmax(fn_total, 1)
+  tibble(threshold = s, precision = precision, recall = recall)
+}
+
+auc_pr <- function(truth_pos, score_pos) {
+  df <- pr_curve_df(truth_pos, score_pos)
+  if (nrow(df) < 2) return(NA_real_)
+  # trapezoid on recall axis
+  o <- order(df$recall, df$precision)
+  x <- df$recall[o]
+  y <- df$precision[o]
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2, na.rm = TRUE)
+}
+
+binary_metrics <- function(truth, pred, positive = "Normal") {
+  # Drop incomplete pairs to avoid NA-driven logical errors
+  keep <- !(is.na(truth) | is.na(pred))
+  truth <- factor(as.character(truth[keep]))
+  pred <- factor(as.character(pred[keep]), levels = levels(truth))
+  if (length(truth) == 0) {
+    return(tibble(
+      accuracy = NA_real_,
+      balanced_accuracy = NA_real_,
+      recall_normal = NA_real_,
+      precision_normal = NA_real_,
+      f1_normal = NA_real_
+    ))
+  }
+  tp <- sum(truth == positive & pred == positive)
+  fn <- sum(truth == positive & pred != positive)
+  tn <- sum(truth != positive & pred != positive)
+  fp <- sum(truth != positive & pred == positive)
+
+  recall_pos <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+  precision_pos <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+  f1_pos <- if (is.na(recall_pos) || is.na(precision_pos) || (recall_pos + precision_pos) == 0) NA_real_ else {
+    2 * recall_pos * precision_pos / (recall_pos + precision_pos)
+  }
+  specificity <- if ((tn + fp) == 0) NA_real_ else tn / (tn + fp)
+  bal_acc <- mean(c(recall_pos, specificity), na.rm = TRUE)
+  acc <- mean(truth == pred)
+
+  tibble(
+    accuracy = acc,
+    balanced_accuracy = bal_acc,
+    recall_normal = recall_pos,
+    precision_normal = precision_pos,
+    f1_normal = f1_pos
+  )
+}
+
+best_threshold_f1 <- function(truth, score_pos, positive = "Normal") {
+  truth <- as.character(truth)
+  neg <- setdiff(unique(na.omit(truth)), positive)[1]
+  if (is.na(neg) || length(neg) == 0) return(0.5)
+  cand <- sort(unique(score_pos))
+  if (length(cand) > 200) cand <- quantile(cand, probs = seq(0, 1, length.out = 200), na.rm = TRUE)
+  f1 <- sapply(cand, function(t) {
+    pred <- ifelse(score_pos >= t, positive, neg)
+    m <- binary_metrics(truth, pred, positive = positive)
+    m$f1_normal
+  })
+  cand[which.max(f1)]
+}
+
+run_repeated_cv_binary <- function(X, y, K = 4, repeats = 20, positive = "Normal", use_weights = TRUE) {
+  y <- factor(y)
+  n <- nrow(X)
+
+  perf <- data.frame()
+  all_preds <- data.frame()
+  all_scores <- data.frame()
+
+  for (r in seq_len(repeats)) {
+    folds <- make_stratified_folds(y, K = K)
+    for (k in seq_len(K)) {
+      test_id <- folds[[k]]
+      train_id <- setdiff(seq_len(n), test_id)
+
+      X_train <- X[train_id, , drop = FALSE]
+      X_test  <- X[test_id, , drop = FALSE]
+      y_train <- y[train_id]
+      y_test  <- y[test_id]
+
+      imp <- impute_fit(X_train)
+      X_train_i <- impute_apply(X_train, imp)
+      X_test_i  <- impute_apply(X_test, imp)
+
+      sc <- standardize_fit(X_train_i)
+      X_train_s <- standardize_apply(X_train_i, sc)
+      X_test_s  <- standardize_apply(X_test_i, sc)
+
+      # Class imbalance weight
+      n_pos <- sum(y_train == positive)
+      n_neg <- sum(y_train != positive)
+      pos_w <- if (n_pos > 0) n_neg / n_pos else 1
+      neg_label <- setdiff(levels(y_train), positive)[1]
+      cw <- c()
+      cw[positive] <- pos_w
+      cw[neg_label] <- 1
+
+      # ---- kNN (baseline, unweighted) ----
+      pred_knn <- class::knn(train = X_train_s, test = X_test_s, cl = y_train, k = 7, prob = TRUE)
+      win_prob <- attr(pred_knn, "prob")
+      score_knn <- ifelse(pred_knn == positive, win_prob, 1 - win_prob)
+      m_knn <- binary_metrics(y_test, pred_knn, positive = positive)
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model="kNN", rep=r, fold=k, m_knn))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model="kNN", rep=r, fold=k, truth=y_test, pred=pred_knn))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model="kNN", rep=r, fold=k, truth=y_test, score_normal=score_knn))
+
+      # ---- SVM ----
+      svm_fit <- e1071::svm(
+        x = X_train_s, y = y_train, kernel = "radial",
+        cost = 1, gamma = 1 / ncol(X_train_s),
+        probability = TRUE,
+        class.weights = if (use_weights) cw else NULL
+      )
+      pred_svm <- predict(svm_fit, X_test_s, probability = TRUE)
+      prob_svm <- attr(pred_svm, "probabilities")
+      score_svm <- if ("Normal" %in% colnames(prob_svm)) prob_svm[, "Normal"] else prob_svm[, 1]
+      m_svm <- binary_metrics(y_test, pred_svm, positive = positive)
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                     rep=r, fold=k, m_svm))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_svm))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "SVM_RBF_w", "SVM_RBF"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=score_svm))
+
+      # ---- RF ----
+      rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train, classwt = if (use_weights) cw else NULL)
+      pred_rf <- predict(rf_fit, X_test_i)
+      prob_rf <- predict(rf_fit, X_test_i, type = "prob")
+      score_rf <- if ("Normal" %in% colnames(prob_rf)) prob_rf[, "Normal"] else prob_rf[, 1]
+      m_rf <- binary_metrics(y_test, pred_rf, positive = positive)
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "RF_w", "RF"),
+                                     rep=r, fold=k, m_rf))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "RF_w", "RF"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_rf))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "RF_w", "RF"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=score_rf))
+
+      # ---- Logistic regression ----
+      w <- if (use_weights) ifelse(y_train == positive, pos_w, 1) else rep(1, length(y_train))
+      glm_fit <- glm(y_train ~ ., data = data.frame(y_train = y_train, X_train_s),
+                     family = binomial(), weights = w)
+      p_hat <- predict(glm_fit, newdata = data.frame(X_test_s), type = "response")
+      pred_glm <- ifelse(p_hat >= 0.5, positive, setdiff(levels(y_train), positive)[1])
+      pred_glm <- factor(pred_glm, levels = levels(y_train))
+      m_glm <- binary_metrics(y_test, pred_glm, positive = positive)
+      perf <- rbind(perf, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                     model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                     rep=r, fold=k, m_glm))
+      all_preds <- rbind(all_preds, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                               model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                               rep=r, fold=k, truth=y_test, pred=pred_glm))
+      all_scores <- rbind(all_scores, data.frame(task="binary", setting=ifelse(use_weights, "weighted", "unweighted"),
+                                                 model=ifelse(use_weights, "Logistic_w", "Logistic"),
+                                                 rep=r, fold=k, truth=y_test, score_normal=p_hat))
+    }
+  }
+
+  list(perf = perf, preds = all_preds, scores = all_scores)
+}
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Use merged binary dataset (across `datasets_binary`)
+ok_bin <- !is.na(pMat_big_bin$label_binary) & pMat_big_bin$label_binary != ""
+y_bin2 <- factor(pMat_big_bin$label_binary[ok_bin], levels = c("Cancer", "Normal"))
+
+X_bin <- t(eMat_big_bin[intersect(genes_bin, rownames(eMat_big_bin)), ok_bin, drop = FALSE])
+
+cat("Binary X dims (samples x genes):", paste(dim(X_bin), collapse=" x "), "\n")
+cat("Binary class counts:\n")
+print(table(y_bin2))
+
+res_bin <- run_repeated_cv_binary(X_bin, y_bin2, K = 4, repeats = 20, positive = "Normal")
+res_bin_unw <- run_repeated_cv_binary(X_bin, y_bin2, K = 4, repeats = 20, positive = "Normal", use_weights = FALSE)
+
+perf_bin <- bind_rows(res_bin$perf, res_bin_unw$perf)
+preds_bin <- bind_rows(res_bin$preds, res_bin_unw$preds)
+scores_bin <- bind_rows(res_bin$scores, res_bin_unw$scores)
+```
+
+## PCA (binary, merged)
+
+```{r, fig.cap="PCA of merged binary expression (after imputation + scaling). Points coloured by class."}
+#| message: false
+#| warning: false
+# PCA is for visualisation only; we impute/scale using whole merged dataset (not CV-safe).
+imp_bin_all <- impute_fit(X_bin)
+X_bin_i_all <- impute_apply(X_bin, imp_bin_all)
+sc_bin_all <- standardize_fit(X_bin_i_all)
+X_bin_s_all <- standardize_apply(X_bin_i_all, sc_bin_all)
+
+pca_bin <- prcomp(X_bin_s_all, center = FALSE, scale. = FALSE)
+pca_bin_df <- data.frame(
+  PC1 = pca_bin$x[, 1],
+  PC2 = pca_bin$x[, 2],
+  truth = y_bin2,
+  dataset_id = pMat_big_bin$dataset_id[ok_bin]
+)
+
+ggplot(pca_bin_df, aes(x = PC1, y = PC2, color = truth)) +
+  geom_point(alpha = 0.75, size = 2) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "Class", title = "Binary PCA (merged)") +
+  theme(legend.position = "right")
+```
+
+```{r, fig.cap="Binary performance: balanced metrics across models (stratified repeated 4-fold CV)."}
+#| message: false
+#| warning: false
+perf_bin_long <- perf_bin %>%
+  pivot_longer(
+    cols = c(accuracy, balanced_accuracy, recall_normal, precision_normal, f1_normal),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+perf_bin_long_w <- perf_bin_long %>% filter(setting == "weighted")
+perf_bin_long_unw <- perf_bin_long %>% filter(setting == "unweighted")
+
+p_w <- ggplot(perf_bin_long_w, aes(x = model, y = value, fill = model)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_bw() +
+  labs(x = "", y = "", title = "Binary model comparison (weighted)") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+
+p_unw <- ggplot(perf_bin_long_unw, aes(x = model, y = value, fill = model)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_bw() +
+  labs(x = "", y = "", title = "Binary model comparison (unweighted)") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+
+print(p_w)
+print(p_unw)
+```
+
+```{r, fig.cap="Binary: confusion matrix for best model after threshold tuning (max F1 for Normal)."}
+#| message: false
+#| warning: false
+best_run_bin <- perf_bin %>%
+  group_by(setting, model) %>%
+  summarise(mean = mean(balanced_accuracy, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean)) %>%
+  slice(1) %>%
+  slice(1)
+
+best_setting_bin <- best_run_bin$setting[1]
+best_model_bin <- best_run_bin$model[1]
+cat("Best binary run by mean balanced accuracy:", best_setting_bin, "/", best_model_bin, "\n")
+
+score_best <- scores_bin %>% filter(setting == best_setting_bin, model == best_model_bin)
+thr_best <- best_threshold_f1(score_best$truth, score_best$score_normal, positive = "Normal")
+cat("Chosen threshold (max pooled F1 for Normal):", round(thr_best, 4), "\n")
+
+neg_label_bin <- setdiff(levels(y_bin2), "Normal")[1]
+pred_tuned <- ifelse(score_best$score_normal >= thr_best, "Normal", neg_label_bin)
+tab_bin <- table(truth = score_best$truth, pred = pred_tuned)
+tab_bin_df <- as.data.frame(tab_bin)
+
+ggplot(tab_bin_df, aes(x = pred, y = truth, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5) +
+  scale_fill_gradient(low = "white", high = "#41AB5D") +
+  theme_bw() +
+  labs(x = "Predicted", y = "True", title = paste0("Binary confusion matrix (pooled CV preds): ", best_model_bin)) +
+  theme(legend.position = "right")
+```
+
+## Best model separation (binary)
+
+```{r, fig.cap="Best binary model: score separation with chosen threshold (pooled CV scores)."}
+#| message: false
+#| warning: false
+sep_df <- score_best %>%
+  mutate(truth = factor(truth, levels = c("Cancer", "Normal")))
+
+ggplot(sep_df, aes(x = score_normal, fill = truth)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = thr_best, linetype = 2, linewidth = 1) +
+  theme_bw() +
+  labs(
+    x = "Predicted P(Normal)",
+    y = "Density",
+    fill = "True class",
+    title = paste0("Binary separation (", best_model_bin, "): pooled CV scores + threshold")
+  )
+```
+
+```{r, fig.cap="Binary: pooled ROC and PR curves for the best model."}
+#| message: false
+#| warning: false
+curve_best <- scores_bin %>% filter(setting == best_setting_bin, model == best_model_bin)
+truth01 <- as.integer(curve_best$truth == "Normal")
+score <- curve_best$score_normal
+
+# ROC points
+roc_thresh <- sort(unique(score), decreasing = TRUE)
+roc_df <- lapply(roc_thresh, function(t) {
+  pred <- score >= t
+  tp <- sum(pred & truth01 == 1)
+  fn <- sum(!pred & truth01 == 1)
+  fp <- sum(pred & truth01 == 0)
+  tn <- sum(!pred & truth01 == 0)
+  tibble(
+    threshold = t,
+    tpr = if ((tp + fn) == 0) NA_real_ else tp / (tp + fn),
+    fpr = if ((fp + tn) == 0) NA_real_ else fp / (fp + tn)
+  )
+}) %>% bind_rows()
+
+pr_df <- pr_curve_df(truth01, score)
+
+p1 <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  theme_bw() +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    title = paste0("ROC curve (AUC = ", round(auc_roc(truth01, score), 3), ")")
+  )
+
+p2 <- ggplot(pr_df, aes(x = recall, y = precision)) +
+  geom_line(color = "#41AB5D", linewidth = 1) +
+  theme_bw() +
+  labs(
+    x = "Recall (Normal)",
+    y = "Precision (Normal)",
+    title = paste0("PR curve (AUC = ", round(auc_pr(truth01, score), 3), ")")
+  )
+
+print(p1)
+print(p2)
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Weighted binary: probability metrics (pooled CV predictions)
+model_auc <- res_bin$scores %>%
+  group_by(setting, model) %>%
+  summarise(
+    roc_auc = auc_roc(truth == "Normal", score_normal),
+    pr_auc = auc_pr(truth == "Normal", score_normal),
+    .groups = "drop"
+  )
+
+knitr::kable(model_auc, caption = "Binary: probability metrics (pooled CV predictions), weighted vs unweighted")
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Binary: aggregate metrics table (mean ± SD) plus ROC/PR AUC, weighted vs unweighted
+model_summary <- perf_bin %>%
+  group_by(setting, model) %>%
+  summarise(
+    accuracy_mean = mean(accuracy, na.rm = TRUE),
+    accuracy_sd = sd(accuracy, na.rm = TRUE),
+    balanced_accuracy_mean = mean(balanced_accuracy, na.rm = TRUE),
+    balanced_accuracy_sd = sd(balanced_accuracy, na.rm = TRUE),
+    sensitivity_mean = mean(recall_normal, na.rm = TRUE),
+    sensitivity_sd = sd(recall_normal, na.rm = TRUE),
+    precision_mean = mean(precision_normal, na.rm = TRUE),
+    precision_sd = sd(precision_normal, na.rm = TRUE),
+    f1_mean = mean(f1_normal, na.rm = TRUE),
+    f1_sd = sd(f1_normal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(model_auc, by = c("setting", "model")) %>%
+  mutate(
+    accuracy = sprintf("%.3f \u00B1 %.3f", accuracy_mean, accuracy_sd),
+    balanced_accuracy = sprintf("%.3f \u00B1 %.3f", balanced_accuracy_mean, balanced_accuracy_sd),
+    sensitivity = sprintf("%.3f \u00B1 %.3f", sensitivity_mean, sensitivity_sd),
+    precision = sprintf("%.3f \u00B1 %.3f", precision_mean, precision_sd),
+    f1 = sprintf("%.3f \u00B1 %.3f", f1_mean, f1_sd),
+    roc_auc = round(roc_auc, 3),
+    pr_auc = round(pr_auc, 3)
+  ) %>%
+  select(setting, model, accuracy, balanced_accuracy, sensitivity, precision, f1, roc_auc, pr_auc)
+
+knitr::kable(model_summary, caption = "Binary: summary metrics per model (weighted vs unweighted)")
+```
+
+## How many DE genes do we need? (binary)
+
+```{r, fig.cap="Binary: best balanced accuracy vs number of DE genes (weighted models only)."}
+#| message: false
+#| warning: false
+# Goal: find the smallest top-N DE gene set that achieves strong performance.
+# We evaluate a grid of N, run the weighted CV once per N, and take the best mean balanced accuracy across models.
+
+de_gene_sweep <- function(e_bin_de, y_bin_de, n_grid = c(5, 10, 20, 30, 40, 50, 75, 100, 150, 200),
+                          K = 4, repeats = 10, positive = "Normal") {
+  design_bin <- model.matrix(~ y_bin_de)
+  fit_bin <- eBayes(lmFit(e_bin_de, design_bin))
+
+  out <- list()
+  for (n_genes in n_grid) {
+    tt <- topTable(fit_bin, n = n_genes, sort.by = "P")
+    genes <- rownames(tt)
+    X <- t(e_bin_de[intersect(genes, rownames(e_bin_de)), , drop = FALSE])
+
+    # If something went wrong (e.g., no overlap), skip safely
+    if (ncol(X) < 2) next
+
+    res_w <- run_repeated_cv_binary(X, y_bin_de, K = K, repeats = repeats, positive = positive, use_weights = TRUE)
+    perf_w <- res_w$perf
+
+    best <- perf_w %>%
+      group_by(model) %>%
+      summarise(mean_bal_acc = mean(balanced_accuracy, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(mean_bal_acc)) %>%
+      slice(1)
+
+    out[[as.character(n_genes)]] <- data.frame(
+      n_genes = n_genes,
+      best_model = best$model[1],
+      best_mean_balanced_accuracy = best$mean_bal_acc[1]
+    )
+  }
+  bind_rows(out)
+}
+
+sweep_res <- de_gene_sweep(e_bin_de, y_bin_de,
+                          n_grid = c(5, 10, 20, 30, 40, 50, 75, 100, 150, 200),
+                          K = 4, repeats = 10, positive = "Normal")
+
+knitr::kable(sweep_res, caption = "Binary DE gene sweep (weighted CV): best mean balanced accuracy by top-N DE genes")
+
+ggplot(sweep_res, aes(x = n_genes, y = best_mean_balanced_accuracy)) +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  geom_point(size = 2) +
+  theme_bw() +
+  scale_x_continuous(breaks = sweep_res$n_genes) +
+  labs(x = "Top-N DE genes", y = "Best mean balanced accuracy (weighted CV)", title = "How many DE genes do we need?") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
