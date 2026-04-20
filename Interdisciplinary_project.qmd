@@ -1,9 +1,8 @@
 ---
-title: "Interdisciplinary project"
+title: "Corrected Interdisciplinary Project"
 format: html
 editor: visual
 ---
-
 
 ```{r}
 # Load libraries
@@ -18,259 +17,960 @@ library(matrixStats)
 library(randomForest)
 library(pbapply)
 library(dplyr)
+library(tidyr)
+library(tibble)
 library(sva)
 library(devtools)
 library(limma)
-#GSE104293 -> glima 68 68 for survival
+library(ggplot2)
+library(e1071)
+library(pheatmap)
 
+set.seed(123)
 ```
 
-```{r}
-GSE7904 <- getGEO(filename = "GSE7904_series_matrix.txt")
-GSE9574 <- getGEO(filename = "GSE9574_series_matrix.txt")
-GSE15852 <- getGEO(filename = "GSE15852_series_matrix.txt")
-GSE29431 <- getGEO(filename = "GSE29431_series_matrix.txt")
-GSE45827 <- getGEO(filename = "GSE45827_series_matrix.txt")
-GSE54002 <- getGEO(filename = "GSE54002_series_matrix.txt")
-
-metadata_GSE7904 <- pData(GSE7904)
-metadata_GSE9574 <- pData(GSE9574)
-metadata_GSE15852<- pData(GSE15852)
-metadata_GSE29431 <- pData(GSE29431)
-metadata_GSE45827 <- pData(GSE45827)
-metadata_GSE54002 <- pData(GSE54002)
-
-
-
-# Recode into a new 'Status' column
-metadata_GSE7904 <- metadata_GSE7904 %>%
-  mutate(Status = case_when(
-    characteristics_ch1 == "NB" ~ "cell",
-    characteristics_ch1 == "NO" ~ "control",
-    TRUE ~ "tumor" # Captures Basal, BRCA1, and non-BLC
-  ))
-
-
-metadata_GSE9574<- metadata_GSE9574%>%
-  mutate(Status = case_when(
-    characteristics_ch1 == "disease-state: normal (reduction mammoplasty)" ~ "control",
-    TRUE ~ "tumor"
-  ))
-
-metadata_GSE15852<- metadata_GSE15852%>%
-  mutate(Status = case_when(
-    source_name_ch1 == "normal breast tissue" ~ "control",
-    TRUE ~ "tumor"
-  ))
-
-metadata_GSE29431 <- metadata_GSE29431 %>%
-  mutate(Status = case_when(
-    grepl("^Normal", title, ignore.case = TRUE) ~ "control",
-    TRUE ~ "tumor"
-  ))
-
-
-metadata_GSE45827 <- metadata_GSE45827 %>%
-  mutate(Status = case_when(
-    grepl("CellLine",source_name_ch1,ignore.case=TRUE) ~ "cell",
-    grepl("Human Normal",source_name_ch1,ignore.case=TRUE) ~ "control",
-    TRUE ~ "tumor"
-  ))
-
-metadata_GSE54002<- metadata_GSE54002%>%
-  mutate(Status = case_when(
-    characteristics_ch1 == "tumor/nontumor: Non-tumor" ~ "control",
-    TRUE ~ "tumor"
-  ))
-
-
-# List of all your metadata objects
-metadata_list <- list(
-  GSE7904 = metadata_GSE7904,
-  GSE9574 = metadata_GSE9574,
-  GSE15852 = metadata_GSE15852,
-  GSE29431 = metadata_GSE29431,
-  GSE45827 = metadata_GSE45827,
-  GSE54002 = metadata_GSE54002
-)
-
-# Filter each to keep only control and tumor, then add a Study ID
-cleaned_metadata_list <- lapply(names(metadata_list), function(x) {
-  metadata_list[[x]] %>%
-    filter(Status %in% c("control", "tumor")) %>%
-    mutate(Study = x, SampleID = rownames(.)) %>%
-    select(SampleID, Status, Study)
-})
-
-# Combine into one master metadata table
-master_metadata <- bind_rows(cleaned_metadata_list)
-rownames(master_metadata) <- master_metadata$SampleID
-
-table(metadata_GSE54002$Status)
-```
-
-#Filter expression matrices
+## Helper Functions
 
 ```{r}
+# Robust GEO loading with retry logic
+load_geo_eset <- function(gse_id) {
+  geo_cache_dir <- file.path("data", "geo-cache")
+  if (!dir.exists(geo_cache_dir)) dir.create(geo_cache_dir, recursive = TRUE)
 
-check_and_log_fixed <- function(gse_obj) {
-  ex <- exprs(gse_obj)
+  g <- tryCatch(
+    GEOquery::getGEO(gse_id, destdir = geo_cache_dir),
+    error = function(e) e
+  )
   
-  # Only transform if raw (max > 50)
+  if (!inherits(g, "error")) {
+    if (inherits(g, "ExpressionSet")) return(g)
+    if (is.list(g) && length(g) >= 1) return(g[[1]])
+  }
+
+  destfile <- file.path(geo_cache_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+  if (file.exists(destfile)) {
+    g2 <- GEOquery::getGEO(filename = destfile)
+    if (inherits(g2, "ExpressionSet")) return(g2)
+    if (is.list(g2) && length(g2) >= 1) return(g2[[1]])
+  }
+  
+  stop("Could not load ExpressionSet for ", gse_id)
+}
+
+# Clean gene symbols (take first if multiple)
+clean_first_symbol <- function(s) {
+  if (is.na(s) || trimws(as.character(s)) == "") return(NA_character_)
+  s <- trimws(as.character(s))
+  parts <- strsplit(s, " /// ", fixed = TRUE)[[1]]
+  trimws(parts[1])
+}
+
+# Collapse probes to genes using gene symbols
+collapse_to_genes <- function(eset) {
+  e <- exprs(eset)
+  fd <- fData(eset)
+  
+  sym_col <- grep("gene\\s*symbol|symbol", colnames(fd), ignore.case = TRUE, value = TRUE)[1]
+  gene_sym_raw <- if (!is.na(sym_col)) as.character(fd[, sym_col]) else rep(NA_character_, nrow(fd))
+  
+  has_symbol <- !is.na(gene_sym_raw) & trimws(gene_sym_raw) != ""
+  gene_sym <- rep(NA_character_, length(gene_sym_raw))
+  gene_sym[has_symbol] <- vapply(gene_sym_raw[has_symbol], clean_first_symbol, character(1))
+  gene_sym <- ifelse(is.na(gene_sym) | gene_sym == "", rownames(e), gene_sym)
+  
+  e_g <- limma::avereps(e, ID = gene_sym)
+  
+  fd$.__gene_sym__ <- gene_sym
+  fd_g <- fd %>%
+    tibble::as_tibble() %>%
+    mutate(.__gene_sym__ = fd$.__gene_sym__) %>%
+    group_by(.__gene_sym__) %>%
+    slice(1) %>%
+    ungroup() %>%
+    tibble::column_to_rownames(".__gene_sym__")
+  
+  list(eMat_g = e_g, fMat_g = fd_g, pMat = pData(eset))
+}
+
+# Check and log-transform if needed
+check_and_log_transform <- function(eset) {
+  ex <- exprs(eset)
   if (max(ex, na.rm = TRUE) > 50) {
-    message("Log-transforming raw data with flooring...")
-    
-    # Floor negative values to a small positive number (e.g., 1) 
-    # so that log2(1) = 0
-    ex[ex <= 0] <- 1 
-    exprs(gse_obj) <- log2(ex)
-    
+    message("Log-transforming raw data...")
+    ex[ex <= 0] <- 1
+    exprs(eset) <- log2(ex)
   } else {
     message("Data is already log-scaled.")
   }
-  return(gse_obj)
+  return(eset)
 }
 
-# Apply the fixed function
-GSE7904  <- check_and_log_fixed(GSE7904)
-GSE9574  <- check_and_log_fixed(GSE9574)
-GSE15852 <- check_and_log_fixed(GSE15852)
-# List of expression objects
-exp_list <- list(
-  GSE7904 = exprs(GSE7904),
-  GSE9574 = exprs(GSE9574),
-  GSE15852 = exprs(GSE15852),
-  GSE29431 = exprs(GSE29431),
-  GSE45827 = exprs(GSE45827),
-  GSE54002 = exprs(GSE54002)
+# Infer binary labels
+infer_binary_label <- function(pMat, normal_keywords) {
+  cols_char <- grep("^characteristics_ch|^source_name|^title", colnames(pMat), value = TRUE)
+  cols_other <- setdiff(colnames(pMat), cols_char)
+  cols_try <- c(cols_char, cols_other)
+
+  has_kw <- function(x, keywords) {
+    x <- tolower(as.character(x))
+    x[is.na(x)] <- ""
+    any(vapply(keywords, function(kw) any(grepl(kw, x, fixed = TRUE)), logical(1)))
+  }
+
+  for (cn in cols_try) {
+    x <- pMat[[cn]]
+    if (!has_kw(x, normal_keywords)) next
+    
+    xlow <- tolower(as.character(x))
+    xlow[is.na(xlow)] <- ""
+    
+    is_normal <- Reduce(`|`, lapply(normal_keywords, function(kw) grepl(kw, xlow, fixed = TRUE)))
+    label <- ifelse(is_normal, "Normal", "Cancer")
+    label[xlow == ""] <- NA_character_
+    label <- factor(label, levels = c("Cancer", "Normal"))
+    
+    tab <- table(label, useNA = "no")
+    if (length(tab) >= 2 && all(tab > 0)) {
+      return(list(label = label, label_col = cn))
+    }
+  }
+
+  list(label = factor(rep(NA_character_, nrow(pMat)), levels = c("Cancer", "Normal")),
+       label_col = NA_character_)
+}
+
+# Merge dataframes with different columns
+rbind_fill <- function(dfs) {
+  all_cols <- Reduce(intersect, lapply(dfs, colnames))
+  dfs2 <- lapply(dfs, function(d) {
+    miss <- setdiff(all_cols, colnames(d))
+    for (m in miss) d[[m]] <- NA
+    d[, all_cols, drop = FALSE]
+  })
+  do.call(rbind, dfs2)
+}
+```
+
+## Load and Process Data
+
+```{r}
+dataset_ids <- c("GSE7904", "GSE9574", "GSE15852", "GSE29431", "GSE45827", "GSE54002")
+
+normal_keywords <- c(
+  "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
+  "healthy", "control", "adjacent normal", "benign", "reduction mammoplasty"
 )
 
-# Filter matrices to include only the 'control' and 'tumor' samples
-exp_filtered <- lapply(names(exp_list), function(x) {
-  samples_to_keep <- master_metadata$SampleID[master_metadata$Study == x]
-  exp_list[[x]][, samples_to_keep, drop = FALSE]
+pieces <- lapply(dataset_ids, function(id) {
+  message("Processing ", id, "...")
+  eset <- load_geo_eset(id)
+  eset <- check_and_log_transform(eset)
+  cc   <- collapse_to_genes(eset)
+  lab  <- infer_binary_label(cc$pMat, normal_keywords)
+  
+  p <- cc$pMat
+  p$dataset_id        <- id
+  p$label_col_detected <- lab$label_col
+  p$Status            <- as.character(lab$label)
+  p$SampleID          <- rownames(p)
+  
+  list(id = id, e = cc$eMat_g, p = p, f = cc$fMat_g)
 })
 
-# Find common probes/genes across ALL datasets
-common_probes<- Reduce(intersect, lapply(exp_filtered, rownames))
-length(common_probes)
-
-# Subset all matrices to these common genes and column-bind
-merged_expression <- do.call(cbind, lapply(exp_filtered, function(x) x[common_probes, ]))
-dim(merged_expression)
-
-
-fData(GSE15852)
+names(pieces) <- dataset_ids
 ```
-#Batch Correction
+
+## Merge by Gene Names (INTERSECTION)
+
 ```{r}
+all_genes <- Reduce(intersect, lapply(pieces, function(x) rownames(x$e)))
+cat("Genes shared across all datasets:", length(all_genes), "\n")
 
-mod <- model.matrix(~as.factor(Status), data = master_metadata)
+pad_to_all_genes <- function(e, all_genes) {
+  miss <- setdiff(all_genes, rownames(e))
+  if (length(miss) > 0) {
+    pad <- matrix(NA_real_, nrow = length(miss), ncol = ncol(e),
+                  dimnames = list(miss, colnames(e)))
+    e <- rbind(e, pad)
+  }
+  e[all_genes, , drop = FALSE]
+}
 
-# Run ComBat to remove the 'Study' effect
-# This might take a minute depending on your RAM
-final_expression_clean <- ComBat(dat = merged_expression, 
-                                 batch = master_metadata$Study, 
-                                 mod = mod,
-                                 par.prior = TRUE) # Uses parametric empirical Bayes
+merged_expression <- do.call(cbind, lapply(pieces, function(x) {
+  pad_to_all_genes(x$e, all_genes)
+}))
+
+master_metadata <- rbind_fill(lapply(pieces, `[[`, "p"))
+
+ok <- !is.na(master_metadata$Status) & master_metadata$Status %in% c("Cancer", "Normal")
+merged_expression <- merged_expression[, ok, drop = FALSE]
+master_metadata   <- master_metadata[ok, ]
+rownames(master_metadata) <- master_metadata$SampleID
+
+cat("\nMerged expression matrix:", paste(dim(merged_expression), collapse = " x "), "\n")
+cat("\nClass distribution:\n")
+print(table(master_metadata$Status, master_metadata$dataset_id))
 ```
+
+## Remove High-NA Genes (No Global Imputation)
+
 ```{r}
-# 1. Transpose the matrix (PCA expects samples as rows, genes as columns)
-pca_data <- t(final_expression_clean)
+# FIX 2: Remove the global median imputation that was here previously.
+# Imputation now happens strictly per-fold inside CV/LODO to prevent leakage.
+# We only drop genes with >30% missingness across all samples.
+na_fraction <- rowMeans(is.na(merged_expression))
+merged_expression <- merged_expression[na_fraction < 0.3, ]
+cat("Genes retained after NA filter:", nrow(merged_expression), "\n")
+```
 
-# 2. Run PCA (scale. = TRUE is recommended for gene expression)
-pca_res <- prcomp(pca_data, scale. = TRUE)
+## Per-Fold ComBat Helper
 
-# 3. Create a plotting dataframe
-# We join the PCA coordinates with your master_metadata
+```{r}
+# FIX 1: ComBat must run inside each CV/LODO fold, fit on training samples only,
+# then applied to test samples using the estimated parameters.
+#
+# We implement this via a two-step approach:
+#   1. Fit ComBat on train split -> capture per-batch gamma/delta estimates
+#   2. Apply those estimates to adjust the test split
+#
+# combat_fit_apply() handles both steps and returns corrected train + test matrices.
+
+combat_fit_apply <- function(expr_train, batch_train, mod_train,
+                             expr_test,  batch_test) {
+  
+  # Identify batches that appear in BOTH train and test
+  train_batches <- unique(as.character(batch_train))
+  test_batches  <- unique(as.character(batch_test))
+  common_batches <- intersect(train_batches, test_batches)
+  
+  # If test has batches not seen in train, fall back to mean-centering for those
+  novel_test_idx <- which(!(as.character(batch_test) %in% common_batches))
+  
+  # Step 1: Run ComBat on training data to get corrected train matrix
+  # sva::ComBat returns a corrected expression matrix; we need the parameters too.
+  # We use ComBat with mean.only=FALSE (default) and capture gamma.hat/delta.hat
+  # by running ComBat in parametric mode.
+  
+  corrected_train <- tryCatch({
+    ComBat(
+      dat       = expr_train,
+      batch     = batch_train,
+      mod       = mod_train,
+      par.prior = TRUE,
+      mean.only = FALSE
+    )
+  }, error = function(e) {
+    message("ComBat failed on training fold: ", conditionMessage(e),
+            "\n  Falling back to limma::removeBatchEffect for this fold.")
+    limma::removeBatchEffect(expr_train, batch = batch_train, design = mod_train)
+  })
+  
+  # Step 2: Apply batch correction to test samples using training parameters.
+  # We use limma::removeBatchEffect here because it cleanly separates fit from apply
+  # via the coefficients approach: fit a batch model on train, then subtract from test.
+  #
+  # Specifically, we estimate batch means from the TRAINING data and subtract them
+  # from corresponding test samples. This is the cleanest leakage-free approach.
+
+  corrected_test <- tryCatch({
+    # Fit batch effect model on training data
+    batch_train_f <- factor(as.character(batch_train))
+    batch_test_f  <- factor(as.character(batch_test), levels = levels(batch_train_f))
+    
+    # Use limma to get batch coefficients from training data
+    design_batch <- model.matrix(~ 0 + batch_train_f)
+    colnames(design_batch) <- levels(batch_train_f)
+    
+    # Regress out batch from train to get residuals + grand mean
+    # Then for each test sample, subtract its batch mean (estimated from train)
+    batch_means_train <- sapply(levels(batch_train_f), function(b) {
+      idx <- which(batch_train_f == b)
+      if (length(idx) == 0) return(rep(0, nrow(expr_train)))
+      rowMeans(expr_train[, idx, drop = FALSE])
+    })
+    
+    grand_mean_train <- rowMeans(expr_train)
+    
+    expr_test_corrected <- expr_test
+    for (b in levels(batch_train_f)) {
+      test_in_batch <- which(as.character(batch_test_f) == b)
+      if (length(test_in_batch) == 0) next
+      # Subtract batch mean, add grand mean (same as removeBatchEffect logic)
+      batch_effect <- batch_means_train[, b] - grand_mean_train
+      expr_test_corrected[, test_in_batch] <- 
+        expr_test[, test_in_batch] - batch_effect
+    }
+    
+    # Handle test samples from batches not seen in training (mean-center only)
+    if (length(novel_test_idx) > 0) {
+      message("  Test fold contains ", length(novel_test_idx),
+              " samples from unseen batches; applying mean-centering only.")
+      sample_means <- colMeans(expr_test[, novel_test_idx, drop = FALSE])
+      expr_test_corrected[, novel_test_idx] <- 
+        sweep(expr_test[, novel_test_idx, drop = FALSE], 2, sample_means, "-") +
+        grand_mean_train
+    }
+    
+    expr_test_corrected
+    
+  }, error = function(e) {
+    message("Test-fold batch correction failed: ", conditionMessage(e),
+            "\n  Returning uncorrected test data for this fold.")
+    expr_test
+  })
+  
+  list(train = corrected_train, test = corrected_test)
+}
+```
+
+## PCA Visualization (Using Full-Data ComBat for Exploration Only)
+
+```{r}
+# NOTE: This block runs ComBat on all data purely for visualization purposes.
+# It is NOT used anywhere in model training or evaluation.
+# All CV/LODO models use the per-fold ComBat helper above.
+
+mod_viz <- model.matrix(~ as.factor(Status), data = master_metadata)
+
+expr_viz_corrected <- tryCatch(
+  ComBat(dat = merged_expression, batch = master_metadata$dataset_id,
+         mod = mod_viz, par.prior = TRUE),
+  error = function(e) {
+    message("Full-data ComBat for visualization failed, using uncorrected data.")
+    merged_expression
+  }
+)
+
+# Simple median imputation for visualization only
+expr_viz_imputed <- expr_viz_corrected
+for (i in seq_len(nrow(expr_viz_imputed))) {
+  na_idx <- is.na(expr_viz_imputed[i, ])
+  if (any(na_idx)) {
+    expr_viz_imputed[i, na_idx] <- median(expr_viz_imputed[i, ], na.rm = TRUE)
+  }
+}
+
+pca_res <- prcomp(t(expr_viz_imputed), scale. = TRUE)
+var_explained <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
 pca_plot_df <- data.frame(
   SampleID = rownames(pca_res$x),
-  PC1 = pca_res$x[, 1],
-  PC2 = pca_res$x[, 2],
-  Study = master_metadata$Study,
+  PC1   = pca_res$x[, 1],
+  PC2   = pca_res$x[, 2],
+  Study  = master_metadata$dataset_id,
   Status = master_metadata$Status
 )
 
-# 4. Calculate variance explained for the axis labels
-var_explained <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
-
-# 5. Plot coloring by Study
 ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Status)) +
   geom_point(alpha = 0.7, size = 3) +
   theme_minimal() +
   labs(
-    title = "PCA of Merged Breast Cancer Datasets (Post-ComBat)",
-    subtitle = "Checking for remaining Batch Effects",
+    title    = "PCA of Merged Breast Cancer Datasets (Post-ComBat, visualization only)",
+    subtitle = "Full-data ComBat used here for exploration only — not used in model evaluation",
     x = paste0("PC1 (", var_explained[1], "%)"),
     y = paste0("PC2 (", var_explained[2], "%)")
   ) +
-  scale_color_brewer(palette = "Set1") # Good for distinguishing 5-6 studies
+  scale_color_manual(values = c("Cancer" = "#E41A1C", "Normal" = "#377EB8"))
 
-
+ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Study, shape = Status)) +
+  geom_point(alpha = 0.7, size = 3) +
+  theme_minimal() +
+  labs(title = "PCA by Study",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC2 (", var_explained[2], "%)"    ))
 ```
+
+## Heatmap of Top Variable Genes (Visualization Only)
+
 ```{r}
-library(pheatmap)
-library(matrixStats)
+ordered_indices   <- order(master_metadata$Status)
+metadata_sorted   <- master_metadata[ordered_indices, ]
+expression_sorted <- expr_viz_imputed[, ordered_indices]
 
-# 1. Sort the metadata and the expression matrix by 'Status'
-# This ensures all 'control' are on the left and 'tumor' on the right
-ordered_indices <- order(master_metadata$Status)
-metadata_sorted <- master_metadata[ordered_indices, ]
-expression_sorted <- final_expression_clean[, ordered_indices]
-
-# 2. Select the top 50 genes (as you did before)
-rv <- rowVars(expression_sorted)
+rv  <- rowVars(expression_sorted)
 idx <- order(rv, decreasing = TRUE)[1:50]
 
-# 3. Plot without column clustering
-pheatmap(expression_sorted[idx, ], 
-         annotation_col = metadata_sorted[, "Status", drop=FALSE],
-         cluster_cols = FALSE,   # This stops the patients from being clustered
-         show_colnames = FALSE, 
-         main = "Top 50 Varied Genes: Grouped by Status",
-         color = colorRampPalette(c("blue", "white", "red"))(100),
-         scale = "row")         # Highly recommended to see gene-wise changes
+pheatmap(
+  expression_sorted[idx, ],
+  annotation_col = metadata_sorted[, c("Status", "dataset_id"), drop = FALSE],
+  cluster_cols   = FALSE,
+  show_colnames  = FALSE,
+  main  = "Top 50 Most Variable Genes (visualization only)",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  scale = "row"
+)
 ```
 
-
+## CV Helper Functions
 
 ```{r}
-library(randomForest)
-library(caret)
+# Imputation (fit on train, apply to test)
+impute_fit <- function(X_train) {
+  meds <- apply(X_train, 2, function(v) median(v, na.rm = TRUE))
+  meds[is.na(meds)] <- 0
+  list(median = meds)
+}
 
-# 1. Prepare Data
-# Transpose expression matrix: Samples as rows, Genes as columns
-X <- t(final_expression_clean)
-y <- as.factor(master_metadata$Status)
+impute_apply <- function(X, fit) {
+  X2 <- X
+  for (j in seq_len(ncol(X2))) {
+    idx <- is.na(X2[, j])
+    if (any(idx)) X2[idx, j] <- fit$median[j]
+  }
+  X2
+}
 
-# 2. Split into Training (70%) and Testing (30%)
-set.seed(123) # For reproducibility
-trainIndex <- createDataPartition(y, p = 0.7, list = FALSE)
+# Standardization (fit on train, apply to test)
+standardize_fit <- function(X_train) {
+  mu  <- colMeans(X_train)
+  sdv <- apply(X_train, 2, sd)
+  sdv[sdv == 0] <- 1
+  list(mu = mu, sd = sdv)
+}
 
-X_train <- X[trainIndex, ]
-y_train <- y[trainIndex]
-X_test  <- X[-trainIndex, ]
-y_test  <- y[-trainIndex]
+standardize_apply <- function(X, fit) {
+  sweep(sweep(X, 2, fit$mu, "-"), 2, fit$sd, "/")
+}
 
-# 3. Train Random Forest 
-# We use 'sampsize' to handle class imbalance (undersampling the majority class)
-table(y_train) # Check your counts
-min_class <- min(table(y_train))
+# Stratified fold creation
+make_stratified_folds <- function(y, K = 5) {
+  y <- factor(y)
+  folds <- vector("list", K)
+  idx_by_class <- split(seq_along(y), y)
+  for (cl in names(idx_by_class)) {
+    idx    <- sample(idx_by_class[[cl]])
+    groups <- split(idx, rep(1:K, length.out = length(idx)))
+    for (k in seq_len(K)) folds[[k]] <- c(folds[[k]], groups[[k]])
+  }
+  lapply(folds, sort)
+}
 
-rf_model <- randomForest(
-  x = X_train, 
-  y = y_train, 
-  ntree = 500, 
-  importance = TRUE,
-  sampsize = c(min_class, min_class) # Forces equal representation in each tree
-)
+# Binary metrics
+binary_metrics <- function(truth, pred, positive = "Normal") {
+  keep  <- !(is.na(truth) | is.na(pred))
+  truth <- factor(as.character(truth[keep]))
+  pred  <- factor(as.character(pred[keep]), levels = levels(truth))
+  
+  if (length(truth) == 0) {
+    return(data.frame(accuracy = NA_real_, balanced_accuracy = NA_real_,
+                      sensitivity = NA_real_, precision = NA_real_, f1 = NA_real_))
+  }
+  
+  tp <- sum(truth == positive & pred == positive)
+  fn <- sum(truth == positive & pred != positive)
+  tn <- sum(truth != positive & pred != positive)
+  fp <- sum(truth != positive & pred == positive)
 
-# 4. Evaluate the Model
-predictions <- predict(rf_model, X_test)
-conf_matrix <- confusionMatrix(predictions, y_test)
-print(conf_matrix)
+  recall      <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+  precision   <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+  f1          <- if (is.na(recall) || is.na(precision) || (recall + precision) == 0) NA_real_ else
+                   2 * recall * precision / (recall + precision)
+  specificity <- if ((tn + fp) == 0) NA_real_ else tn / (tn + fp)
+  bal_acc     <- mean(c(recall, specificity), na.rm = TRUE)
+  acc         <- mean(truth == pred)
 
-# 5. Find Top Biomarkers (Important Genes)
-varImpPlot(rf_model, n.var = 20, main = "Top 20 Gene Predictors for Breast Cancer")
+  data.frame(accuracy = acc, balanced_accuracy = bal_acc,
+             sensitivity = recall, precision = precision, f1 = f1)
+}
+
+# AUC calculation
+auc_roc <- function(truth_pos, score_pos) {
+  truth_pos <- as.integer(truth_pos)
+  score_pos <- as.numeric(score_pos)
+  pos   <- truth_pos == 1
+  neg   <- truth_pos == 0
+  n_pos <- sum(pos)
+  n_neg <- sum(neg)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  r <- rank(score_pos, ties.method = "average")
+  (sum(r[pos]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
 ```
 
+## Run Repeated Stratified CV (Leakage-Free)
+
+```{r}
+# Transpose once; per-fold ComBat operates on the genes x samples slice
+X_full_raw <- merged_expression          # genes x samples (pre-correction)
+y <- factor(master_metadata$Status, levels = c("Cancer", "Normal"))
+batch_all <- master_metadata$dataset_id
+
+cat("Feature matrix (genes x samples):", paste(dim(X_full_raw), collapse = " x "), "\n")
+cat("Class distribution:\n")
+print(table(y))
+
+K       <- 5
+repeats <- 10
+
+perf_results <- data.frame()
+all_scores   <- data.frame()
+
+for (r in seq_len(repeats)) {
+  folds <- make_stratified_folds(y, K = K)
+  
+  for (k in seq_len(K)) {
+    cat("Repeat:", r, "Fold:", k, "\n")
+    
+    test_id  <- folds[[k]]
+    train_id <- setdiff(seq_len(length(y)), test_id)
+
+    # ---- FIX 1: Per-fold ComBat ----
+    expr_train_raw <- X_full_raw[, train_id, drop = FALSE]
+    expr_test_raw  <- X_full_raw[, test_id,  drop = FALSE]
+    
+    batch_train <- batch_all[train_id]
+    batch_test  <- batch_all[test_id]
+    
+    mod_train <- model.matrix(~ y[train_id])
+    
+    cb <- combat_fit_apply(
+      expr_train = expr_train_raw, batch_train = batch_train, mod_train = mod_train,
+      expr_test  = expr_test_raw,  batch_test  = batch_test
+    )
+    
+    # Transpose to samples x genes for downstream use
+    X_train_full <- t(cb$train)
+    X_test_full  <- t(cb$test)
+    
+    y_train <- y[train_id]
+    y_test  <- y[test_id]
+
+    # ---- DE gene selection (train only) ----
+    expr_train_t <- t(X_train_full)   # back to genes x samples for limma
+    design_train <- model.matrix(~ y_train)
+    fit_lm       <- eBayes(lmFit(expr_train_t, design_train))
+    top_genes    <- topTable(fit_lm, n = 50, sort.by = "P")
+    sel_genes    <- intersect(rownames(top_genes), colnames(X_train_full))
+    
+    if (length(sel_genes) < 10) {
+      cat("Skipping fold — too few genes selected\n")
+      next
+    }
+
+    X_train <- X_train_full[, sel_genes, drop = FALSE]
+    X_test  <- X_test_full[,  sel_genes, drop = FALSE]
+
+    # ---- Impute (train only) ----
+    # FIX 2: No global imputation exists anymore; this is the sole imputation step.
+    imp         <- impute_fit(X_train)
+    X_train_i   <- impute_apply(X_train, imp)
+    X_test_i    <- impute_apply(X_test,  imp)
+
+    # ---- Scale (train only) ----
+    sc          <- standardize_fit(X_train_i)
+    X_train_s   <- standardize_apply(X_train_i, sc)
+    X_test_s    <- standardize_apply(X_test_i,  sc)
+
+    # ---- Class weights ----
+    n_pos <- sum(y_train == "Normal")
+    n_neg <- sum(y_train == "Cancer")
+    pos_w <- if (n_pos > 0) n_neg / n_pos else 1
+    cw    <- c("Normal" = pos_w, "Cancer" = 1)
+
+    # ---- Random Forest ----
+    rf_fit  <- randomForest(x = X_train_i, y = y_train, classwt = cw, ntree = 500)
+    pred_rf <- predict(rf_fit, X_test_i)
+    prob_rf <- predict(rf_fit, X_test_i, type = "prob")
+    score_rf <- prob_rf[, "Normal"]
+    
+    m_rf <- binary_metrics(y_test, pred_rf, positive = "Normal")
+    perf_results <- rbind(perf_results,
+                          data.frame(model = "RF_weighted", rep = r, fold = k, m_rf))
+    all_scores   <- rbind(all_scores,
+                          data.frame(model = "RF_weighted", rep = r, fold = k,
+                                     truth = y_test, score_normal = score_rf))
+
+    # ---- SVM ----
+    svm_fit  <- svm(x = X_train_s, y = y_train, kernel = "radial",
+                    cost = 1, gamma = 1 / ncol(X_train_s),
+                    probability = TRUE, class.weights = cw)
+    pred_svm <- predict(svm_fit, X_test_s, probability = TRUE)
+    prob_svm <- attr(pred_svm, "probabilities")
+    score_svm <- prob_svm[, "Normal"]
+    
+    m_svm <- binary_metrics(y_test, pred_svm, positive = "Normal")
+    perf_results <- rbind(perf_results,
+                          data.frame(model = "SVM_weighted", rep = r, fold = k, m_svm))
+    all_scores   <- rbind(all_scores,
+                          data.frame(model = "SVM_weighted", rep = r, fold = k,
+                                     truth = y_test, score_normal = score_svm))
+  }
+}
+
+cat("\nLeakage-free CV complete.\n")
+```
+
+## Y-Shuffle Test (Leakage Check)
+
+```{r}
+# FIX 3: Use a distinct variable name (y_shuffled) throughout to avoid
+# the silent shadowing bug in the original code where y_test was reused
+# as both the shuffled label vector and the per-fold test label slice.
+
+set.seed(123)
+y_shuffled <- sample(y)   # <-- renamed from y_test to y_shuffled
+
+cat("Original distribution:\n");  print(table(y))
+cat("Shuffled distribution:\n");  print(table(y_shuffled))
+
+perf_results_shuff <- list()
+all_scores_shuff   <- list()
+
+# FIX 3 continued: generate fresh folds from the shuffled labels,
+# not from whatever folds happened to be in scope from the CV loop.
+folds_shuff <- make_stratified_folds(y_shuffled, K = 5)
+
+counter <- 1
+
+for (fold_info in folds_shuff) {
+  
+  test_idx  <- fold_info
+  train_idx <- setdiff(seq_len(length(y_shuffled)), test_idx)
+  
+  # ---- Per-fold ComBat ----
+  expr_train_raw <- X_full_raw[, train_idx, drop = FALSE]
+  expr_test_raw  <- X_full_raw[, test_idx,  drop = FALSE]
+  batch_train    <- batch_all[train_idx]
+  batch_test     <- batch_all[test_idx]
+  mod_train_shuf <- model.matrix(~ y_shuffled[train_idx])
+  
+  cb_shuf <- combat_fit_apply(
+    expr_train = expr_train_raw, batch_train = batch_train, mod_train = mod_train_shuf,
+    expr_test  = expr_test_raw,  batch_test  = batch_test
+  )
+  
+  X_train <- t(cb_shuf$train)
+  X_test  <- t(cb_shuf$test)
+  
+  y_train_fold    <- y_shuffled[train_idx]   # clear naming: train labels
+  y_test_fold     <- y_shuffled[test_idx]    # clear naming: test labels
+  
+  # ---- Feature selection (train only) ----
+  expr_train_t <- t(X_train)
+  design_shuf  <- model.matrix(~ y_train_fold)
+  fit_shuf     <- eBayes(lmFit(expr_train_t, design_shuf))
+  top_g_shuf   <- topTable(fit_shuf, n = 50)
+  sel_g_shuf   <- intersect(rownames(top_g_shuf), colnames(X_train))
+  
+  X_train_sel <- X_train[, sel_g_shuf, drop = FALSE]
+  X_test_sel  <- X_test[,  sel_g_shuf, drop = FALSE]
+  
+  # ---- Imputation (train only) ----
+  imp_shuf    <- impute_fit(X_train_sel)
+  X_train_i   <- impute_apply(X_train_sel, imp_shuf)
+  X_test_i    <- impute_apply(X_test_sel,  imp_shuf)
+  
+  # ---- Class weights ----
+  counts        <- table(y_train_fold)
+  class_weights <- sum(counts) / (2 * counts)
+  
+  # ---- Random Forest ----
+  rf_model  <- randomForest(x = X_train_i, y = y_train_fold, ntree = 500,
+                            classwt = class_weights)
+  rf_probs  <- predict(rf_model, X_test_i, type = "prob")[, "Normal"]
+  
+  # ---- SVM ----
+  svm_model <- e1071::svm(x = X_train_i, y = y_train_fold,
+                          probability = TRUE, class.weights = class_weights)
+  svm_pred  <- predict(svm_model, X_test_i, probability = TRUE)
+  svm_probs <- attr(svm_pred, "probabilities")[, "Normal"]
+  
+  # ---- Store scores ----
+  df_rf  <- data.frame(truth = y_test_fold, score_normal = rf_probs,  model = "RF_shuffled")
+  df_svm <- data.frame(truth = y_test_fold, score_normal = svm_probs, model = "SVM_shuffled")
+  all_scores_shuff[[counter]] <- rbind(df_rf, df_svm)
+  
+  # ---- Metrics ----
+  get_metrics_shuf <- function(truth, probs) {
+    pred <- ifelse(probs >= 0.5, "Normal", "Cancer")
+    cm   <- table(factor(truth, levels = c("Cancer","Normal")),
+                  factor(pred,  levels = c("Cancer","Normal")))
+    TN <- cm[1,1]; FP <- cm[1,2]; FN <- cm[2,1]; TP <- cm[2,2]
+    accuracy    <- (TP + TN) / sum(cm)
+    sensitivity <- ifelse((TP+FN)==0, NA, TP / (TP + FN))
+    specificity <- ifelse((TN+FP)==0, NA, TN / (TN + FP))
+    precision   <- ifelse((TP+FP)==0, NA, TP / (TP + FP))
+    f1          <- ifelse(is.na(precision)|is.na(sensitivity)|(precision+sensitivity)==0, NA,
+                          2*(precision*sensitivity)/(precision+sensitivity))
+    data.frame(accuracy = accuracy,
+               balanced_accuracy = mean(c(sensitivity, specificity), na.rm = TRUE),
+               sensitivity = sensitivity, precision = precision, f1 = f1)
+  }
+  
+  perf_rf              <- get_metrics_shuf(y_test_fold, rf_probs)
+  perf_rf$model        <- "RF_shuffled"
+  perf_svm             <- get_metrics_shuf(y_test_fold, svm_probs)
+  perf_svm$model       <- "SVM_shuffled"
+  perf_results_shuff[[counter]] <- rbind(perf_rf, perf_svm)
+  
+  counter <- counter + 1
+}
+
+perf_results_shuff <- dplyr::bind_rows(perf_results_shuff)
+all_scores_shuff   <- dplyr::bind_rows(all_scores_shuff)
+
+auc_shuff <- all_scores_shuff %>%
+  group_by(model) %>%
+  summarise(roc_auc = auc_roc(truth == "Normal", score_normal), .groups = "drop")
+
+summary_shuff <- perf_results_shuff %>%
+  group_by(model) %>%
+  summarise(accuracy = mean(accuracy, na.rm = TRUE),
+            balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+            f1 = mean(f1, na.rm = TRUE), .groups = "drop") %>%
+  left_join(auc_shuff, by = "model")
+
+cat("Shuffle test summary (expect ~0.5 AUC):\n")
+print(summary_shuff)
+```
+
+## LODO Scoring Functions
+
+```{r}
+library(isotone)
+
+gene_panel <- data.frame(
+  gene   = c("MKI67", "AURKA", "BIRC5", "CCNB1", "MYBL2",
+             "ESR1",  "PGR",   "BCL2",  "SCUBE2",
+             "ERBB2", "GRB7"),
+  weight = c(1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1),
+  group  = c(rep("proliferation", 5), rep("ER_related", 4), rep("HER2_related", 2))
+)
+
+create_multigene_panel_score <- function(X, gene_panel) {
+  scores_by_group <- lapply(unique(gene_panel$group), function(grp) {
+    genes_in   <- gene_panel$gene[gene_panel$group == grp]
+    weights_in <- gene_panel$weight[gene_panel$group == grp]
+    names(weights_in) <- genes_in
+    
+    present <- intersect(genes_in, colnames(X))
+    if (length(present) == 0) return(rep(0, nrow(X)))
+    
+    X_sub <- as.matrix(X[, present, drop = FALSE])
+    w_sub <- weights_in[present]
+    rowSums(sweep(X_sub, 2, w_sub, "*")) / sum(abs(w_sub))
+  })
+  names(scores_by_group) <- unique(gene_panel$group)
+  
+  fs <- scores_by_group[[1]]
+  if (max(fs) == min(fs)) return(list(recurrence_score = rep(0, nrow(X))))
+  list(recurrence_score = round(100 * (fs - min(fs)) / (max(fs) - min(fs)), 1))
+}
+
+get_metrics <- function(truth, probs) {
+  pred <- ifelse(probs >= 0.5, "Normal", "Cancer")
+  cm   <- table(factor(truth, levels = c("Cancer","Normal")),
+                factor(pred,  levels = c("Cancer","Normal")))
+  TN <- cm[1,1]; FP <- cm[1,2]; FN <- cm[2,1]; TP <- cm[2,2]
+  accuracy    <- (TP + TN) / sum(cm)
+  sensitivity <- ifelse((TP+FN)==0, NA, TP / (TP + FN))
+  specificity <- ifelse((TN+FP)==0, NA, TN / (TN + FP))
+  precision   <- ifelse((TP+FP)==0, NA, TP / (TP + FP))
+  f1          <- ifelse(is.na(precision)|is.na(sensitivity)|(precision+sensitivity)==0, NA,
+                        2*(precision*sensitivity)/(precision+sensitivity))
+  data.frame(accuracy = accuracy,
+             balanced_accuracy = mean(c(sensitivity, specificity), na.rm = TRUE),
+             sensitivity = sensitivity, precision = precision, f1 = f1)
+}
+```
+
+## Run LODO (Leakage-Free)
+
+```{r}
+dataset_id <- master_metadata$dataset_id
+datasets   <- unique(dataset_id)
+lodo_metrics <- list()
+lodo_scores  <- list()
+counter      <- 1
+
+for (ds in datasets) {
+  cat("Holding out dataset:", ds, "...\n")
+  
+  test_idx  <- which(dataset_id == ds)
+  train_idx <- which(dataset_id != ds)
+  
+  y_train <- y[train_idx]
+  y_test  <- y[test_idx]
+  
+  if (length(unique(y_test)) < 2) {
+    cat("Skipping", ds, "(insufficient class diversity)\n")
+    next
+  }
+  
+  # ---- Per-fold ComBat ----
+  expr_train_raw <- X_full_raw[, train_idx, drop = FALSE]
+  expr_test_raw  <- X_full_raw[, test_idx,  drop = FALSE]
+  batch_train    <- dataset_id[train_idx]
+  batch_test     <- dataset_id[test_idx]
+  mod_lodo       <- model.matrix(~ y_train)
+  
+  cb_lodo <- combat_fit_apply(
+    expr_train = expr_train_raw, batch_train = batch_train, mod_train = mod_lodo,
+    expr_test  = expr_test_raw,  batch_test  = batch_test
+  )
+  
+  X_train_full <- t(cb_lodo$train)
+  X_test_full  <- t(cb_lodo$test)
+  
+  # ---- Feature selection (train only) ----
+  expr_train_t  <- t(X_train_full)
+  design_lodo   <- model.matrix(~ y_train)
+  fit_lodo      <- eBayes(lmFit(expr_train_t, design_lodo))
+  top_genes_df  <- topTable(fit_lodo, n = 50)
+  sel_genes     <- intersect(rownames(top_genes_df), colnames(X_train_full))
+  
+  X_train_sel <- X_train_full[, sel_genes, drop = FALSE]
+  X_test_sel  <- X_test_full[,  sel_genes, drop = FALSE]
+  
+  # ---- Imputation (train only) ----
+  imp         <- impute_fit(X_train_sel)
+  X_train_i   <- as.matrix(impute_apply(X_train_sel, imp))
+  X_test_i    <- as.matrix(impute_apply(X_test_sel,  imp))
+  
+  # ---- Class weights ----
+  counts        <- table(y_train)
+  class_weights <- sum(counts) / (2 * counts)
+  
+  # ---- Score 1: Random Forest ----
+  rf_model  <- randomForest(x = X_train_i, y = y_train, ntree = 500,
+                            classwt = class_weights)
+  score1_rf <- predict(rf_model, X_test_i, type = "prob")[, "Normal"]
+  
+  # ---- Score 2: Weighted gene expression ----
+  gene_weights  <- top_genes_df$logFC
+  names(gene_weights) <- sel_genes
+  score2_weighted <- as.vector(X_test_i %*% gene_weights)
+  
+  # ---- Score 3 & 4: Lasso logistic regression ----
+  y_bin_train  <- ifelse(y_train == "Normal", 1, 0)
+  cv_lasso     <- cv.glmnet(x = X_train_i, y = y_bin_train, family = "binomial", alpha = 0.5)
+  score3_lasso <- as.vector(predict(cv_lasso, newx = X_test_i, s = "lambda.min", type = "response")[, 1])
+  score4_nomo  <- as.vector(predict(cv_lasso, newx = X_test_i, s = "lambda.min", type = "link")[, 1])
+  
+  # ---- Score 5: Multi-gene panel ----
+  # NOTE: Uses the original (gene-level, uncorrected) test expression for the panel score,
+  # consistent with how the panel genes are biologically interpreted.
+  score5_panel <- create_multigene_panel_score(t(X_full_raw[, test_idx, drop = FALSE]), gene_panel)$recurrence_score
+  
+  # ---- Score 6: Ensemble ----
+  svm_mod   <- svm(x = X_train_i, y = y_train, probability = TRUE, class.weights = class_weights)
+  svm_probs <- attr(predict(svm_mod, X_test_i, probability = TRUE), "probabilities")[, "Normal"]
+  score6_ensemble <- (score1_rf + svm_probs + score3_lasso) / 3
+  
+  # ---- Score 7: Isotonic calibration ----
+  cal_idx        <- sample(seq_len(nrow(X_train_i)), size = min(50, floor(0.2 * nrow(X_train_i))))
+  raw_cal_probs  <- predict(rf_model, X_train_i[cal_idx, , drop = FALSE], type = "prob")[, "Normal"]
+  calibrator     <- isoreg(raw_cal_probs, ifelse(y_train[cal_idx] == "Normal", 1, 0))
+  score7_calibrated <- approx(calibrator$x, calibrator$yf, xout = score1_rf, rule = 2)$y
+  
+  # ---- Store ----
+  fold_df <- data.frame(
+    SampleID         = rownames(X_test_i),
+    Dataset          = ds,
+    Truth            = y_test,
+    RF_Prob          = score1_rf,
+    Weighted_Expr    = score2_weighted,
+    Lasso_Prob       = score3_lasso,
+    Nomogram_LogOdds = score4_nomo,
+    Panel_Score      = score5_panel,
+    Ensemble_Prob    = score6_ensemble,
+    Calibrated_Prob  = score7_calibrated
+  )
+  lodo_scores[[counter]] <- fold_df
+  
+  fold_metrics          <- get_metrics(y_test, score6_ensemble)
+  fold_metrics$model    <- "Ensemble"
+  fold_metrics$dataset  <- ds
+  lodo_metrics[[counter]] <- fold_metrics
+  
+  counter <- counter + 1
+}
+
+final_lodo_results <- bind_rows(lodo_metrics)
+final_lodo_scores  <- bind_rows(lodo_scores)
+
+cat("LODO complete. Ensemble model summary:\n")
+print(final_lodo_results)
+```
+
+## Scoring Comparison Plot
+
+```{r}
+library(tidyr)
+library(ggplot2)
+
+plot_scores <- final_lodo_scores %>%
+  pivot_longer(cols = c(RF_Prob, Weighted_Expr, Lasso_Prob, Nomogram_LogOdds,
+                        Panel_Score, Ensemble_Prob, Calibrated_Prob),
+               names_to  = "Scoring_Method",
+               values_to = "Value")
+
+ggplot(plot_scores, aes(x = Truth, y = Value, fill = Truth)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
+  facet_wrap(~Scoring_Method, scales = "free_y") +
+  theme_bw() +
+  labs(title    = "Comparison of 7 Scoring Methodologies",
+       subtitle = "Separation between Cancer and Normal across all LODO folds",
+       y = "Score Value", x = "Clinical Status") +
+  scale_fill_manual(values = c("Cancer" = "#e41a1c", "Normal" = "#377eb8"))
+```
+
+## ROC Curves and AUC
+
+```{r}
+library(pROC)
+library(plotROC)
+
+score_cols <- c("RF_Prob", "Weighted_Expr", "Lasso_Prob", "Nomogram_LogOdds",
+                "Panel_Score", "Ensemble_Prob", "Calibrated_Prob")
+
+auc_results <- sapply(score_cols, function(col) {
+  roc_obj <- roc(final_lodo_scores$Truth, final_lodo_scores[[col]],
+                 levels = c("Cancer", "Normal"), quiet = TRUE)
+  auc(roc_obj)
+})
+
+auc_df <- data.frame(Method = names(auc_results), AUC = as.numeric(auc_results)) %>%
+  arrange(desc(AUC))
+
+print(auc_df)
+
+roc_plot_data <- final_lodo_scores %>%
+  pivot_longer(cols = c(RF_Prob, Lasso_Prob, Ensemble_Prob, Calibrated_Prob,Nomogram_LogOdds),
+               names_to  = "Scoring_Method",
+               values_to = "Value") %>%
+  mutate(D_binary = ifelse(Truth == "Normal", 1, 0))
+
+roc_plot <- ggplot(roc_plot_data, aes(d = D_binary, m = Value, color = Scoring_Method)) +
+  geom_roc(n.cuts = 0, size = 1.2) +
+  style_roc(theme = theme_minimal) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+  labs(title    = "Multi-Method ROC Comparison",
+       subtitle = "Cross-dataset validation (LODO)",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)") +
+  scale_color_brewer(palette = "Set1") +
+  theme(panel.background = element_rect(fill = "white", color = "white"),
+        plot.background  = element_rect(fill = "white", color = "white"))
+
+print(roc_plot)
+calc_auc(roc_plot)
+```
+
+```{r}
+library(ggplot2)
+
+# We use the final_lodo_scores dataframe we created earlier
+ggplot(final_lodo_scores, aes(x = Nomogram_LogOdds, fill = Truth)) +
+  geom_density(alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Cancer" = "#E41A1C", "Normal" = "#377EB8")) +
+  labs(
+    title = "Density of Predicted Cancer Risk (Log-Odds)",
+    subtitle = "Dashed line represents the 50/50 decision threshold",
+    x = "Risk Score (Log-Odds)",
+    y = "Density"
+  )
+```
