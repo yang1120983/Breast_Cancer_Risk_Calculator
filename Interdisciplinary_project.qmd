@@ -154,7 +154,7 @@ rbind_fill <- function(dfs) {
 ## Load and Process Data
 
 ```{r}
-dataset_ids <- c("GSE7904", "GSE9574", "GSE15852", "GSE29431", "GSE45827", "GSE54002")
+dataset_ids <- c("GSE7904", "GSE9574", "GSE15852", "GSE29431", "GSE54002","GSE25066", "GSE45827")
 
 normal_keywords <- c(
   "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
@@ -774,7 +774,8 @@ get_metrics <- function(truth, probs) {
 }
 ```
 
-## Run LODO (Leakage-Free)
+
+## Run LODO (Leakage-Free, Intercept-Corrected, Platt-Calibrated)
 
 ```{r}
 dataset_id <- master_metadata$dataset_id
@@ -785,104 +786,213 @@ counter      <- 1
 
 for (ds in datasets) {
   cat("Holding out dataset:", ds, "...\n")
-  
+
   test_idx  <- which(dataset_id == ds)
   train_idx <- which(dataset_id != ds)
-  
+
   y_train <- y[train_idx]
   y_test  <- y[test_idx]
-  
+
   if (length(unique(y_test)) < 2) {
     cat("Skipping", ds, "(insufficient class diversity)\n")
     next
   }
-  
-  # ---- Per-fold ComBat ----
+
+  # ── Per-fold ComBat ───────────────────────────────────────────────────────
   expr_train_raw <- X_full_raw[, train_idx, drop = FALSE]
   expr_test_raw  <- X_full_raw[, test_idx,  drop = FALSE]
   batch_train    <- dataset_id[train_idx]
   batch_test     <- dataset_id[test_idx]
   mod_lodo       <- model.matrix(~ y_train)
-  
+
   cb_lodo <- combat_fit_apply(
     expr_train = expr_train_raw, batch_train = batch_train, mod_train = mod_lodo,
     expr_test  = expr_test_raw,  batch_test  = batch_test
   )
-  
+
   X_train_full <- t(cb_lodo$train)
   X_test_full  <- t(cb_lodo$test)
-  
-  # ---- Feature selection (train only) ----
-  expr_train_t  <- t(X_train_full)
-  design_lodo   <- model.matrix(~ y_train)
-  fit_lodo      <- eBayes(lmFit(expr_train_t, design_lodo))
-  top_genes_df  <- topTable(fit_lodo, n = 50)
-  sel_genes     <- intersect(rownames(top_genes_df), colnames(X_train_full))
-  
+
+  # ── Feature selection (train only) ───────────────────────────────────────
+  expr_train_t <- t(X_train_full)
+  design_lodo  <- model.matrix(~ y_train)
+  fit_lodo     <- eBayes(lmFit(expr_train_t, design_lodo))
+  top_genes_df <- topTable(fit_lodo, n = 50)
+  sel_genes    <- intersect(rownames(top_genes_df), colnames(X_train_full))
+
+  if (length(sel_genes) < 10) {
+    cat("Skipping", ds, "(too few genes selected)\n")
+    next
+  }
+
   X_train_sel <- X_train_full[, sel_genes, drop = FALSE]
   X_test_sel  <- X_test_full[,  sel_genes, drop = FALSE]
-  
-  # ---- Imputation (train only) ----
-  imp         <- impute_fit(X_train_sel)
-  X_train_i   <- as.matrix(impute_apply(X_train_sel, imp))
-  X_test_i    <- as.matrix(impute_apply(X_test_sel,  imp))
-  
-  # ---- Class weights ----
-  counts        <- table(y_train)
-  class_weights <- sum(counts) / (2 * counts)
-  
-  # ---- Score 1: Random Forest ----
-  rf_model  <- randomForest(x = X_train_i, y = y_train, ntree = 500,
-                            classwt = class_weights)
+
+  # ── Imputation (train only) ───────────────────────────────────────────────
+  imp       <- impute_fit(X_train_sel)
+  X_train_i <- as.matrix(impute_apply(X_train_sel, imp))
+  X_test_i  <- as.matrix(impute_apply(X_test_sel,  imp))
+
+  # ── Standardisation (train only, needed for SVM) ─────────────────────────
+  sc        <- standardize_fit(X_train_i)
+  X_train_s <- standardize_apply(X_train_i, sc)
+  X_test_s  <- standardize_apply(X_test_i,  sc)
+
+  # ── Class counts (used across several scores) ─────────────────────────────
+  n_cancer <- sum(y_train == "Cancer")
+  n_normal <- sum(y_train == "Normal")
+  total    <- n_cancer + n_normal
+
+  # Inverse-frequency weights — balances gradient contributions during fitting
+  sample_weights <- ifelse(
+    y_train == "Normal",
+    total / (2 * n_normal),
+    total / (2 * n_cancer)
+  )
+
+  # Named weights for RF / SVM (these take a per-class vector, not per-sample)
+  class_weights <- c("Normal" = total / (2 * n_normal),
+                     "Cancer" = total / (2 * n_cancer))
+
+  # Binary outcome vector (1 = Normal) for glmnet
+  y_bin_train <- ifelse(y_train == "Normal", 1, 0)
+
+  # Prior correction term: shifts log-odds so 0 = true 50/50 boundary
+  # regardless of class imbalance in this fold
+  train_prevalence <- mean(y_bin_train)
+  prior_correction <- log(train_prevalence / (1 - train_prevalence))
+
+  # ── Platt calibration split (20% of training, fit once, reused below) ────
+  set.seed(42)
+  cal_size      <- max(20, floor(0.2 * nrow(X_train_i)))
+  cal_idx_platt <- sample(seq_len(nrow(X_train_i)), size = cal_size)
+  tr_idx_platt  <- setdiff(seq_len(nrow(X_train_i)), cal_idx_platt)
+
+  # ── Score 1: Random Forest ────────────────────────────────────────────────
+  rf_model  <- randomForest(
+    x       = X_train_i,
+    y       = y_train,
+    ntree   = 500,
+    classwt = class_weights
+  )
   score1_rf <- predict(rf_model, X_test_i, type = "prob")[, "Normal"]
-  
-  # ---- Score 2: Weighted gene expression ----
-  gene_weights  <- top_genes_df$logFC
+
+  # ── Score 2: Weighted gene expression (logFC-weighted sum) ───────────────
+  gene_weights    <- top_genes_df$logFC
   names(gene_weights) <- sel_genes
   score2_weighted <- as.vector(X_test_i %*% gene_weights)
-  
-  # ---- Score 3 & 4: Lasso logistic regression ----
-  y_bin_train  <- ifelse(y_train == "Normal", 1, 0)
-  cv_lasso     <- cv.glmnet(x = X_train_i, y = y_bin_train, family = "binomial", alpha = 0.5)
-  score3_lasso <- as.vector(predict(cv_lasso, newx = X_test_i, s = "lambda.min", type = "response")[, 1])
-  score4_nomo  <- as.vector(predict(cv_lasso, newx = X_test_i, s = "lambda.min", type = "link")[, 1])
-  
-  # ---- Score 5: Multi-gene panel ----
-  # NOTE: Uses the original (gene-level, uncorrected) test expression for the panel score,
-  # consistent with how the panel genes are biologically interpreted.
-  score5_panel <- create_multigene_panel_score(t(X_full_raw[, test_idx, drop = FALSE]), gene_panel)$recurrence_score
-  
-  # ---- Score 6: Ensemble ----
-  svm_mod   <- svm(x = X_train_i, y = y_train, probability = TRUE, class.weights = class_weights)
-  svm_probs <- attr(predict(svm_mod, X_test_i, probability = TRUE), "probabilities")[, "Normal"]
+
+  # ── Scores 3 & 4: Lasso logistic (weighted + intercept-corrected + Platt) ─
+
+  # Full lasso on all training data (used for Score 4 log-odds and Score 3 base)
+  cv_lasso <- cv.glmnet(
+    x            = X_train_i,
+    y            = y_bin_train,
+    family       = "binomial",
+    alpha        = 0.5,
+    weights      = sample_weights,   # prevents intercept drift from imbalance
+    nfolds       = 5,
+    type.measure = "auc"             # optimise lambda by AUC not deviance
+  )
+
+  # Score 4: prior-corrected log-odds
+  # Subtracting the prior term re-centres the boundary at 0
+  raw_logodds_test <- as.vector(
+    predict(cv_lasso, newx = X_test_i, s = "lambda.min", type = "link")[, 1]
+  )
+  score4_nomo <- raw_logodds_test - prior_correction
+
+  # Platt scaling for Score 3:
+  # Step A — refit lasso on non-calibration subset
+  cv_lasso_tr <- cv.glmnet(
+    x        = X_train_i[tr_idx_platt, ],
+    y        = y_bin_train[tr_idx_platt],
+    family   = "binomial",
+    alpha    = 0.5,
+    weights  = sample_weights[tr_idx_platt],
+    nfolds   = 5
+  )
+
+  # Step B — get log-odds on the held-out calibration subset
+  cal_logodds <- as.vector(
+    predict(cv_lasso_tr,
+            newx = X_train_i[cal_idx_platt, ],
+            s    = "lambda.min",
+            type = "link")[, 1]
+  )
+  cal_truth <- y_bin_train[cal_idx_platt]
+
+  # Step C — fit Platt scaler: logistic(truth ~ raw log-odds)
+  platt_fit <- glm(
+    cal_truth ~ cal_logodds,
+    family = binomial()
+  )
+
+  # Step D — apply Platt scaler to full-lasso test log-odds → calibrated prob
+  score3_lasso <- as.vector(
+    predict(platt_fit,
+            newdata = data.frame(cal_logodds = raw_logodds_test),
+            type    = "response")
+  )
+
+  # ── Score 5: Multi-gene panel (raw expression, biology-driven) ───────────
+  score5_panel <- create_multigene_panel_score(
+    t(X_full_raw[, test_idx, drop = FALSE]),
+    gene_panel
+  )$recurrence_score
+
+  # ── Score 6: Ensemble (RF + SVM + Platt-calibrated lasso) ────────────────
+  svm_mod   <- svm(
+    x            = X_train_s,
+    y            = y_train,
+    kernel       = "radial",
+    cost         = 1,
+    gamma        = 1 / ncol(X_train_s),
+    probability  = TRUE,
+    class.weights = class_weights
+  )
+  svm_probs       <- attr(predict(svm_mod, X_test_s, probability = TRUE),
+                          "probabilities")[, "Normal"]
   score6_ensemble <- (score1_rf + svm_probs + score3_lasso) / 3
-  
-  # ---- Score 7: Isotonic calibration ----
-  cal_idx        <- sample(seq_len(nrow(X_train_i)), size = min(50, floor(0.2 * nrow(X_train_i))))
-  raw_cal_probs  <- predict(rf_model, X_train_i[cal_idx, , drop = FALSE], type = "prob")[, "Normal"]
-  calibrator     <- isoreg(raw_cal_probs, ifelse(y_train[cal_idx] == "Normal", 1, 0))
-  score7_calibrated <- approx(calibrator$x, calibrator$yf, xout = score1_rf, rule = 2)$y
-  
-  # ---- Store ----
+
+  # ── Score 7: Isotonic calibration of RF probabilities ────────────────────
+  raw_cal_probs <- predict(
+    rf_model,
+    X_train_i[cal_idx_platt, , drop = FALSE],
+    type = "prob"
+  )[, "Normal"]
+
+  calibrator <- isoreg(
+    raw_cal_probs,
+    ifelse(y_train[cal_idx_platt] == "Normal", 1, 0)
+  )
+  score7_calibrated <- approx(
+    calibrator$x, calibrator$yf,
+    xout = score1_rf,
+    rule = 2
+  )$y
+
+  # ── Store scores ──────────────────────────────────────────────────────────
   fold_df <- data.frame(
     SampleID         = rownames(X_test_i),
     Dataset          = ds,
     Truth            = y_test,
     RF_Prob          = score1_rf,
     Weighted_Expr    = score2_weighted,
-    Lasso_Prob       = score3_lasso,
-    Nomogram_LogOdds = score4_nomo,
+    Lasso_Prob       = score3_lasso,        # Platt-calibrated probability
+    Nomogram_LogOdds = score4_nomo,         # prior-corrected log-odds
     Panel_Score      = score5_panel,
     Ensemble_Prob    = score6_ensemble,
     Calibrated_Prob  = score7_calibrated
   )
   lodo_scores[[counter]] <- fold_df
-  
-  fold_metrics          <- get_metrics(y_test, score6_ensemble)
-  fold_metrics$model    <- "Ensemble"
-  fold_metrics$dataset  <- ds
+
+  # ── Store metrics (ensemble as primary) ──────────────────────────────────
+  fold_metrics         <- get_metrics(y_test, score6_ensemble)
+  fold_metrics$model   <- "Ensemble"
+  fold_metrics$dataset <- ds
   lodo_metrics[[counter]] <- fold_metrics
-  
+
   counter <- counter + 1
 }
 
@@ -893,26 +1003,85 @@ cat("LODO complete. Ensemble model summary:\n")
 print(final_lodo_results)
 ```
 
+## Density Plot (Intercept-Corrected Log-Odds)
+
+```{r}
+# Global density — should now show Cancer left of 0, Normal right of 0
+ggplot(final_lodo_scores, aes(x = Nomogram_LogOdds, fill = Truth)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Cancer" = "#E41A1C", "Normal" = "#377EB8")) +
+  labs(
+    title    = "Density of Predicted Cancer Risk (Log-Odds)",
+    subtitle = "Prior-corrected: dashed line = true 50/50 threshold",
+    x        = "Risk Score (Log-Odds)",
+    y        = "Density"
+  )
+
+# Per-dataset panels — reveals any dataset still drifting after correction
+ggplot(final_lodo_scores, aes(x = Nomogram_LogOdds, fill = Truth)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~ Dataset, ncol = 3) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Cancer" = "#E41A1C", "Normal" = "#377EB8")) +
+  labs(
+    title    = "Per-Dataset Density of Predicted Cancer Risk",
+    subtitle = "Each panel = one LODO held-out dataset. Drift here = batch confound.",
+    x        = "Risk Score (Log-Odds)",
+    y        = "Density"
+  )
+
+# Sanity check table — median log-odds and % above threshold per class
+cat("\nCalibration sanity check (Cancer median should be < 0, Normal > 0):\n")
+final_lodo_scores %>%
+  group_by(Truth) %>%
+  summarise(
+    median_logodds  = round(median(Nomogram_LogOdds, na.rm = TRUE), 3),
+    pct_above_zero  = round(mean(Nomogram_LogOdds > 0, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  print()
+
+# Per-dataset breakdown
+cat("\nPer-dataset calibration check:\n")
+final_lodo_scores %>%
+  group_by(Dataset, Truth) %>%
+  summarise(
+    median_logodds = round(median(Nomogram_LogOdds, na.rm = TRUE), 3),
+    n              = n(),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from  = Truth,
+    values_from = c(median_logodds, n)
+  ) %>%
+  print()
+```
+
 ## Scoring Comparison Plot
 
 ```{r}
-library(tidyr)
-library(ggplot2)
-
 plot_scores <- final_lodo_scores %>%
-  pivot_longer(cols = c(RF_Prob, Weighted_Expr, Lasso_Prob, Nomogram_LogOdds,
-                        Panel_Score, Ensemble_Prob, Calibrated_Prob),
-               names_to  = "Scoring_Method",
-               values_to = "Value")
+  pivot_longer(
+    cols      = c(RF_Prob, Weighted_Expr, Lasso_Prob, Nomogram_LogOdds,
+                  Panel_Score, Ensemble_Prob, Calibrated_Prob),
+    names_to  = "Scoring_Method",
+    values_to = "Value"
+  )
 
 ggplot(plot_scores, aes(x = Truth, y = Value, fill = Truth)) +
   geom_boxplot(alpha = 0.7, outlier.shape = NA) +
   geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
-  facet_wrap(~Scoring_Method, scales = "free_y") +
+  facet_wrap(~ Scoring_Method, scales = "free_y") +
   theme_bw() +
-  labs(title    = "Comparison of 7 Scoring Methodologies",
-       subtitle = "Separation between Cancer and Normal across all LODO folds",
-       y = "Score Value", x = "Clinical Status") +
+  labs(
+    title    = "Comparison of 7 Scoring Methodologies",
+    subtitle = "Separation between Cancer and Normal across all LODO folds",
+    y        = "Score Value",
+    x        = "Clinical Status"
+  ) +
   scale_fill_manual(values = c("Cancer" = "#e41a1c", "Normal" = "#377eb8"))
 ```
 
@@ -926,51 +1095,46 @@ score_cols <- c("RF_Prob", "Weighted_Expr", "Lasso_Prob", "Nomogram_LogOdds",
                 "Panel_Score", "Ensemble_Prob", "Calibrated_Prob")
 
 auc_results <- sapply(score_cols, function(col) {
-  roc_obj <- roc(final_lodo_scores$Truth, final_lodo_scores[[col]],
-                 levels = c("Cancer", "Normal"), quiet = TRUE)
+  roc_obj <- roc(
+    final_lodo_scores$Truth,
+    final_lodo_scores[[col]],
+    levels = c("Cancer", "Normal"),
+    quiet  = TRUE
+  )
   auc(roc_obj)
 })
 
 auc_df <- data.frame(Method = names(auc_results), AUC = as.numeric(auc_results)) %>%
   arrange(desc(AUC))
 
+cat("AUC by scoring method:\n")
 print(auc_df)
 
 roc_plot_data <- final_lodo_scores %>%
-  pivot_longer(cols = c(RF_Prob, Lasso_Prob, Ensemble_Prob, Calibrated_Prob,Nomogram_LogOdds),
-               names_to  = "Scoring_Method",
-               values_to = "Value") %>%
+  pivot_longer(
+    cols      = c(RF_Prob, Lasso_Prob, Ensemble_Prob, Calibrated_Prob, Nomogram_LogOdds),
+    names_to  = "Scoring_Method",
+    values_to = "Value"
+  ) %>%
   mutate(D_binary = ifelse(Truth == "Normal", 1, 0))
 
-roc_plot <- ggplot(roc_plot_data, aes(d = D_binary, m = Value, color = Scoring_Method)) +
+roc_plot <- ggplot(roc_plot_data,
+                   aes(d = D_binary, m = Value, color = Scoring_Method)) +
   geom_roc(n.cuts = 0, size = 1.2) +
   style_roc(theme = theme_minimal) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
-  labs(title    = "Multi-Method ROC Comparison",
-       subtitle = "Cross-dataset validation (LODO)",
-       x = "1 - Specificity (False Positive Rate)",
-       y = "Sensitivity (True Positive Rate)") +
+  labs(
+    title    = "Multi-Method ROC Comparison",
+    subtitle = "Cross-dataset validation (LODO)",
+    x        = "1 - Specificity (False Positive Rate)",
+    y        = "Sensitivity (True Positive Rate)"
+  ) +
   scale_color_brewer(palette = "Set1") +
-  theme(panel.background = element_rect(fill = "white", color = "white"),
-        plot.background  = element_rect(fill = "white", color = "white"))
+  theme(
+    panel.background = element_rect(fill = "white", color = "white"),
+    plot.background  = element_rect(fill = "white", color = "white")
+  )
 
 print(roc_plot)
 calc_auc(roc_plot)
-```
-
-```{r}
-library(ggplot2)
-
-# We use the final_lodo_scores dataframe we created earlier
-ggplot(final_lodo_scores, aes(x = Nomogram_LogOdds, fill = Truth)) +
-  geom_density(alpha = 0.5) + 
-  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
-  theme_minimal() +
-  scale_fill_manual(values = c("Cancer" = "#E41A1C", "Normal" = "#377EB8")) +
-  labs(
-    title = "Density of Predicted Cancer Risk (Log-Odds)",
-    subtitle = "Dashed line represents the 50/50 decision threshold",
-    x = "Risk Score (Log-Odds)",
-    y = "Density"
-  )
 ```
