@@ -45,6 +45,11 @@ normal_keywords <- c(
   "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
   "healthy", "control", "adjacent normal", "benign", "none"
 )
+
+# Preprocessing knobs
+enable_auto_log2 <- TRUE
+use_fold_downsampling <- TRUE
+downsample_max_ratio <- 3
 ```
 
 ```{r}
@@ -126,8 +131,33 @@ clean_first_symbol <- function(s) {
   trimws(parts[1])
 }
 
+needs_log2_transform <- function(e) {
+  vals <- as.numeric(e)
+  vals <- vals[is.finite(vals)]
+  if (length(vals) < 10) return(FALSE)
+  qx <- stats::quantile(vals, probs = c(0, 0.25, 0.5, 0.75, 0.99, 1.0), na.rm = TRUE)
+  # GEO2R-style heuristic for identifying non-log expression scales.
+  (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0) || (qx[2] > 0 && qx[2] < 1 && qx[4] > 1 && qx[4] < 2)
+}
+
+safe_log2_transform <- function(e) {
+  pos <- e[e > 0 & is.finite(e)]
+  if (!length(pos)) return(e)
+  pseudo <- min(pos, na.rm = TRUE) / 2
+  e2 <- e
+  e2[!is.finite(e2)] <- NA_real_
+  e2[e2 <= 0] <- pseudo
+  log2(e2)
+}
+
 collapse_to_genes <- function(eset) {
   e <- exprs(eset)
+  q_raw <- stats::quantile(as.numeric(e), probs = c(0.01, 0.5, 0.99), na.rm = TRUE)
+  log2_applied <- isTRUE(enable_auto_log2) && needs_log2_transform(e)
+  if (log2_applied) {
+    e <- safe_log2_transform(e)
+  }
+  q_used <- stats::quantile(as.numeric(e), probs = c(0.01, 0.5, 0.99), na.rm = TRUE)
   fd <- fData(eset)
   sym_col <- grep("gene\\s*symbol|symbol", colnames(fd), ignore.case = TRUE, value = TRUE)[1]
   gene_sym_raw <- if (!is.na(sym_col)) as.character(fd[, sym_col]) else rep(NA_character_, nrow(fd))
@@ -147,42 +177,114 @@ gene_sym[has_symbol] <- vapply(gene_sym_raw[has_symbol], clean_first_symbol, cha
     ungroup() %>%
     tibble::column_to_rownames(".__gene_sym__")
 
-  list(eMat_g = e_g, fMat_g = fd_g, pMat = pData(eset))
+  list(
+    eMat_g = e_g,
+    fMat_g = fd_g,
+    pMat = pData(eset),
+    log2_applied = log2_applied,
+    q01_raw = as.numeric(q_raw[1]),
+    q50_raw = as.numeric(q_raw[2]),
+    q99_raw = as.numeric(q_raw[3]),
+    q01_used = as.numeric(q_used[1]),
+    q50_used = as.numeric(q_used[2]),
+    q99_used = as.numeric(q_used[3])
+  )
 }
 
 infer_binary_label <- function(pMat, normal_keywords) {
-  # Prefer characteristics_ch* columns first, then everything else
-  cols_char <- grep("^characteristics_ch", colnames(pMat), value = TRUE)
-  cols_other <- setdiff(colnames(pMat), cols_char)
-  cols_try <- c(cols_char, cols_other)
-
-  has_kw <- function(x) {
-    x <- tolower(as.character(x))
+  # Robust text parsing avoids accidental matches like "abnormal"/"normalized".
+  normalize_pheno_txt <- function(x) {
+    x <- as.character(x)
     x[is.na(x)] <- ""
-    any(vapply(
-      normal_keywords,
-      function(kw) any(grepl(kw, x, fixed = TRUE)),
-      logical(1)
-    ))
+    x <- gsub("\u00a0|\u200b", " ", x, fixed = TRUE)
+    x <- trimws(gsub("[[:space:]]+", " ", x))
+    tolower(x)
   }
 
-  for (cn in cols_try) {
-    x <- pMat[[cn]]
-    if (!has_kw(x)) next
-    xlow <- tolower(as.character(x))
-    xlow[is.na(xlow)] <- ""
-    is_normal <- Reduce(`|`, lapply(normal_keywords, function(kw) grepl(kw, xlow, fixed = TRUE)))
-    label <- ifelse(is_normal, "Normal", "Cancer")
-    label[xlow == ""] <- NA_character_
-    label <- factor(label, levels = c("Cancer", "Normal"))
-    tab <- table(label, useNA = "no")
-    if (length(tab) >= 2 && all(tab > 0)) {
-      return(list(label = label, label_col = cn))
+  flatten_pheno_col <- function(x) {
+    if (is.list(x) && !inherits(x, "data.frame")) {
+      vapply(x, function(z) paste(as.character(z), collapse = " "), character(1))
+    } else {
+      as.character(x)
     }
   }
 
-  list(label = factor(rep(NA_character_, nrow(pMat)), levels = c("Cancer", "Normal")),
-       label_col = NA_character_)
+  rx_escape <- function(s) gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", s, perl = TRUE)
+
+  keyword_hit <- function(xlow, keywords) {
+    keywords <- unique(trimws(as.character(keywords)))
+    keywords <- keywords[nzchar(keywords)]
+    if (!length(keywords)) return(rep(FALSE, length(xlow)))
+    parts <- vapply(keywords, function(kw) {
+      paste0("(?<![[:alnum:]])", rx_escape(kw), "(?![[:alnum:]])")
+    }, character(1))
+    grepl(paste0("(?i)(?:", paste(parts, collapse = "|"), ")"), xlow, perl = TRUE)
+  }
+
+  explicit_normal_rx <- paste0(
+    "(?i)(",
+    ",\\s*normal\\b|",
+    "\\bbreast\\s+biopsy[, ]+normal\\b|",
+    "\\bhuman\\s+breast\\s+biopsy[, ]+normal\\b|",
+    "\\bnormal\\s+breast(\\s+tissue)?\\b|",
+    "tissue:\\s*normal\\b|",
+    "histopathological\\s+exam:\\s*normal\\b",
+    ")"
+  )
+
+  tumor_hint_rx <- "(?i)(tumor|cancer|carcinoma|malign|invasive|ductal|lobular|metasta)"
+
+  cols_try <- local({
+    nm <- colnames(pMat)
+    pr <- nm[grepl(
+      "source_name|sample_title|\\btitle\\b|histology|pathology|disease|diagnosis|tumor|sample_type|biopsy|specimen",
+      nm,
+      ignore.case = TRUE
+    )]
+    ch <- grep("^characteristics_ch", nm, value = TRUE)
+    rest <- setdiff(nm, c(pr, ch))
+    unique(c(intersect(pr, nm), ch, rest))
+  })
+
+  col_has_signal <- function(xlow) {
+    nzchar(xlow) &
+      (keyword_hit(xlow, normal_keywords) |
+         grepl(explicit_normal_rx, xlow, perl = TRUE) |
+         grepl(tumor_hint_rx, xlow, perl = TRUE))
+  }
+
+  best <- NULL
+  best_key <- NULL
+
+  for (idx in seq_along(cols_try)) {
+    cn <- cols_try[[idx]]
+    x <- flatten_pheno_col(pMat[[cn]])
+    xlow <- normalize_pheno_txt(x)
+    if (!any(col_has_signal(xlow))) next
+
+    is_normal <- keyword_hit(xlow, normal_keywords) | grepl(explicit_normal_rx, xlow, perl = TRUE)
+    label <- ifelse(is_normal, "Normal", "Cancer")
+    label[!nzchar(xlow)] <- NA_character_
+    label <- factor(label, levels = c("Cancer", "Normal"))
+
+    tab <- table(label, useNA = "no")
+    if (!all(c("Cancer", "Normal") %in% names(tab))) next
+    if (is.na(tab[["Cancer"]]) || is.na(tab[["Normal"]])) next
+    if (tab[["Cancer"]] == 0 || tab[["Normal"]] == 0) next
+
+    min_cnt <- min(as.integer(tab[["Cancer"]]), as.integer(tab[["Normal"]]))
+    n_nonempty <- sum(nzchar(xlow) & !is.na(label))
+    key <- c(min_cnt, n_nonempty, -idx)
+    if (is.null(best_key) || key[1] > best_key[1] ||
+        (key[1] == best_key[1] && key[2] > best_key[2]) ||
+        (key[1] == best_key[1] && key[2] == best_key[2] && key[3] > best_key[3])) {
+      best_key <- key
+      best <- list(label = label, label_col = cn)
+    }
+  }
+
+  if (!is.null(best)) return(best)
+  list(label = factor(rep(NA_character_, nrow(pMat)), levels = c("Cancer", "Normal")), label_col = NA_character_)
 }
 
 extract_after_scalar <- function(x, prefix) {
@@ -379,7 +481,15 @@ build_merged_binary_dataset <- function(gse_ids, normal_keywords) {
     p$label_col_detected <- lab$label_col
     p$label_binary <- as.character(lab$label)
 
-    list(id = id, e = cc$eMat_g, p = p, f = cc$fMat_g)
+    list(
+      id = id,
+      e = cc$eMat_g,
+      p = p,
+      f = cc$fMat_g,
+      log2_applied = cc$log2_applied,
+      q01_raw = cc$q01_raw, q50_raw = cc$q50_raw, q99_raw = cc$q99_raw,
+      q01_used = cc$q01_used, q50_used = cc$q50_used, q99_used = cc$q99_used
+    )
   })
 
   # Merge expression by INTERSECTION of genes so no dataset-specific padding is needed.
@@ -911,7 +1021,9 @@ print(table(y_bin2))
 run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = TRUE,
                                apply_batch_correction = TRUE,
                                weight_scheme = c("ratio", "balanced", "balanced_capped"),
-                               weight_cap = 4) {
+                               weight_cap = 4,
+                               use_downsampling = TRUE,
+                               downsample_ratio_cap = 3) {
   y <- factor(y)
   batch <- as.character(batch)
   weight_scheme <- match.arg(weight_scheme)
@@ -927,6 +1039,7 @@ run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = T
   perf <- data.frame()
   all_preds <- data.frame()
   all_scores <- data.frame()
+  fold_diag <- data.frame()
 
   for (ds in unique(batch)) {
     test_id <- which(batch == ds)
@@ -949,6 +1062,30 @@ run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = T
     expr_test_raw <- t(X[test_id, , drop = FALSE])
     batch_train <- batch[train_id]
     batch_test <- batch[test_id]
+
+    n_pos_before <- sum(y_train == positive)
+    n_neg_before <- sum(y_train != positive)
+
+    downsample_applied <- FALSE
+    if (isTRUE(use_downsampling)) {
+      idx_pos <- which(y_train == positive)
+      idx_neg <- which(y_train != positive)
+      if (length(idx_pos) > 0 && length(idx_neg) > 0) {
+        max_n <- function(n_min) max(1L, as.integer(downsample_ratio_cap * n_min))
+        keep_idx <- seq_along(y_train)
+        if (length(idx_neg) > max_n(length(idx_pos))) {
+          keep_idx <- sort(c(idx_pos, sample(idx_neg, max_n(length(idx_pos)))))
+        } else if (length(idx_pos) > max_n(length(idx_neg))) {
+          keep_idx <- sort(c(sample(idx_pos, max_n(length(idx_neg))), idx_neg))
+        }
+        if (length(keep_idx) < length(y_train)) {
+          downsample_applied <- TRUE
+          y_train <- droplevels(y_train[keep_idx])
+          expr_train_raw <- expr_train_raw[, keep_idx, drop = FALSE]
+          batch_train <- batch_train[keep_idx]
+        }
+      }
+    }
     mod_train <- model.matrix(~ y_train)
 
     cb <- if (isTRUE(apply_batch_correction)) {
@@ -1021,6 +1158,26 @@ run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = T
       pos_w <- 1
       neg_w <- 1
     }
+
+    n_pos_after <- sum(y_train == positive)
+    n_neg_after <- sum(y_train != positive)
+    fold_diag <- rbind(fold_diag, data.frame(
+      setting = setting_label,
+      fold = ds,
+      positive_class = positive,
+      n_train_before = as.integer(n_pos_before + n_neg_before),
+      n_pos_before = as.integer(n_pos_before),
+      n_neg_before = as.integer(n_neg_before),
+      n_train_after = as.integer(n_pos_after + n_neg_after),
+      n_pos_after = as.integer(n_pos_after),
+      n_neg_after = as.integer(n_neg_after),
+      downsample_used = isTRUE(use_downsampling),
+      downsample_applied = downsample_applied,
+      downsample_ratio_cap = downsample_ratio_cap,
+      pos_weight = as.numeric(pos_w),
+      neg_weight = as.numeric(neg_w),
+      stringsAsFactors = FALSE
+    ))
 
     neg_label <- setdiff(levels(y_train), positive)[1]
     cw <- c()
@@ -1126,7 +1283,7 @@ run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = T
     }
   }
 
-  list(perf = perf, preds = all_preds, scores = all_scores)
+  list(perf = perf, preds = all_preds, scores = all_scores, diag = fold_diag)
 }
 
 weight_cfg <- tibble::tribble(
@@ -1147,13 +1304,48 @@ bin_runs <- lapply(seq_len(nrow(weight_cfg)), function(i) {
     use_weights = cfg$use_weights,
     apply_batch_correction = TRUE,
     weight_scheme = cfg$weight_scheme,
-    weight_cap = cfg$weight_cap
+    weight_cap = cfg$weight_cap,
+    use_downsampling = use_fold_downsampling,
+    downsample_ratio_cap = downsample_max_ratio
   )
 })
 
 perf_bin <- bind_rows(lapply(bin_runs, `[[`, "perf"))
 preds_bin <- bind_rows(lapply(bin_runs, `[[`, "preds"))
 scores_bin <- bind_rows(lapply(bin_runs, `[[`, "scores"))
+diag_bin <- bind_rows(lapply(bin_runs, `[[`, "diag"))
+```
+
+## Preprocessing + imbalance diagnostics
+
+```{r}
+#| message: false
+#| warning: false
+prep_diag <- bind_rows(lapply(merged_bin$pieces, function(pc) {
+  tibble::tibble(
+    dataset_id = pc$id,
+    log2_applied = isTRUE(pc$log2_applied),
+    q01_raw = round(pc$q01_raw, 3),
+    q50_raw = round(pc$q50_raw, 3),
+    q99_raw = round(pc$q99_raw, 3),
+    q01_used = round(pc$q01_used, 3),
+    q50_used = round(pc$q50_used, 3),
+    q99_used = round(pc$q99_used, 3)
+  )
+}))
+
+knitr::kable(prep_diag, caption = "Per-dataset preprocessing diagnostics (raw scale vs post-log scale)")
+
+diag_fold_summary <- diag_bin %>%
+  mutate(
+    imbalance_before = round(n_neg_before / pmax(n_pos_before, 1), 2),
+    imbalance_after = round(n_neg_after / pmax(n_pos_after, 1), 2)
+  ) %>%
+  select(setting, fold, n_train_before, n_pos_before, n_neg_before, imbalance_before,
+         n_train_after, n_pos_after, n_neg_after, imbalance_after,
+         downsample_used, downsample_applied, pos_weight, neg_weight)
+
+knitr::kable(diag_fold_summary, caption = "Per-fold class-balance diagnostics (before/after downsampling and effective weights)")
 ```
 
 ## PCA (binary, merged)
