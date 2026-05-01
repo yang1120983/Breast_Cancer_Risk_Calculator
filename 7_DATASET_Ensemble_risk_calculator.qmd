@@ -2248,915 +2248,50 @@ print(p_risk_bc_folds)
 print(p_risk_bc_all)
 ```
 
-# Workflow Description
 
-For each dataset, samples were first split in a stratified manner by class (Cancer vs Normal), where:
 
-75% of samples were assigned to the development set 25% of samples were reserved as an independent hold-out test set
 
-This split was performed within each dataset and within each class, ensuring that both dataset structure and class distribution were keep.
 
-## Development Set (75%)
 
-The development set was used for model selection and ensemble design:
 
-Leave-One-Dataset-Out (LODO) validation was performed to evaluate model performance The mean LODO AUC was computed for each candidate model Models were ranked based on their mean LODO performance Fixed ensemble groups were constructed using a Top-K selection strategy (e.g., Top 4, Top 5, etc.) Multiple weighting strategies were defined to combine model outputs
 
-This stage was used exclusively for designing the ensemble, without accessing the hold-out test set.
 
-## Hold-out Test Set (25%)
 
-The hold-out test set was used for external evaluation:
 
-All predefined ensemble configurations (Top-K × weighting strategies) were applied Performance was evaluated on unseen samples using: AUC Sensitivity Specificity Balanced Accuracy Additionally, density overlap between Cancer and Normal risk score distributions was computed The results were used to compare how well different ensemble configurations generalize to new data
 
-Importantly, the hold-out test set was not used for model selection or tuning, but only for final evaluation. 
-# No batch ensemble risk
+
+Last week: fix weighted formula   
+this week: dynamic weighted model
+# Dynamic weighted model risk calculator
+## model selection:
+1: higher performance
+2: low correlation
+
+Step 1:
+Apply LODO (Leave-One-Dataset-Out) cross-validation on the full internal datasets to obtain out-of-dataset predictions for each sample.
+
+Step 2:
+Train the attention-based meta model using these LODO test predictions.
+
+Step 3:
+Retrain the base models (RF, Ridge, Logistic) using 100% of the internal datasets.
+
+Step 4:
+Generate predictions on the external dataset using the retrained base models.
+
+Step 5:
+Feed the base model predictions from the external dataset into the trained attention meta model to obtain the final dynamic risk scores.
+
+Step 6:
+Evaluate the final model performance only on the external dataset.
+
 
 ```{r}
 # ============================================================
-# NOT BATCH CORRECTION Ensemble Risk Calculator
-# Top-K fixed ensemble version
-# 75% development + 25% hold-out test
-# Development: LODO mean AUC for model ranking
-# Hold-out: evaluate Top-K fixed ensemble combinations
-# ============================================================
-
-library(dplyr)
-library(tidyr)
-library(tibble)
-library(limma)
-library(ggplot2)
-library(class)
-library(e1071)
-library(randomForest)
-library(glmnet)
-
-set.seed(3888)
-
-# -----------------------------
-# 0. Settings
-# -----------------------------
-positive_class <- "Cancer"
-negative_class <- "Normal"
-
-top_n_genes <- 50
-
-top_k_vec <- c(4, 5, 6, 7)
-
-weight_methods <- c(
-  "rank_auc",
-  "softmax_auc",
-  "auc_x_balacc",
-  "auc_minus_spec_penalty",
-  "equal_weight"
-)
-
-T <- 0.20
-lambda <- 0.50
-
-candidate_models <- c(
-  "RF",
-  "SVM_RBF",
-  "SVM_LINEAR",
-  "LASSO",
-  "Ridge",
-  "ElasticNet",
-  "kNN",
-  "Logistic",
-  "NaiveBayes"
-)
-
-# -----------------------------
-# 1. Helper functions
-# -----------------------------
-clip_prob <- function(p, eps = 1e-6) {
-  pmin(pmax(as.numeric(p), eps), 1 - eps)
-}
-
-auc_roc <- function(truth_pos, score_pos) {
-  truth_pos <- as.integer(truth_pos)
-  score_pos <- as.numeric(score_pos)
-
-  pos <- truth_pos == 1
-  neg <- truth_pos == 0
-
-  n_pos <- sum(pos)
-  n_neg <- sum(neg)
-
-  if (n_pos == 0 || n_neg == 0) return(NA_real_)
-
-  r <- rank(score_pos, ties.method = "average")
-  (sum(r[pos]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-}
-
-binary_metrics_cancer <- function(truth, score_cancer, threshold = 0.5) {
-  truth <- as.character(truth)
-  pred <- ifelse(score_cancer >= threshold, positive_class, negative_class)
-
-  tp <- sum(pred == positive_class & truth == positive_class, na.rm = TRUE)
-  fn <- sum(pred != positive_class & truth == positive_class, na.rm = TRUE)
-  tn <- sum(pred == negative_class & truth == negative_class, na.rm = TRUE)
-  fp <- sum(pred != negative_class & truth == negative_class, na.rm = TRUE)
-
-  accuracy <- mean(pred == truth, na.rm = TRUE)
-  sensitivity <- ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn))
-  specificity <- ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
-  balanced_accuracy <- mean(c(sensitivity, specificity), na.rm = TRUE)
-  auc <- auc_roc(truth == positive_class, score_cancer)
-
-  tibble(
-    AUC = auc,
-    Accuracy = accuracy,
-    Sensitivity = sensitivity,
-    Specificity = specificity,
-    BalancedAccuracy = balanced_accuracy
-  )
-}
-
-impute_fit <- function(X_train) {
-  meds <- apply(X_train, 2, function(v) median(v, na.rm = TRUE))
-  meds[is.na(meds)] <- 0
-  list(median = meds)
-}
-
-impute_apply <- function(X, fit) {
-  X2 <- X
-  for (j in seq_len(ncol(X2))) {
-    idx <- is.na(X2[, j])
-    if (any(idx)) X2[idx, j] <- fit$median[j]
-  }
-  X2
-}
-
-standardize_fit <- function(X_train) {
-  mu <- colMeans(X_train)
-  sdv <- apply(X_train, 2, sd)
-  sdv[sdv == 0 | is.na(sdv)] <- 1
-  list(mu = mu, sd = sdv)
-}
-
-standardize_apply <- function(X, fit) {
-  sweep(sweep(X, 2, fit$mu, "-"), 2, fit$sd, "/")
-}
-
-select_de_genes <- function(X_train_full, y_train, top_n = 50) {
-  y_train <- factor(y_train, levels = c(negative_class, positive_class))
-  design <- model.matrix(~ y_train)
-
-  fit <- eBayes(lmFit(t(X_train_full), design))
-  tt <- topTable(fit, n = top_n, sort.by = "P")
-
-  intersect(rownames(tt), colnames(X_train_full))
-}
-
-calc_density_overlap <- function(df, score_col = "ensemble_risk_score") {
-  x_cancer <- df %>% filter(truth == positive_class) %>% pull(.data[[score_col]])
-  x_normal <- df %>% filter(truth == negative_class) %>% pull(.data[[score_col]])
-
-  x_cancer <- x_cancer[is.finite(x_cancer)]
-  x_normal <- x_normal[is.finite(x_normal)]
-
-  if (length(x_cancer) < 2 || length(x_normal) < 2) return(NA_real_)
-
-  x_min <- min(c(x_cancer, x_normal))
-  x_max <- max(c(x_cancer, x_normal))
-
-  d_cancer <- density(x_cancer, from = x_min, to = x_max, n = 1000, adjust = 1.2)
-  d_normal <- density(x_normal, from = x_min, to = x_max, n = 1000, adjust = 1.2)
-
-  overlap_y <- pmin(d_cancer$y, d_normal$y)
-  grid_x <- seq(x_min, x_max, length.out = 1000)
-
-  sum(diff(grid_x) * head(overlap_y, -1))
-}
-
-# -----------------------------
-# 2. Prepare binary data
-# -----------------------------
-ok_bin <- !is.na(pMat_big_bin$label_binary) & pMat_big_bin$label_binary != ""
-
-X_all <- t(eMat_big_bin[, ok_bin, drop = FALSE])
-y_all <- factor(pMat_big_bin$label_binary[ok_bin], levels = c(negative_class, positive_class))
-dataset_all <- as.character(pMat_big_bin$dataset_id[ok_bin])
-
-valid <- !is.na(y_all)
-X_all <- X_all[valid, , drop = FALSE]
-y_all <- droplevels(y_all[valid])
-dataset_all <- dataset_all[valid]
-
-cat("Total samples:", nrow(X_all), "\n")
-cat("Total genes:", ncol(X_all), "\n")
-cat("Class distribution:\n")
-print(table(y_all))
-cat("Dataset distribution:\n")
-print(table(dataset_all))
-
-# -----------------------------
-# 3. Stratified 75/25 split within each dataset and class
-# -----------------------------
-split_stratified_by_dataset <- function(y, dataset, train_prop = 0.75) {
-  dev_idx <- c()
-  test_idx <- c()
-
-  for (ds in unique(dataset)) {
-    for (cl in unique(as.character(y))) {
-      idx <- which(dataset == ds & as.character(y) == cl)
-      if (length(idx) == 0) next
-
-      idx <- sample(idx)
-
-      if (length(idx) == 1) {
-        dev_idx <- c(dev_idx, idx)
-      } else {
-        n_dev <- floor(length(idx) * train_prop)
-        n_dev <- max(1, min(n_dev, length(idx) - 1))
-
-        dev_idx <- c(dev_idx, idx[seq_len(n_dev)])
-        test_idx <- c(test_idx, idx[(n_dev + 1):length(idx)])
-      }
-    }
-  }
-
-  list(
-    dev_idx = sort(dev_idx),
-    test_idx = sort(test_idx)
-  )
-}
-
-split_obj <- split_stratified_by_dataset(y_all, dataset_all, train_prop = 0.75)
-
-dev_idx <- split_obj$dev_idx
-test_idx <- split_obj$test_idx
-
-X_dev <- X_all[dev_idx, , drop = FALSE]
-y_dev <- y_all[dev_idx]
-dataset_dev <- dataset_all[dev_idx]
-
-X_test <- X_all[test_idx, , drop = FALSE]
-y_test <- y_all[test_idx]
-dataset_test <- dataset_all[test_idx]
-
-cat("\nDevelopment set:\n")
-print(table(y_dev))
-print(table(dataset_dev))
-
-cat("\nHold-out test set:\n")
-print(table(y_test))
-print(table(dataset_test))
-
-# -----------------------------
-# 4. Fit models and predict Cancer probability
-# -----------------------------
-fit_predict_models <- function(X_train_full, y_train, X_test_full, model_set = candidate_models) {
-
-  sel_genes <- select_de_genes(X_train_full, y_train, top_n = top_n_genes)
-
-  if (length(sel_genes) < 5) {
-    stop("Too few selected genes.")
-  }
-
-  X_train <- X_train_full[, sel_genes, drop = FALSE]
-  X_test <- X_test_full[, sel_genes, drop = FALSE]
-
-  imp <- impute_fit(X_train)
-  X_train_i <- impute_apply(X_train, imp)
-  X_test_i <- impute_apply(X_test, imp)
-
-  sc <- standardize_fit(X_train_i)
-  X_train_s <- standardize_apply(X_train_i, sc)
-  X_test_s <- standardize_apply(X_test_i, sc)
-
-  y_train <- factor(y_train, levels = c(negative_class, positive_class))
-
-  out <- list()
-
-  if ("RF" %in% model_set) {
-    rf_fit <- randomForest(
-      x = X_train_i,
-      y = y_train,
-      ntree = 500
-    )
-    prob_rf <- predict(rf_fit, X_test_i, type = "prob")
-    out[["RF"]] <- prob_rf[, positive_class]
-  }
-
-  if ("SVM_RBF" %in% model_set) {
-    svm_rbf_fit <- e1071::svm(
-      x = X_train_s,
-      y = y_train,
-      kernel = "radial",
-      cost = 1,
-      gamma = 1 / ncol(X_train_s),
-      probability = TRUE
-    )
-    pred_svm_rbf <- predict(svm_rbf_fit, X_test_s, probability = TRUE)
-    prob_svm_rbf <- attr(pred_svm_rbf, "probabilities")
-    out[["SVM_RBF"]] <- prob_svm_rbf[, positive_class]
-  }
-
-  if ("SVM_LINEAR" %in% model_set) {
-    svm_linear_fit <- e1071::svm(
-      x = X_train_s,
-      y = y_train,
-      kernel = "linear",
-      cost = 1,
-      probability = TRUE
-    )
-    pred_svm_linear <- predict(svm_linear_fit, X_test_s, probability = TRUE)
-    prob_svm_linear <- attr(pred_svm_linear, "probabilities")
-    out[["SVM_LINEAR"]] <- prob_svm_linear[, positive_class]
-  }
-
-  if ("LASSO" %in% model_set) {
-    y_num <- as.numeric(y_train == positive_class)
-
-    lasso_fit <- tryCatch(
-      cv.glmnet(
-        x = as.matrix(X_train_s),
-        y = y_num,
-        family = "binomial",
-        alpha = 1,
-        standardize = FALSE
-      ),
-      error = function(e) NULL
-    )
-
-    if (!is.null(lasso_fit)) {
-      out[["LASSO"]] <- as.numeric(
-        predict(lasso_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
-      )
-    }
-  }
-
-  if ("Ridge" %in% model_set) {
-    y_num <- as.numeric(y_train == positive_class)
-
-    ridge_fit <- tryCatch(
-      cv.glmnet(
-        x = as.matrix(X_train_s),
-        y = y_num,
-        family = "binomial",
-        alpha = 0,
-        standardize = FALSE
-      ),
-      error = function(e) NULL
-    )
-
-    if (!is.null(ridge_fit)) {
-      out[["Ridge"]] <- as.numeric(
-        predict(ridge_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
-      )
-    }
-  }
-
-  if ("ElasticNet" %in% model_set) {
-    y_num <- as.numeric(y_train == positive_class)
-
-    enet_fit <- tryCatch(
-      cv.glmnet(
-        x = as.matrix(X_train_s),
-        y = y_num,
-        family = "binomial",
-        alpha = 0.5,
-        standardize = FALSE
-      ),
-      error = function(e) NULL
-    )
-
-    if (!is.null(enet_fit)) {
-      out[["ElasticNet"]] <- as.numeric(
-        predict(enet_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
-      )
-    }
-  }
-
-  if ("kNN" %in% model_set) {
-    pred_knn <- class::knn(
-      train = X_train_s,
-      test = X_test_s,
-      cl = y_train,
-      k = 7,
-      prob = TRUE
-    )
-
-    win_prob <- attr(pred_knn, "prob")
-    score_knn <- ifelse(pred_knn == positive_class, win_prob, 1 - win_prob)
-    out[["kNN"]] <- score_knn
-  }
-
-  if ("Logistic" %in% model_set) {
-    y_num <- as.numeric(y_train == positive_class)
-
-    df_train <- data.frame(y_num = y_num, X_train_s, check.names = TRUE)
-    df_test <- data.frame(X_test_s, check.names = TRUE)
-
-    logistic_fit <- tryCatch(
-      glm(y_num ~ ., data = df_train, family = binomial()),
-      error = function(e) NULL
-    )
-
-    if (!is.null(logistic_fit)) {
-      score_logistic <- tryCatch(
-        as.numeric(predict(logistic_fit, newdata = df_test, type = "response")),
-        error = function(e) rep(NA_real_, nrow(X_test_s))
-      )
-      out[["Logistic"]] <- score_logistic
-    }
-  }
-
-  if ("NaiveBayes" %in% model_set) {
-    nb_fit <- tryCatch(
-      e1071::naiveBayes(x = X_train_s, y = y_train),
-      error = function(e) NULL
-    )
-
-    if (!is.null(nb_fit)) {
-      prob_nb <- tryCatch(
-        predict(nb_fit, X_test_s, type = "raw"),
-        error = function(e) NULL
-      )
-
-      if (!is.null(prob_nb) && positive_class %in% colnames(prob_nb)) {
-        out[["NaiveBayes"]] <- prob_nb[, positive_class]
-      }
-    }
-  }
-
-  out <- lapply(out, clip_prob)
-  as_tibble(out)
-}
-
-# -----------------------------
-# 5. Development LODO
-# -----------------------------
-lodo_scores_list <- list()
-lodo_metrics_list <- list()
-
-for (ds in unique(dataset_dev)) {
-  cat("Running development LODO fold:", ds, "\n")
-
-  test_id <- which(dataset_dev == ds)
-  train_id <- setdiff(seq_along(y_dev), test_id)
-
-  y_train <- y_dev[train_id]
-  y_fold <- y_dev[test_id]
-
-  if (length(unique(y_train)) < 2 || length(unique(y_fold)) < 2) {
-    cat("Skipping fold", ds, "because train/test has only one class.\n")
-    next
-  }
-
-  pred_scores <- fit_predict_models(
-    X_train_full = X_dev[train_id, , drop = FALSE],
-    y_train = y_train,
-    X_test_full = X_dev[test_id, , drop = FALSE],
-    model_set = candidate_models
-  )
-
-  available_models <- intersect(candidate_models, colnames(pred_scores))
-
-  fold_scores <- pred_scores %>%
-    mutate(
-      fold = ds,
-      sample_index = seq_len(n()),
-      truth = as.character(y_fold)
-    ) %>%
-    pivot_longer(
-      cols = all_of(available_models),
-      names_to = "model",
-      values_to = "score_cancer"
-    )
-
-  lodo_scores_list[[length(lodo_scores_list) + 1]] <- fold_scores
-
-  fold_metrics <- fold_scores %>%
-    group_by(model) %>%
-    summarise(
-      AUC = binary_metrics_cancer(truth, score_cancer)$AUC,
-      Accuracy = binary_metrics_cancer(truth, score_cancer)$Accuracy,
-      Sensitivity = binary_metrics_cancer(truth, score_cancer)$Sensitivity,
-      Specificity = binary_metrics_cancer(truth, score_cancer)$Specificity,
-      BalancedAccuracy = binary_metrics_cancer(truth, score_cancer)$BalancedAccuracy,
-      .groups = "drop"
-    ) %>%
-    mutate(fold = ds)
-
-  lodo_metrics_list[[length(lodo_metrics_list) + 1]] <- fold_metrics
-}
-
-lodo_scores_dev <- bind_rows(lodo_scores_list)
-lodo_metrics_dev <- bind_rows(lodo_metrics_list)
-
-cat("\n===== Development LODO metrics =====\n")
-print(lodo_metrics_dev)
-
-# -----------------------------
-# 6. Model ranking by mean LODO AUC
-# -----------------------------
-model_rank_dev <- lodo_metrics_dev %>%
-  group_by(model) %>%
-  summarise(
-    mean_LODO_AUC = mean(AUC, na.rm = TRUE),
-    sd_LODO_AUC = sd(AUC, na.rm = TRUE),
-    mean_BalancedAccuracy = mean(BalancedAccuracy, na.rm = TRUE),
-    mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
-    mean_Specificity = mean(Specificity, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy))
-
-cat("\n===== Model ranking by mean development LODO AUC =====\n")
-print(model_rank_dev)
-
-# -----------------------------
-# 7. Fixed groups by Top-K
-# -----------------------------
-fixed_groups <- list()
-
-for (k in top_k_vec) {
-  selected <- model_rank_dev %>%
-    arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy)) %>%
-    slice_head(n = k)
-
-  if (nrow(selected) == 0) {
-    cat("No model selected for Top-K =", k, "\n")
-    next
-  }
-
-  fixed_groups[[as.character(k)]] <- selected
-}
-
-cat("\n===== Fixed model groups by Top-K =====\n")
-print(fixed_groups)
-
-# -----------------------------
-# 8. Weighting strategy function
-# -----------------------------
-make_weights <- function(selected_df, weight_method) {
-  df <- selected_df %>%
-    arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy), desc(mean_Sensitivity)) %>%
-    mutate(
-      rank = row_number(),
-      rank_score = rev(seq_len(n()))
-    )
-
-  if (weight_method == "rank_auc") {
-    df <- df %>%
-      mutate(raw_weight = mean_LODO_AUC * rank_score)
-
-  } else if (weight_method == "softmax_auc") {
-    df <- df %>%
-      mutate(raw_weight = exp(mean_LODO_AUC / T))
-
-  } else if (weight_method == "auc_x_balacc") {
-    df <- df %>%
-      mutate(raw_weight = exp((mean_LODO_AUC * mean_BalancedAccuracy) / T))
-
-  } else if (weight_method == "auc_minus_spec_penalty") {
-    df <- df %>%
-      mutate(raw_weight = exp((mean_LODO_AUC - lambda * (1 - mean_Specificity)) / T))
-
-  } else if (weight_method == "equal_weight") {
-    df <- df %>%
-      mutate(raw_weight = 1)
-
-  } else {
-    stop("Unknown weight method: ", weight_method)
-  }
-
-  df %>%
-    mutate(
-      raw_weight = ifelse(is.na(raw_weight) | raw_weight <= 0, 1e-8, raw_weight),
-      final_weight = raw_weight / sum(raw_weight)
-    )
-}
-
-# -----------------------------
-# 9. Hold-out test evaluation
-# -----------------------------
-all_holdout_scores <- list()
-all_holdout_metrics <- list()
-all_holdout_weights <- list()
-
-for (k in names(fixed_groups)) {
-  selected_df <- fixed_groups[[k]]
-  selected_models <- selected_df$model
-
-  cat("\nTraining fixed models for Top-K:", k, "\n")
-  cat("Selected models:", paste(selected_models, collapse = ", "), "\n")
-
-  pred_scores_test <- fit_predict_models(
-    X_train_full = X_dev,
-    y_train = y_dev,
-    X_test_full = X_test,
-    model_set = selected_models
-  )
-
-  pred_scores_test <- pred_scores_test %>%
-    mutate(
-      sample_index = seq_len(n()),
-      truth = as.character(y_test)
-    )
-
-  for (wm in weight_methods) {
-    weight_df <- make_weights(selected_df, wm)
-
-    score_cols <- intersect(weight_df$model, colnames(pred_scores_test))
-
-    if (length(score_cols) == 0) next
-
-    weights_use <- weight_df$final_weight[match(score_cols, weight_df$model)]
-    weights_use <- weights_use / sum(weights_use)
-
-    score_mat <- as.matrix(pred_scores_test[, score_cols, drop = FALSE])
-    ensemble_score <- as.numeric(score_mat %*% weights_use)
-    ensemble_score <- clip_prob(ensemble_score)
-
-    score_df <- pred_scores_test %>%
-      select(sample_index, truth, all_of(score_cols)) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm),
-        ensemble_score_cancer = ensemble_score,
-        ensemble_risk_score = qlogis(ensemble_score)
-      )
-
-    metric_df <- binary_metrics_cancer(
-      truth = score_df$truth,
-      score_cancer = score_df$ensemble_score_cancer,
-      threshold = 0.5
-    ) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm),
-        n_models = length(score_cols),
-        selected_models = paste(score_cols, collapse = " + ")
-      )
-
-    weight_out <- weight_df %>%
-      select(model, mean_LODO_AUC, mean_BalancedAccuracy, mean_Sensitivity, mean_Specificity, final_weight) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm)
-      )
-
-    all_holdout_scores[[length(all_holdout_scores) + 1]] <- score_df
-    all_holdout_metrics[[length(all_holdout_metrics) + 1]] <- metric_df
-    all_holdout_weights[[length(all_holdout_weights) + 1]] <- weight_out
-  }
-}
-
-holdout_scores_df <- bind_rows(all_holdout_scores)
-holdout_metrics_df <- bind_rows(all_holdout_metrics)
-holdout_weights_df <- bind_rows(all_holdout_weights)
-
-if (nrow(holdout_scores_df) == 0) {
-  stop("No hold-out ensemble result generated. Check Top-K settings.")
-}
-
-holdout_metrics_df <- holdout_metrics_df %>%
-  arrange(desc(BalancedAccuracy), desc(AUC), desc(Sensitivity))
-
-cat("\n===== Hold-out test performance =====\n")
-print(holdout_metrics_df)
-
-cat("\n===== Hold-out ensemble weights =====\n")
-print(holdout_weights_df)
-
-# -----------------------------
-# 10. Density overlap ranking
-# -----------------------------
-overlap_df <- holdout_scores_df %>%
-  group_by(combo, top_k, weight_method) %>%
-  summarise(
-    overlap_area = calc_density_overlap(cur_data(), score_col = "ensemble_risk_score"),
-    cancer_median = median(ensemble_risk_score[truth == positive_class], na.rm = TRUE),
-    normal_median = median(ensemble_risk_score[truth == negative_class], na.rm = TRUE),
-    cancer_right_rate = mean(ensemble_risk_score[truth == positive_class] > 0, na.rm = TRUE),
-    normal_right_rate = mean(ensemble_risk_score[truth == negative_class] > 0, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(cancer_median > normal_median) %>%
-  arrange(overlap_area, normal_right_rate)
-
-cat("\n===== Density overlap ranking =====\n")
-print(overlap_df)
-
-# -----------------------------
-# 11. Plots
-# -----------------------------
-
-ggplot(model_rank_dev, aes(x = reorder(model, mean_LODO_AUC), y = mean_LODO_AUC)) +
-  geom_col(alpha = 0.8) +
-  coord_flip() +
-  theme_bw() +
-  labs(
-    x = "Model",
-    y = "Mean development LODO AUC",
-    title = "Model ranking based on 75% development LODO"
-  )
-
-holdout_metrics_long <- holdout_metrics_df %>%
-  select(combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy) %>%
-  pivot_longer(
-    cols = c(AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy),
-    names_to = "metric",
-    values_to = "value"
-  )
-
-ggplot(holdout_metrics_long, aes(x = reorder(combo, value), y = value)) +
-  geom_col(alpha = 0.8) +
-  coord_flip() +
-  facet_wrap(~ metric, scales = "free_x") +
-  theme_bw() +
-  labs(
-    x = "Combination",
-    y = "Value",
-    title = "Hold-out test performance of Top-K fixed ensemble combinations"
-  )
-
-ggplot(holdout_scores_df, aes(x = ensemble_risk_score, fill = truth)) +
-  geom_density(alpha = 0.35, adjust = 1.2, linewidth = 0.4) +
-  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
-  facet_grid(weight_method ~ top_k, scales = "free_y") +
-  theme_bw() +
-  labs(
-    x = "Ensemble risk score: log-odds of Cancer",
-    y = "Density",
-    title = "NOT BATCH: Top-K Ensemble Risk Calculator Density Comparison"
-  )
-
-if (nrow(overlap_df) > 0) {
-  best_overlap_combo <- overlap_df$combo[1]
-
-  df_best_overlap <- holdout_scores_df %>%
-    filter(combo == best_overlap_combo)
-
-  ggplot(df_best_overlap, aes(x = ensemble_risk_score, fill = truth)) +
-    geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
-    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
-    theme_bw(base_size = 15) +
-    labs(
-      title = paste0("Minimum Density Overlap on Hold-out Test: ", best_overlap_combo),
-      x = "Ensemble risk score: log-odds of Cancer",
-      y = "Density"
-    )
-}
-
-# -----------------------------
-# 12. Final summaries
-# -----------------------------
-best_by_balacc <- holdout_metrics_df %>% slice(1)
-
-cat("\n===== Best hold-out combination by Balanced Accuracy =====\n")
-print(best_by_balacc)
-
-if (nrow(overlap_df) > 0) {
-  cat("\n===== Best hold-out combination by minimum density overlap =====\n")
-  print(overlap_df %>% slice(1))
-}
-
-cat("\n===== Top 10 hold-out combinations =====\n")
-print(holdout_metrics_df %>% head(10))
-
-# -----------------------------
-# 13. Print final score formulas
-# -----------------------------
-make_formula_text <- function(weight_table, combo_name) {
-  df <- weight_table %>%
-    filter(combo == combo_name) %>%
-    arrange(desc(final_weight))
-
-  if (nrow(df) == 0) return("No formula available.")
-
-  parts <- paste0(
-    round(df$final_weight, 4),
-    " * ",
-    df$model
-  )
-
-  paste0(
-    "FINAL SCORE = ",
-    paste(parts, collapse = " + ")
-  )
-}
-
-best_ba_combo <- best_by_balacc$combo[1]
-
-formula_best_ba <- make_formula_text(
-  weight_table = holdout_weights_df,
-  combo_name = best_ba_combo
-)
-
-cat("\n===== Final score formula: Best by Balanced Accuracy =====\n")
-cat("Combination:", best_ba_combo, "\n")
-cat(formula_best_ba, "\n")
-
-if (nrow(overlap_df) > 0) {
-  best_overlap_combo <- overlap_df$combo[1]
-
-  formula_best_overlap <- make_formula_text(
-    weight_table = holdout_weights_df,
-    combo_name = best_overlap_combo
-  )
-
-  cat("\n===== Final score formula: Best by Minimum Density Overlap =====\n")
-  cat("Combination:", best_overlap_combo, "\n")
-  cat(formula_best_overlap, "\n")
-}
-# -----------------------------
-# 14. Single best model hold-out performance
-# -----------------------------
-
-single_best_model <- model_rank_dev %>%
-  arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy)) %>%
-  slice(1) %>%
-  pull(model)
-
-cat("\n===== Single Best Model selected by development LODO mean AUC =====\n")
-cat("Single best model:", single_best_model, "\n")
-
-single_pred_test <- fit_predict_models(
-  X_train_full = X_dev,
-  y_train = y_dev,
-  X_test_full = X_test,
-  model_set = single_best_model
-)
-
-single_score <- single_pred_test[[single_best_model]]
-single_score <- clip_prob(single_score)
-
-single_metrics <- binary_metrics_cancer(
-  truth = as.character(y_test),
-  score_cancer = single_score,
-  threshold = 0.5
-) %>%
-  mutate(
-    model = single_best_model,
-    selected_by = "highest mean development LODO AUC"
-  )
-
-cat("\n===== Single Best Model Hold-out Test Performance =====\n")
-print(single_metrics)
-
-single_score_df <- tibble(
-  sample_index = seq_along(single_score),
-  truth = as.character(y_test),
-  model = single_best_model,
-  score_cancer = single_score,
-  risk_score = qlogis(single_score)
-)
-
-ggplot(single_score_df, aes(x = risk_score, fill = truth)) +
-  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
-  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
-  theme_bw(base_size = 15) +
-  labs(
-    title = paste0("Single Best Model Density on Hold-out Test: ", single_best_model),
-    x = "Risk score: log-odds of Cancer",
-    y = "Density"
-  )
-
-# -----------------------------
-# 15. Compare single best vs best ensemble
-# -----------------------------
-
-best_ensemble_metrics <- best_by_balacc %>%
-  mutate(method = "Best Ensemble by Balanced Accuracy") %>%
-  select(method, combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy)
-
-single_compare_metrics <- single_metrics %>%
-  mutate(
-    method = "Single Best Model",
-    combo = single_best_model
-  ) %>%
-  select(method, combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy)
-
-comparison_table <- bind_rows(
-  single_compare_metrics,
-  best_ensemble_metrics
-)
-
-cat("\n===== Single Best Model vs Best Ensemble Comparison =====\n")
-print(comparison_table)
-```
-
-Not Batch ===== Final score formula: Best by Balanced Accuracy ===== Combination: top6 | softmax_auc FINAL SCORE = 0.1898 * RF + 0.1782 * Ridge + 0.1662 * LASSO + 0.1655 * ElasticNet + 0.1529 * SVM_LINEAR + 0.1473 * NaiveBayes 
-===== Final score formula: Best by Minimum Density Overlap ===== Combination: top4 | softmax_auc FINAL SCORE = 0.2713 * RF + 0.2547 * Ridge + 0.2375 * LASSO + 0.2365 * ElasticNet
-
-# batched ensemble risk calculator
-
-```{r}
-# ============================================================
-# BATCH CORRECTION Ensemble Risk Calculator
-# Top-K fixed ensemble version
-# 75% development + 25% hold-out test
-# Development: LODO mean AUC for model ranking
-# Hold-out: evaluate Top-K fixed ensemble combinations
+# FULL DATA LODO Model Selection
+# 9 candidate models + batch correction
+# No 75/25 split
+# Output: performance + correlation + visualisation
 # ============================================================
 
 library(dplyr)
@@ -3175,32 +2310,28 @@ set.seed(3888)
 # -----------------------------
 # 0. Settings
 # -----------------------------
+
 positive_class <- "Cancer"
 negative_class <- "Normal"
 
 top_n_genes <- 50
-top_k_vec <- c(4, 5, 6, 7)
-
-weight_methods <- c(
-  "rank_auc",
-  "softmax_auc",
-  "auc_x_balacc",
-  "auc_minus_spec_penalty",
-  "equal_weight"
-)
-
-T <- 0.20
-lambda <- 0.50
 
 candidate_models <- c(
-  "RF", "SVM_RBF", "SVM_LINEAR",
-  "LASSO", "Ridge", "ElasticNet",
-  "kNN", "Logistic", "NaiveBayes"
+  "RF",
+  "SVM_RBF",
+  "SVM_LINEAR",
+  "LASSO",
+  "Ridge",
+  "ElasticNet",
+  "kNN",
+  "Logistic",
+  "NaiveBayes"
 )
 
 # -----------------------------
 # 1. Helper functions
 # -----------------------------
+
 clip_prob <- function(p, eps = 1e-6) {
   pmin(pmax(as.numeric(p), eps), 1 - eps)
 }
@@ -3271,7 +2402,6 @@ standardize_apply <- function(X, fit) {
   sweep(sweep(X, 2, fit$mu, "-"), 2, fit$sd, "/")
 }
 
-# Training-only batch correction
 combat_fit_apply <- function(expr_train, batch_train, y_train, expr_test, batch_test) {
   batch_train <- as.character(batch_train)
   batch_test <- as.character(batch_test)
@@ -3346,101 +2476,39 @@ select_de_genes <- function(X_train_full, y_train, top_n = 50) {
   intersect(rownames(tt), colnames(X_train_full))
 }
 
-calc_density_overlap <- function(df, score_col = "ensemble_risk_score") {
-  x_cancer <- df %>% filter(truth == positive_class) %>% pull(.data[[score_col]])
-  x_normal <- df %>% filter(truth == negative_class) %>% pull(.data[[score_col]])
-
-  x_cancer <- x_cancer[is.finite(x_cancer)]
-  x_normal <- x_normal[is.finite(x_normal)]
-
-  if (length(x_cancer) < 2 || length(x_normal) < 2) return(NA_real_)
-
-  x_min <- min(c(x_cancer, x_normal))
-  x_max <- max(c(x_cancer, x_normal))
-
-  d_cancer <- density(x_cancer, from = x_min, to = x_max, n = 1000, adjust = 1.2)
-  d_normal <- density(x_normal, from = x_min, to = x_max, n = 1000, adjust = 1.2)
-
-  overlap_y <- pmin(d_cancer$y, d_normal$y)
-  grid_x <- seq(x_min, x_max, length.out = 1000)
-
-  sum(diff(grid_x) * head(overlap_y, -1))
-}
-
 # -----------------------------
-# 2. Prepare binary data
+# 2. Prepare full binary data
 # -----------------------------
+
 ok_bin <- !is.na(pMat_big_bin$label_binary) & pMat_big_bin$label_binary != ""
 
 X_all <- t(eMat_big_bin[, ok_bin, drop = FALSE])
-y_all <- factor(pMat_big_bin$label_binary[ok_bin], levels = c(negative_class, positive_class))
+
+y_all <- factor(
+  pMat_big_bin$label_binary[ok_bin],
+  levels = c(negative_class, positive_class)
+)
+
 dataset_all <- as.character(pMat_big_bin$dataset_id[ok_bin])
 
 valid <- !is.na(y_all)
+
 X_all <- X_all[valid, , drop = FALSE]
 y_all <- droplevels(y_all[valid])
 dataset_all <- dataset_all[valid]
 
+cat("===== Full dataset summary =====\n")
 cat("Total samples:", nrow(X_all), "\n")
 cat("Total genes:", ncol(X_all), "\n")
-cat("Class distribution:\n")
+cat("\nClass distribution:\n")
 print(table(y_all))
-cat("Dataset distribution:\n")
+cat("\nDataset distribution:\n")
 print(table(dataset_all))
 
 # -----------------------------
-# 3. Stratified 75/25 split
+# 3. Fit models and predict Cancer probability
 # -----------------------------
-split_stratified_by_dataset <- function(y, dataset, train_prop = 0.75) {
-  dev_idx <- c()
-  test_idx <- c()
 
-  for (ds in unique(dataset)) {
-    for (cl in unique(as.character(y))) {
-      idx <- which(dataset == ds & as.character(y) == cl)
-      if (length(idx) == 0) next
-
-      idx <- sample(idx)
-
-      if (length(idx) == 1) {
-        dev_idx <- c(dev_idx, idx)
-      } else {
-        n_dev <- floor(length(idx) * train_prop)
-        n_dev <- max(1, min(n_dev, length(idx) - 1))
-
-        dev_idx <- c(dev_idx, idx[seq_len(n_dev)])
-        test_idx <- c(test_idx, idx[(n_dev + 1):length(idx)])
-      }
-    }
-  }
-
-  list(dev_idx = sort(dev_idx), test_idx = sort(test_idx))
-}
-
-split_obj <- split_stratified_by_dataset(y_all, dataset_all, train_prop = 0.75)
-
-dev_idx <- split_obj$dev_idx
-test_idx <- split_obj$test_idx
-
-X_dev <- X_all[dev_idx, , drop = FALSE]
-y_dev <- y_all[dev_idx]
-dataset_dev <- dataset_all[dev_idx]
-
-X_test <- X_all[test_idx, , drop = FALSE]
-y_test <- y_all[test_idx]
-dataset_test <- dataset_all[test_idx]
-
-cat("\nDevelopment set:\n")
-print(table(y_dev))
-print(table(dataset_dev))
-
-cat("\nHold-out test set:\n")
-print(table(y_test))
-print(table(dataset_test))
-
-# -----------------------------
-# 4. Fit models and predict Cancer probability WITH batch correction
-# -----------------------------
 fit_predict_models <- function(
     X_train_full,
     y_train,
@@ -3452,7 +2520,6 @@ fit_predict_models <- function(
 
   y_train <- factor(y_train, levels = c(negative_class, positive_class))
 
-  # batch correction before DE gene selection
   expr_train_raw <- t(X_train_full)
   expr_test_raw <- t(X_test_full)
 
@@ -3467,7 +2534,11 @@ fit_predict_models <- function(
   X_train_bc_full <- t(cb$train)
   X_test_bc_full <- t(cb$test)
 
-  sel_genes <- select_de_genes(X_train_bc_full, y_train, top_n = top_n_genes)
+  sel_genes <- select_de_genes(
+    X_train_full = X_train_bc_full,
+    y_train = y_train,
+    top_n = top_n_genes
+  )
 
   if (length(sel_genes) < 5) {
     stop("Too few selected genes.")
@@ -3487,7 +2558,11 @@ fit_predict_models <- function(
   out <- list()
 
   if ("RF" %in% model_set) {
-    rf_fit <- randomForest(x = X_train_i, y = y_train, ntree = 500)
+    rf_fit <- randomForest(
+      x = X_train_i,
+      y = y_train,
+      ntree = 500
+    )
     prob_rf <- predict(rf_fit, X_test_i, type = "prob")
     out[["RF"]] <- prob_rf[, positive_class]
   }
@@ -3535,7 +2610,12 @@ fit_predict_models <- function(
 
     if (!is.null(lasso_fit)) {
       out[["LASSO"]] <- as.numeric(
-        predict(lasso_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
+        predict(
+          lasso_fit,
+          newx = as.matrix(X_test_s),
+          type = "response",
+          s = "lambda.min"
+        )
       )
     }
   }
@@ -3556,7 +2636,12 @@ fit_predict_models <- function(
 
     if (!is.null(ridge_fit)) {
       out[["Ridge"]] <- as.numeric(
-        predict(ridge_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
+        predict(
+          ridge_fit,
+          newx = as.matrix(X_test_s),
+          type = "response",
+          s = "lambda.min"
+        )
       )
     }
   }
@@ -3577,7 +2662,12 @@ fit_predict_models <- function(
 
     if (!is.null(enet_fit)) {
       out[["ElasticNet"]] <- as.numeric(
-        predict(enet_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
+        predict(
+          enet_fit,
+          newx = as.matrix(X_test_s),
+          type = "response",
+          s = "lambda.min"
+        )
       )
     }
   }
@@ -3639,22 +2729,23 @@ fit_predict_models <- function(
 }
 
 # -----------------------------
-# 5. Development LODO
+# 4. Full-data LODO
 # -----------------------------
+
 lodo_scores_list <- list()
 lodo_metrics_list <- list()
 
-for (ds in unique(dataset_dev)) {
-  cat("Running batch-corrected development LODO fold:", ds, "\n")
+for (ds in unique(dataset_all)) {
+  cat("\nRunning FULL DATA LODO fold:", ds, "\n")
 
-  test_id <- which(dataset_dev == ds)
-  train_id <- setdiff(seq_along(y_dev), test_id)
+  test_id <- which(dataset_all == ds)
+  train_id <- setdiff(seq_along(y_all), test_id)
 
-  y_train <- y_dev[train_id]
-  y_fold <- y_dev[test_id]
+  y_train <- y_all[train_id]
+  y_fold <- y_all[test_id]
 
-  batch_train <- dataset_dev[train_id]
-  batch_fold <- dataset_dev[test_id]
+  batch_train <- dataset_all[train_id]
+  batch_fold <- dataset_all[test_id]
 
   if (length(unique(y_train)) < 2 || length(unique(y_fold)) < 2) {
     cat("Skipping fold", ds, "because train/test has only one class.\n")
@@ -3662,10 +2753,10 @@ for (ds in unique(dataset_dev)) {
   }
 
   pred_scores <- fit_predict_models(
-    X_train_full = X_dev[train_id, , drop = FALSE],
+    X_train_full = X_all[train_id, , drop = FALSE],
     y_train = y_train,
     batch_train = batch_train,
-    X_test_full = X_dev[test_id, , drop = FALSE],
+    X_test_full = X_all[test_id, , drop = FALSE],
     batch_test = batch_fold,
     model_set = candidate_models
   )
@@ -3684,8 +2775,6 @@ for (ds in unique(dataset_dev)) {
       values_to = "score_cancer"
     )
 
-  lodo_scores_list[[length(lodo_scores_list) + 1]] <- fold_scores
-
   fold_metrics <- fold_scores %>%
     group_by(model) %>%
     summarise(
@@ -3698,23 +2787,26 @@ for (ds in unique(dataset_dev)) {
     ) %>%
     mutate(fold = ds)
 
+  lodo_scores_list[[length(lodo_scores_list) + 1]] <- fold_scores
   lodo_metrics_list[[length(lodo_metrics_list) + 1]] <- fold_metrics
 }
 
-lodo_scores_dev <- bind_rows(lodo_scores_list)
-lodo_metrics_dev <- bind_rows(lodo_metrics_list)
+lodo_scores_full <- bind_rows(lodo_scores_list)
+lodo_metrics_full <- bind_rows(lodo_metrics_list)
 
-cat("\n===== Batch-corrected development LODO metrics =====\n")
-print(lodo_metrics_dev)
+cat("\n===== FULL DATA LODO metrics =====\n")
+print(lodo_metrics_full)
 
 # -----------------------------
-# 6. Model ranking
+# 5. Performance summary
 # -----------------------------
-model_rank_dev <- lodo_metrics_dev %>%
+
+model_rank_full <- lodo_metrics_full %>%
   group_by(model) %>%
   summarise(
     mean_LODO_AUC = mean(AUC, na.rm = TRUE),
     sd_LODO_AUC = sd(AUC, na.rm = TRUE),
+    mean_Accuracy = mean(Accuracy, na.rm = TRUE),
     mean_BalancedAccuracy = mean(BalancedAccuracy, na.rm = TRUE),
     mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
     mean_Specificity = mean(Specificity, na.rm = TRUE),
@@ -3722,372 +2814,1676 @@ model_rank_dev <- lodo_metrics_dev %>%
   ) %>%
   arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy))
 
-cat("\n===== Batch-corrected model ranking by mean development LODO AUC =====\n")
-print(model_rank_dev)
+cat("\n===== FULL DATA model ranking =====\n")
+print(model_rank_full)
 
 # -----------------------------
-# 7. Fixed groups by Top-K
+# 6. Plot: AUC ranking
 # -----------------------------
-fixed_groups <- list()
 
-for (k in top_k_vec) {
-  selected <- model_rank_dev %>%
-    arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy)) %>%
-    slice_head(n = k)
-
-  if (nrow(selected) == 0) next
-
-  fixed_groups[[as.character(k)]] <- selected
-}
-
-cat("\n===== Batch-corrected fixed model groups by Top-K =====\n")
-print(fixed_groups)
-
-# -----------------------------
-# 8. Weighting strategy
-# -----------------------------
-make_weights <- function(selected_df, weight_method) {
-  df <- selected_df %>%
-    arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy), desc(mean_Sensitivity)) %>%
-    mutate(
-      rank = row_number(),
-      rank_score = rev(seq_len(n()))
-    )
-
-  if (weight_method == "rank_auc") {
-    df <- df %>% mutate(raw_weight = mean_LODO_AUC * rank_score)
-
-  } else if (weight_method == "softmax_auc") {
-    df <- df %>% mutate(raw_weight = exp(mean_LODO_AUC / T))
-
-  } else if (weight_method == "auc_x_balacc") {
-    df <- df %>% mutate(raw_weight = exp((mean_LODO_AUC * mean_BalancedAccuracy) / T))
-
-  } else if (weight_method == "auc_minus_spec_penalty") {
-    df <- df %>% mutate(raw_weight = exp((mean_LODO_AUC - lambda * (1 - mean_Specificity)) / T))
-
-  } else if (weight_method == "equal_weight") {
-    df <- df %>% mutate(raw_weight = 1)
-
-  } else {
-    stop("Unknown weight method: ", weight_method)
-  }
-
-  df %>%
-    mutate(
-      raw_weight = ifelse(is.na(raw_weight) | raw_weight <= 0, 1e-8, raw_weight),
-      final_weight = raw_weight / sum(raw_weight)
-    )
-}
-
-# -----------------------------
-# 9. Hold-out evaluation
-# -----------------------------
-all_holdout_scores <- list()
-all_holdout_metrics <- list()
-all_holdout_weights <- list()
-
-for (k in names(fixed_groups)) {
-  selected_df <- fixed_groups[[k]]
-  selected_models <- selected_df$model
-
-  cat("\nTraining batch-corrected fixed models for Top-K:", k, "\n")
-  cat("Selected models:", paste(selected_models, collapse = ", "), "\n")
-
-  pred_scores_test <- fit_predict_models(
-    X_train_full = X_dev,
-    y_train = y_dev,
-    batch_train = dataset_dev,
-    X_test_full = X_test,
-    batch_test = dataset_test,
-    model_set = selected_models
-  )
-
-  pred_scores_test <- pred_scores_test %>%
-    mutate(
-      sample_index = seq_len(n()),
-      truth = as.character(y_test)
-    )
-
-  for (wm in weight_methods) {
-    weight_df <- make_weights(selected_df, wm)
-
-    score_cols <- intersect(weight_df$model, colnames(pred_scores_test))
-    if (length(score_cols) == 0) next
-
-    weights_use <- weight_df$final_weight[match(score_cols, weight_df$model)]
-    weights_use <- weights_use / sum(weights_use)
-
-    score_mat <- as.matrix(pred_scores_test[, score_cols, drop = FALSE])
-    ensemble_score <- clip_prob(as.numeric(score_mat %*% weights_use))
-
-    score_df <- pred_scores_test %>%
-      select(sample_index, truth, all_of(score_cols)) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm),
-        ensemble_score_cancer = ensemble_score,
-        ensemble_risk_score = qlogis(ensemble_score)
-      )
-
-    metric_df <- binary_metrics_cancer(
-      truth = score_df$truth,
-      score_cancer = score_df$ensemble_score_cancer,
-      threshold = 0.5
-    ) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm),
-        n_models = length(score_cols),
-        selected_models = paste(score_cols, collapse = " + ")
-      )
-
-    weight_out <- weight_df %>%
-      select(model, mean_LODO_AUC, mean_BalancedAccuracy, mean_Sensitivity, mean_Specificity, final_weight) %>%
-      mutate(
-        top_k = as.numeric(k),
-        weight_method = wm,
-        combo = paste0("top", k, " | ", wm)
-      )
-
-    all_holdout_scores[[length(all_holdout_scores) + 1]] <- score_df
-    all_holdout_metrics[[length(all_holdout_metrics) + 1]] <- metric_df
-    all_holdout_weights[[length(all_holdout_weights) + 1]] <- weight_out
-  }
-}
-
-holdout_scores_df <- bind_rows(all_holdout_scores)
-holdout_metrics_df <- bind_rows(all_holdout_metrics)
-holdout_weights_df <- bind_rows(all_holdout_weights)
-
-if (nrow(holdout_scores_df) == 0) {
-  stop("No batch-corrected hold-out ensemble result generated.")
-}
-
-holdout_metrics_df <- holdout_metrics_df %>%
-  arrange(desc(BalancedAccuracy), desc(AUC), desc(Sensitivity))
-
-cat("\n===== Batch-corrected hold-out test performance =====\n")
-print(holdout_metrics_df)
-
-cat("\n===== Batch-corrected hold-out ensemble weights =====\n")
-print(holdout_weights_df)
-
-# -----------------------------
-# 10. Density overlap
-# -----------------------------
-overlap_df <- holdout_scores_df %>%
-  group_by(combo, top_k, weight_method) %>%
-  summarise(
-    overlap_area = calc_density_overlap(cur_data(), score_col = "ensemble_risk_score"),
-    cancer_median = median(ensemble_risk_score[truth == positive_class], na.rm = TRUE),
-    normal_median = median(ensemble_risk_score[truth == negative_class], na.rm = TRUE),
-    cancer_right_rate = mean(ensemble_risk_score[truth == positive_class] > 0, na.rm = TRUE),
-    normal_right_rate = mean(ensemble_risk_score[truth == negative_class] > 0, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(cancer_median > normal_median) %>%
-  arrange(overlap_area, normal_right_rate)
-
-cat("\n===== Batch-corrected density overlap ranking =====\n")
-print(overlap_df)
-
-# -----------------------------
-# 11. Plots
-# -----------------------------
-ggplot(model_rank_dev, aes(x = reorder(model, mean_LODO_AUC), y = mean_LODO_AUC)) +
+ggplot(model_rank_full,
+       aes(x = reorder(model, mean_LODO_AUC),
+           y = mean_LODO_AUC)) +
   geom_col(alpha = 0.8) +
+  geom_errorbar(
+    aes(
+      ymin = mean_LODO_AUC - sd_LODO_AUC,
+      ymax = mean_LODO_AUC + sd_LODO_AUC
+    ),
+    width = 0.2
+  ) +
   coord_flip() +
-  theme_bw() +
+  theme_bw(base_size = 13) +
   labs(
     x = "Model",
-    y = "Mean development LODO AUC",
-    title = "BATCH: Model ranking based on 75% development LODO"
+    y = "Mean FULL-DATA LODO AUC",
+    title = "Model Performance Ranking Using Full-data LODO",
+    subtitle = "Error bar = SD across LODO folds"
   )
 
-holdout_metrics_long <- holdout_metrics_df %>%
-  select(combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy) %>%
+# -----------------------------
+# 7. Plot: model stability
+# -----------------------------
+
+ggplot(lodo_metrics_full,
+       aes(x = model, y = AUC)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Model",
+    y = "LODO AUC",
+    title = "Model Stability Across Full-data LODO Folds"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+# -----------------------------
+# 8. Multiple metric plot
+# -----------------------------
+
+model_rank_long <- model_rank_full %>%
+  select(
+    model,
+    mean_LODO_AUC,
+    mean_BalancedAccuracy,
+    mean_Sensitivity,
+    mean_Specificity
+  ) %>%
   pivot_longer(
-    cols = c(AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy),
+    cols = -model,
     names_to = "metric",
     values_to = "value"
   )
 
-ggplot(holdout_metrics_long, aes(x = reorder(combo, value), y = value)) +
-  geom_col(alpha = 0.8) +
+ggplot(model_rank_long,
+       aes(x = reorder(model, value),
+           y = value,
+           fill = metric)) +
+  geom_col(position = "dodge", alpha = 0.8) +
   coord_flip() +
-  facet_wrap(~ metric, scales = "free_x") +
-  theme_bw() +
+  theme_bw(base_size = 13) +
   labs(
-    x = "Combination",
+    x = "Model",
     y = "Value",
-    title = "BATCH: Hold-out test performance of Top-K fixed ensemble combinations"
+    title = "Model Performance Across Metrics"
   )
 
-ggplot(holdout_scores_df, aes(x = ensemble_risk_score, fill = truth)) +
-  geom_density(alpha = 0.35, adjust = 1.2, linewidth = 0.4) +
-  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
-  facet_grid(weight_method ~ top_k, scales = "free_y") +
-  theme_bw() +
-  labs(
-    x = "Ensemble risk score: log-odds of Cancer",
-    y = "Density",
-    title = "BATCH: Top-K Ensemble Risk Calculator Density Comparison"
-  )
-
-if (nrow(overlap_df) > 0) {
-  best_overlap_combo <- overlap_df$combo[1]
-
-  df_best_overlap <- holdout_scores_df %>%
-    filter(combo == best_overlap_combo)
-
-  ggplot(df_best_overlap, aes(x = ensemble_risk_score, fill = truth)) +
-    geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
-    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
-    theme_bw(base_size = 15) +
-    labs(
-      title = paste0("BATCH: Minimum Density Overlap on Hold-out Test: ", best_overlap_combo),
-      x = "Ensemble risk score: log-odds of Cancer",
-      y = "Density"
-    )
-}
-
 # -----------------------------
-# 12. Final summaries
+# 9. Correlation matrix
 # -----------------------------
-best_by_balacc <- holdout_metrics_df %>% slice(1)
 
-cat("\n===== BATCH: Best hold-out combination by Balanced Accuracy =====\n")
-print(best_by_balacc)
-
-if (nrow(overlap_df) > 0) {
-  cat("\n===== BATCH: Best hold-out combination by minimum density overlap =====\n")
-  print(overlap_df %>% slice(1))
-}
-
-cat("\n===== BATCH: Top 10 hold-out combinations =====\n")
-print(holdout_metrics_df %>% head(10))
-
-# -----------------------------
-# 13. Print final score formulas
-# -----------------------------
-make_formula_text <- function(weight_table, combo_name) {
-  df <- weight_table %>%
-    filter(combo == combo_name) %>%
-    arrange(desc(final_weight))
-
-  if (nrow(df) == 0) return("No formula available.")
-
-  parts <- paste0(round(df$final_weight, 4), " * ", df$model)
-
-  paste0("FINAL SCORE = ", paste(parts, collapse = " + "))
-}
-
-best_ba_combo <- best_by_balacc$combo[1]
-
-formula_best_ba <- make_formula_text(
-  weight_table = holdout_weights_df,
-  combo_name = best_ba_combo
-)
-
-cat("\n===== BATCH: Final score formula: Best by Balanced Accuracy =====\n")
-cat("Combination:", best_ba_combo, "\n")
-cat(formula_best_ba, "\n")
-
-if (nrow(overlap_df) > 0) {
-  best_overlap_combo <- overlap_df$combo[1]
-
-  formula_best_overlap <- make_formula_text(
-    weight_table = holdout_weights_df,
-    combo_name = best_overlap_combo
-  )
-
-  cat("\n===== BATCH: Final score formula: Best by Minimum Density Overlap =====\n")
-  cat("Combination:", best_overlap_combo, "\n")
-  cat(formula_best_overlap, "\n")
-}
-
-# -----------------------------
-# 14. Single best model hold-out performance
-# -----------------------------
-single_best_model <- model_rank_dev %>%
-  arrange(desc(mean_LODO_AUC), desc(mean_BalancedAccuracy)) %>%
-  slice(1) %>%
-  pull(model)
-
-cat("\n===== BATCH: Single Best Model selected by development LODO mean AUC =====\n")
-cat("Single best model:", single_best_model, "\n")
-
-single_pred_test <- fit_predict_models(
-  X_train_full = X_dev,
-  y_train = y_dev,
-  batch_train = dataset_dev,
-  X_test_full = X_test,
-  batch_test = dataset_test,
-  model_set = single_best_model
-)
-
-single_score <- single_pred_test[[single_best_model]]
-single_score <- clip_prob(single_score)
-
-single_metrics <- binary_metrics_cancer(
-  truth = as.character(y_test),
-  score_cancer = single_score,
-  threshold = 0.5
-) %>%
+lodo_pred_wide_full <- lodo_scores_full %>%
+  select(fold, sample_index, truth, model, score_cancer) %>%
   mutate(
-    model = single_best_model,
-    selected_by = "highest mean development LODO AUC"
+    score_cancer = as.numeric(score_cancer),
+    sample_uid = paste(fold, sample_index, sep = "_")
+  ) %>%
+  select(sample_uid, model, score_cancer) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = score_cancer,
+    values_fn = mean
   )
 
-cat("\n===== BATCH: Single Best Model Hold-out Test Performance =====\n")
-print(single_metrics)
+pred_mat_full <- lodo_pred_wide_full %>%
+  select(-sample_uid) %>%
+  as.data.frame()
 
-single_score_df <- tibble(
-  sample_index = seq_along(single_score),
-  truth = as.character(y_test),
-  model = single_best_model,
-  score_cancer = single_score,
-  risk_score = qlogis(single_score)
+pred_mat_full <- pred_mat_full[
+  , colSums(!is.na(pred_mat_full)) > 0,
+  drop = FALSE
+]
+
+pred_mat_full[] <- lapply(pred_mat_full, as.numeric)
+
+cor_mat_full <- cor(
+  pred_mat_full,
+  use = "pairwise.complete.obs",
+  method = "pearson"
 )
 
-ggplot(single_score_df, aes(x = risk_score, fill = truth)) +
+cat("\n===== FULL DATA prediction correlation matrix =====\n")
+print(round(cor_mat_full, 3))
+
+# -----------------------------
+# 10. Correlation heatmap
+# -----------------------------
+
+cor_df_full <- as.data.frame(as.table(cor_mat_full))
+colnames(cor_df_full) <- c("Model_1", "Model_2", "Correlation")
+
+ggplot(cor_df_full,
+       aes(x = Model_1, y = Model_2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Correlation",
+    title = "Prediction Correlation Between Models Using Full-data LODO"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10)
+  )
+
+# -----------------------------
+# 11. Performance vs correlation
+# -----------------------------
+
+mean_abs_cor_full <- sapply(colnames(cor_mat_full), function(m) {
+  vals <- abs(cor_mat_full[m, ])
+  vals <- vals[names(vals) != m]
+  mean(vals, na.rm = TRUE)
+})
+
+cor_summary_full <- tibble(
+  model = names(mean_abs_cor_full),
+  mean_abs_correlation_with_others = as.numeric(mean_abs_cor_full)
+)
+
+perf_cor_summary_full <- model_rank_full %>%
+  left_join(cor_summary_full, by = "model")
+
+cat("\n===== FULL DATA performance + correlation summary =====\n")
+print(perf_cor_summary_full)
+
+ggplot(perf_cor_summary_full,
+       aes(x = mean_abs_correlation_with_others,
+           y = mean_LODO_AUC,
+           label = model)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text(vjust = -0.6, size = 3.5) +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Mean Absolute Correlation with Other Models",
+    y = "Mean FULL-DATA LODO AUC",
+    title = "Performance vs Redundancy",
+    subtitle = "Better candidates are high AUC and relatively low correlation"
+  )
+```
+FINAL MODEL SELECTION: Logistic + Ridge+ RF
+# Meta model(attention-based)
+```{r}
+# ============================================================
+# Attention-based Meta Model Training
+# Logit-input attention + probability-output final score
+# Base models: RF + Ridge + Logistic
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+set.seed(3888)
+
+# -----------------------------
+# 1. Select base models
+# -----------------------------
+
+selected_models <- c("RF", "Ridge", "Logistic")
+
+# -----------------------------
+# 2. Build meta-training data from LODO test predictions
+# -----------------------------
+
+meta_train_data <- lodo_scores_full %>%
+  filter(model %in% selected_models) %>%
+  select(fold, sample_index, truth, model, score_cancer) %>%
+  mutate(
+    score_cancer = as.numeric(score_cancer),
+    sample_uid = paste(fold, sample_index, sep = "_")
+  ) %>%
+  select(sample_uid, fold, truth, model, score_cancer) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = score_cancer,
+    values_fn = mean
+  ) %>%
+  drop_na(all_of(selected_models))
+
+cat("Meta-training data size:\n")
+print(dim(meta_train_data))
+
+# -----------------------------
+# 3. Prepare X and y
+# -----------------------------
+
+clip_prob <- function(p, eps = 1e-6) {
+  pmin(pmax(as.numeric(p), eps), 1 - eps)
+}
+
+# Original probabilities for final weighted risk score
+X_meta_train_prob <- as.matrix(meta_train_data[, selected_models])
+X_meta_train_prob <- apply(X_meta_train_prob, 2, clip_prob)
+
+# Logit-transformed probabilities for attention weight calculation
+X_meta_train_att <- qlogis(X_meta_train_prob)
+
+y_meta_train <- as.numeric(meta_train_data$truth == "Cancer")
+
+cat("\nX_meta_train_prob dimension:\n")
+print(dim(X_meta_train_prob))
+
+cat("\nX_meta_train_att dimension:\n")
+print(dim(X_meta_train_att))
+
+cat("\ny_meta_train distribution:\n")
+print(table(y_meta_train))
+
+# -----------------------------
+# 4. Smoothed attention model
+# -----------------------------
+
+softmax_temp <- function(z, temperature = 5.0) {
+  z <- z / temperature
+  z <- z - max(z)
+  exp_z <- exp(z)
+  exp_z / sum(exp_z)
+}
+
+attention_predict <- function(params, X_att, X_prob, temperature = 5.0) {
+  n_models <- ncol(X_att)
+
+  W <- matrix(
+    params[1:(n_models * n_models)],
+    nrow = n_models,
+    ncol = n_models
+  )
+
+  b <- params[
+    (n_models * n_models + 1):(n_models * n_models + n_models)
+  ]
+
+  weights <- t(apply(X_att, 1, function(x) {
+    logits <- as.numeric(x %*% W + b)
+    softmax_temp(logits, temperature = temperature)
+  }))
+
+  # IMPORTANT:
+  # weights are learned from logit inputs,
+  # but final cancer score is weighted average of original probabilities.
+  final_score <- rowSums(weights * X_prob)
+
+  list(
+    weights = weights,
+    final_score = clip_prob(final_score)
+  )
+}
+
+entropy_loss <- function(weights) {
+  eps <- 1e-8
+  entropy <- -rowSums(weights * log(weights + eps))
+  -mean(entropy)
+}
+
+bce_loss_smoothed <- function(
+    params,
+    X_att,
+    X_prob,
+    y,
+    temperature = 5.0,
+    l2_lambda = 0.05,
+    entropy_lambda = 0.20
+) {
+  pred_obj <- attention_predict(
+    params = params,
+    X_att = X_att,
+    X_prob = X_prob,
+    temperature = temperature
+  )
+
+  pred <- clip_prob(pred_obj$final_score)
+  weights <- pred_obj$weights
+
+  bce <- -mean(
+    y * log(pred) +
+      (1 - y) * log(1 - pred)
+  )
+
+  l2_penalty <- l2_lambda * sum(params^2)
+  entropy_penalty <- entropy_lambda * entropy_loss(weights)
+
+  total_loss <- bce + l2_penalty + entropy_penalty
+
+  total_loss
+}
+
+# -----------------------------
+# 5. Train smoothed attention meta model
+# -----------------------------
+
+n_models <- ncol(X_meta_train_att)
+
+temperature_use <- 1.5
+l2_lambda_use <- 0.0005
+entropy_lambda_use <- 0.01
+
+init_params <- c(
+  rnorm(n_models * n_models, mean = 0, sd = 0.001),
+  rep(0, n_models)
+)
+
+fit_attention <- optim(
+  par = init_params,
+  fn = bce_loss_smoothed,
+  X_att = X_meta_train_att,
+  X_prob = X_meta_train_prob,
+  y = y_meta_train,
+  temperature = temperature_use,
+  l2_lambda = l2_lambda_use,
+  entropy_lambda = entropy_lambda_use,
+  method = "BFGS",
+  control = list(maxit = 1000)
+)
+
+cat("\n===== Smoothed attention meta model trained =====\n")
+cat("Final meta-training loss:", fit_attention$value, "\n")
+
+attention_meta_model <- list(
+  selected_models = selected_models,
+  params = fit_attention$par,
+  loss = fit_attention$value,
+  n_models = n_models,
+  temperature = temperature_use,
+  l2_lambda = l2_lambda_use,
+  entropy_lambda = entropy_lambda_use,
+  input_type = "logit_probability_for_attention_probability_for_score"
+)
+
+# -----------------------------
+# 6. Inspect learned weights
+# -----------------------------
+
+att_train_pred <- attention_predict(
+  params = attention_meta_model$params,
+  X_att = X_meta_train_att,
+  X_prob = X_meta_train_prob,
+  temperature = attention_meta_model$temperature
+)
+
+weight_df <- as.data.frame(att_train_pred$weights)
+colnames(weight_df) <- paste0("weight_", selected_models)
+
+meta_train_result <- meta_train_data %>%
+  bind_cols(weight_df) %>%
+  mutate(
+    attention_score_cancer = att_train_pred$final_score,
+    attention_risk_score = qlogis(attention_score_cancer)
+  )
+
+cat("\nMeta-training result preview:\n")
+print(head(meta_train_result))
+
+# -----------------------------
+# 7. Average weights
+# -----------------------------
+
+avg_attention_weights <- meta_train_result %>%
+  summarise(
+    RF = mean(weight_RF, na.rm = TRUE),
+    Ridge = mean(weight_Ridge, na.rm = TRUE),
+    Logistic = mean(weight_Logistic, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "model",
+    values_to = "mean_weight"
+  ) %>%
+  arrange(desc(mean_weight))
+
+cat("\n===== Average smoothed attention weights =====\n")
+print(avg_attention_weights)
+
+# -----------------------------
+# 8. Visualise dynamic weights
+# -----------------------------
+
+weight_long <- meta_train_result %>%
+  select(sample_uid, truth, starts_with("weight_")) %>%
+  pivot_longer(
+    cols = starts_with("weight_"),
+    names_to = "model",
+    values_to = "weight"
+  ) %>%
+  mutate(model = gsub("weight_", "", model))
+
+ggplot(weight_long, aes(x = model, y = weight, fill = truth)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.6) +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Base model",
+    y = "Attention weight",
+    title = "Smoothed dynamic attention weights"
+  )
+
+# -----------------------------
+# 9. Diagnostic risk score distribution
+# -----------------------------
+
+ggplot(meta_train_result, aes(x = attention_risk_score, fill = truth)) +
+  geom_density(alpha = 0.4, adjust = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Attention meta risk score: log-odds of Cancer",
+    y = "Density",
+    title = "Diagnostic distribution on LODO meta-training predictions"
+  )
+
+```
+```{r}
+# 1. Check sample counts per fold
+fold_count <- meta_train_result %>%
+  count(fold, truth)
+
+print(fold_count)
+
+# 2. Density plot by dataset/fold
+ggplot(meta_train_result,
+       aes(x = attention_risk_score, fill = truth)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  facet_wrap(~ fold, scales = "free_y", ncol = 3) +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Attention meta risk score: log-odds of Cancer",
+    y = "Density",
+    title = "Per-dataset LODO test-fold density separation",
+    subtitle = "Each panel shows one left-out dataset"
+  )
+```
+# Test
+DATASET: GSE42568
+```{r}
+# ============================================================
+# External test dataset: GSE42568
+# Basic preprocessing consistent with training pipeline
+# ============================================================
+
+external_gse <- "GSE42568"
+
+# -----------------------------
+# 1. Load GSE42568
+# -----------------------------
+
+eset_42568 <- load_geo_eset(external_gse)
+
+# -----------------------------
+# 2. Collapse probe-level expression to gene-level expression
+#    This also applies auto log2 transform if needed
+# -----------------------------
+
+cc_42568 <- collapse_to_genes(eset_42568)
+
+eMat_42568 <- cc_42568$eMat_g
+pMat_42568 <- cc_42568$pMat
+fMat_42568 <- cc_42568$fMat_g
+
+cat("===== GSE42568 preprocessing diagnostics =====\n")
+cat("Log2 applied:", cc_42568$log2_applied, "\n")
+cat("Raw expression quantiles:",
+    cc_42568$q01_raw, cc_42568$q50_raw, cc_42568$q99_raw, "\n")
+cat("Used expression quantiles:",
+    cc_42568$q01_used, cc_42568$q50_used, cc_42568$q99_used, "\n")
+
+cat("\nGSE42568 gene-level expression dims:\n")
+print(dim(eMat_42568))
+
+# -----------------------------
+# 3. Infer Cancer / Normal label
+# -----------------------------
+
+lab_42568 <- infer_binary_label(pMat_42568, normal_keywords)
+
+pMat_42568$dataset_id <- external_gse
+pMat_42568$label_col_detected <- lab_42568$label_col
+pMat_42568$label_binary <- as.character(lab_42568$label)
+
+cat("\nDetected label column:\n")
+print(lab_42568$label_col)
+
+cat("\nGSE42568 label distribution:\n")
+print(table(pMat_42568$label_binary, useNA = "ifany"))
+
+# -----------------------------
+# 4. Keep valid binary samples only
+# -----------------------------
+
+ok_42568 <- !is.na(pMat_42568$label_binary) &
+  pMat_42568$label_binary != ""
+
+eMat_42568_bin <- eMat_42568[, ok_42568, drop = FALSE]
+
+y_ext_42568 <- factor(
+  pMat_42568$label_binary[ok_42568],
+  levels = c("Cancer", "Normal")
+)
+
+p_ext_42568 <- pMat_42568[ok_42568, , drop = FALSE]
+
+cat("\nValid external samples:\n")
+print(table(y_ext_42568))
+
+# -----------------------------
+# 5. Match genes with training merged dataset
+# -----------------------------
+# eMat_big_bin = training merged gene expression matrix
+# rows = genes, cols = samples
+
+common_genes_42568 <- intersect(rownames(eMat_big_bin), rownames(eMat_42568_bin))
+
+cat("\nNumber of common genes with training data:\n")
+print(length(common_genes_42568))
+
+if (length(common_genes_42568) < 50) {
+  warning("Very few common genes between training data and GSE42568. Check gene symbol mapping.")
+}
+
+# Keep same gene order as training data
+common_genes_42568 <- rownames(eMat_big_bin)[rownames(eMat_big_bin) %in% common_genes_42568]
+
+eMat_42568_common <- eMat_42568_bin[common_genes_42568, , drop = FALSE]
+
+# External X matrix: samples x genes
+X_ext_42568 <- t(eMat_42568_common)
+
+cat("\nExternal X matrix dims: samples x genes\n")
+print(dim(X_ext_42568))
+
+# -----------------------------
+# 6. Basic missing value check
+# -----------------------------
+
+cat("\nMissing value fraction in GSE42568 common-gene matrix:\n")
+print(mean(is.na(X_ext_42568)))
+
+na_gene_frac_42568 <- colMeans(is.na(X_ext_42568))
+cat("\nGenes with >30% NA in external data:\n")
+print(sum(na_gene_frac_42568 > 0.3))
+
+# -----------------------------
+# 7. External dataset summary object
+# -----------------------------
+
+external_42568 <- list(
+  gse_id = external_gse,
+  eMat_gene = eMat_42568,
+  pMat = pMat_42568,
+  X_ext = X_ext_42568,
+  y_ext = y_ext_42568,
+  p_ext = p_ext_42568,
+  common_genes = common_genes_42568,
+  log2_applied = cc_42568$log2_applied,
+  label_col_detected = lab_42568$label_col
+)
+
+cat("\n===== GSE42568 external dataset ready =====\n")
+cat("Object saved as: external_42568\n")
+cat("Use external_42568$X_ext and external_42568$y_ext for external testing.\n")
+```
+```{r}
+# ============================================================
+# External prediction on GSE42568
+# Train base models on 100% internal data
+# Predict GSE42568
+# Apply trained attention meta model
+# ============================================================
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(randomForest)
+library(glmnet)
+
+set.seed(3888)
+
+# -----------------------------
+# 1. Prepare internal training data
+# -----------------------------
+
+positive_class <- "Cancer"
+negative_class <- "Normal"
+
+ok_internal <- !is.na(pMat_big_bin$label_binary) &
+  pMat_big_bin$label_binary != ""
+
+X_internal_full <- t(eMat_big_bin[, ok_internal, drop = FALSE])
+
+y_internal <- factor(
+  pMat_big_bin$label_binary[ok_internal],
+  levels = c(negative_class, positive_class)
+)
+
+batch_internal <- as.character(pMat_big_bin$dataset_id[ok_internal])
+
+# External data from previous step
+X_external_full <- external_42568$X_ext
+y_external <- external_42568$y_ext
+batch_external <- rep("GSE42568", nrow(X_external_full))
+
+# Keep common genes in same order
+common_genes_ext <- intersect(colnames(X_internal_full), colnames(X_external_full))
+
+X_internal_full <- X_internal_full[, common_genes_ext, drop = FALSE]
+X_external_full <- X_external_full[, common_genes_ext, drop = FALSE]
+
+cat("Internal training data:", dim(X_internal_full), "\n")
+cat("External test data:", dim(X_external_full), "\n")
+print(table(y_internal))
+print(table(y_external))
+
+# -----------------------------
+# 2. Batch correction: fit on internal, apply to external
+# -----------------------------
+
+expr_train_raw <- t(X_internal_full)
+expr_test_raw <- t(X_external_full)
+
+cb_ext <- combat_fit_apply(
+  expr_train = expr_train_raw,
+  batch_train = batch_internal,
+  y_train = y_internal,
+  expr_test = expr_test_raw,
+  batch_test = batch_external
+)
+X_internal_bc <- t(cb_ext$train)
+X_external_bc <- t(cb_ext$test)
+
+# -----------------------------
+# 3. Select top genes from internal training data only
+# -----------------------------
+
+design_ext <- model.matrix(~ y_internal)
+
+fit_ext_de <- eBayes(lmFit(t(X_internal_bc), design_ext))
+
+top_external_genes <- topTable(
+  fit_ext_de,
+  n = 50,
+  sort.by = "P"
+)
+
+genes_external_model <- intersect(
+  rownames(top_external_genes),
+  colnames(X_internal_bc)
+)
+
+cat("Selected genes for external prediction:", length(genes_external_model), "\n")
+
+X_train_sel <- X_internal_bc[, genes_external_model, drop = FALSE]
+X_test_sel <- X_external_bc[, genes_external_model, drop = FALSE]
+
+# -----------------------------
+# 4. Impute and scale using internal training only
+# -----------------------------
+
+imp_ext <- impute_fit(X_train_sel)
+
+X_train_i <- impute_apply(X_train_sel, imp_ext)
+X_test_i <- impute_apply(X_test_sel, imp_ext)
+
+sc_ext <- standardize_fit(X_train_i)
+
+X_train_s <- standardize_apply(X_train_i, sc_ext)
+X_test_s <- standardize_apply(X_test_i, sc_ext)
+
+# -----------------------------
+# 5. Train selected base models on internal data
+# -----------------------------
+
+selected_models <- c("RF", "Ridge", "Logistic")
+
+y_num_cancer <- as.numeric(y_internal == positive_class)
+
+# RF
+rf_final <- randomForest::randomForest(
+  x = X_train_i,
+  y = y_internal,
+  ntree = 500
+)
+
+rf_prob <- predict(rf_final, X_test_i, type = "prob")
+score_rf_cancer <- rf_prob[, positive_class]
+
+# Ridge
+ridge_final <- glmnet::cv.glmnet(
+  x = as.matrix(X_train_s),
+  y = y_num_cancer,
+  family = "binomial",
+  alpha = 0,
+  standardize = FALSE
+)
+
+score_ridge_cancer <- as.numeric(
+  predict(
+    ridge_final,
+    newx = as.matrix(X_test_s),
+    type = "response",
+    s = "lambda.min"
+  )
+)
+
+# Logistic
+df_train_logistic <- data.frame(
+  y_num_cancer = y_num_cancer,
+  X_train_s,
+  check.names = TRUE
+)
+
+df_test_logistic <- data.frame(
+  X_test_s,
+  check.names = TRUE
+)
+
+logistic_final <- glm(
+  y_num_cancer ~ .,
+  data = df_train_logistic,
+  family = binomial()
+)
+
+score_logistic_cancer <- as.numeric(
+  predict(
+    logistic_final,
+    newdata = df_test_logistic,
+    type = "response"
+  )
+)
+
+# -----------------------------
+# 6. Base model prediction table
+# -----------------------------
+
+clip_prob <- function(p, eps = 1e-6) {
+  pmin(pmax(as.numeric(p), eps), 1 - eps)
+}
+
+external_base_pred <- tibble(
+  sample_index = seq_len(nrow(X_external_full)),
+  truth = as.character(y_external),
+  RF = clip_prob(score_rf_cancer),
+  Ridge = clip_prob(score_ridge_cancer),
+  Logistic = clip_prob(score_logistic_cancer)
+)
+
+cat("\nExternal base predictions preview:\n")
+print(head(external_base_pred))
+
+# -----------------------------
+# 7. Apply trained attention meta model
+# -----------------------------
+
+softmax_temp <- function(z, temperature = 5.0) {
+  z <- z / temperature
+  z <- z - max(z)
+  exp_z <- exp(z)
+  exp_z / sum(exp_z)
+}
+
+attention_predict_external <- function(params, X_att, X_prob, temperature = 5.0) {
+  n_models <- ncol(X_att)
+
+  W <- matrix(
+    params[1:(n_models * n_models)],
+    nrow = n_models,
+    ncol = n_models
+  )
+
+  b <- params[
+    (n_models * n_models + 1):(n_models * n_models + n_models)
+  ]
+
+  weights <- t(apply(X_att, 1, function(x) {
+    logits <- as.numeric(x %*% W + b)
+    softmax_temp(logits, temperature = temperature)
+  }))
+
+  final_score <- rowSums(weights * X_prob)
+
+  list(
+    weights = weights,
+    final_score = clip_prob(final_score)
+  )
+}
+
+X_ext_prob <- as.matrix(external_base_pred[, selected_models])
+X_ext_prob <- apply(X_ext_prob, 2, clip_prob)
+
+X_ext_att <- qlogis(X_ext_prob)
+
+att_ext_pred <- attention_predict_external(
+  params = attention_meta_model$params,
+  X_att = X_ext_att,
+  X_prob = X_ext_prob,
+  temperature = attention_meta_model$temperature
+)
+
+weight_ext_df <- as.data.frame(att_ext_pred$weights)
+colnames(weight_ext_df) <- paste0("weight_", selected_models)
+
+external_attention_result <- external_base_pred %>%
+  bind_cols(weight_ext_df) %>%
+  mutate(
+    attention_score_cancer = att_ext_pred$final_score,
+    attention_risk_score = qlogis(attention_score_cancer),
+    pred_class = ifelse(attention_score_cancer >= 0.5, "Cancer", "Normal")
+  )
+
+cat("\n===== External attention prediction result =====\n")
+print(head(external_attention_result))
+
+# -----------------------------
+# 8. External performance metrics
+# -----------------------------
+
+auc_roc <- function(truth_pos, score_pos) {
+  truth_pos <- as.integer(truth_pos)
+  score_pos <- as.numeric(score_pos)
+
+  pos <- truth_pos == 1
+  neg <- truth_pos == 0
+
+  n_pos <- sum(pos)
+  n_neg <- sum(neg)
+
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+
+  r <- rank(score_pos, ties.method = "average")
+  (sum(r[pos]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+binary_metrics_cancer <- function(truth, score_cancer, threshold = 0.5) {
+  truth <- as.character(truth)
+  pred <- ifelse(score_cancer >= threshold, "Cancer", "Normal")
+
+  tp <- sum(pred == "Cancer" & truth == "Cancer", na.rm = TRUE)
+  fn <- sum(pred != "Cancer" & truth == "Cancer", na.rm = TRUE)
+  tn <- sum(pred == "Normal" & truth == "Normal", na.rm = TRUE)
+  fp <- sum(pred != "Normal" & truth == "Normal", na.rm = TRUE)
+
+  tibble(
+    AUC = auc_roc(truth == "Cancer", score_cancer),
+    Accuracy = mean(pred == truth, na.rm = TRUE),
+    Sensitivity = ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+    Specificity = ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp)),
+    BalancedAccuracy = mean(c(
+      ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+      ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
+    ), na.rm = TRUE)
+  )
+}
+
+external_metrics <- binary_metrics_cancer(
+  truth = external_attention_result$truth,
+  score_cancer = external_attention_result$attention_score_cancer,
+  threshold = 0.5
+)
+
+cat("\n===== GSE42568 Attention External Test Performance =====\n")
+print(external_metrics)
+
+# -----------------------------
+# 9. Compare base models vs attention on GSE42568
+# -----------------------------
+
+base_external_metrics <- selected_models %>%
+  lapply(function(m) {
+    binary_metrics_cancer(
+      truth = external_attention_result$truth,
+      score_cancer = external_attention_result[[m]],
+      threshold = 0.5
+    ) %>%
+      mutate(model = m)
+  }) %>%
+  bind_rows()
+
+attention_external_metrics <- external_metrics %>%
+  mutate(model = "Attention_Meta")
+
+external_comparison <- bind_rows(
+  base_external_metrics,
+  attention_external_metrics
+) %>%
+  select(model, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy) %>%
+  arrange(desc(AUC), desc(BalancedAccuracy))
+
+cat("\n===== GSE42568 Base Models vs Attention Meta Model =====\n")
+print(external_comparison)
+
+# -----------------------------
+# 10. External density plot
+# -----------------------------
+
+ggplot(external_attention_result,
+       aes(x = attention_risk_score, fill = truth)) +
   geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
   geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
-  theme_bw(base_size = 15) +
+  theme_bw(base_size = 14) +
   labs(
-    title = paste0("BATCH: Single Best Model Density on Hold-out Test: ", single_best_model),
-    x = "Risk score: log-odds of Cancer",
-    y = "Density"
+    x = "Attention meta risk score: log-odds of Cancer",
+    y = "Density",
+    title = "GSE42568 External Test: Attention Risk Score Distribution"
   )
 
 # -----------------------------
-# 15. Compare single best vs best ensemble
+# 11. External dynamic weights plot
 # -----------------------------
-best_ensemble_metrics <- best_by_balacc %>%
-  mutate(method = "Best Ensemble by Balanced Accuracy") %>%
-  select(method, combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy)
 
-single_compare_metrics <- single_metrics %>%
-  mutate(
-    method = "Single Best Model",
-    combo = single_best_model
+external_weight_long <- external_attention_result %>%
+  select(sample_index, truth, starts_with("weight_")) %>%
+  pivot_longer(
+    cols = starts_with("weight_"),
+    names_to = "model",
+    values_to = "weight"
   ) %>%
-  select(method, combo, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy)
+  mutate(model = gsub("weight_", "", model))
 
-comparison_table <- bind_rows(
-  single_compare_metrics,
-  best_ensemble_metrics
+ggplot(external_weight_long,
+       aes(x = model, y = weight, fill = truth)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.6) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Base model",
+    y = "Attention weight",
+    title = "GSE42568 External Test: Dynamic Attention Weights"
+  )
+```
+```{r}
+# ============================================================
+# Single Best Model (e.g. Ridge) vs Attention on GSE42568
+# SAME preprocessing, SAME trained models
+# ============================================================
+
+# -----------------------------
+# single best model
+# -----------------------------
+
+single_best_model <- "Ridge"   
+
+# -----------------------------
+# 2. prediction
+# -----------------------------
+
+single_score <- external_attention_result[[single_best_model]]
+
+single_result <- external_attention_result %>%
+  mutate(
+    single_score_cancer = single_score,
+    single_pred_class = ifelse(single_score_cancer >= 0.5, "Cancer", "Normal")
+  )
+
+# -----------------------------
+# 3. 计算 performance
+# -----------------------------
+
+single_metrics <- binary_metrics_cancer(
+  truth = single_result$truth,
+  score_cancer = single_result$single_score_cancer,
+  threshold = 0.5
+) %>%
+  mutate(model = paste0("Single_", single_best_model))
+
+attention_metrics <- external_metrics %>%
+  mutate(model = "Attention_Meta")
+
+comparison_single_vs_attention <- bind_rows(
+  single_metrics,
+  attention_metrics
+) %>%
+  select(model, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy)
+
+cat("\n===== Single Best Model vs Attention =====\n")
+print(comparison_single_vs_attention)
+
+# -----------------------------
+# 4. Density 
+# -----------------------------
+
+
+density_compare_df <- bind_rows(
+  single_result %>%
+    mutate(
+      score = qlogis(single_score_cancer),
+      model = paste0("Single_", single_best_model)
+    ) %>%
+    select(score, truth, model),
+
+  external_attention_result %>%
+    mutate(
+      score = attention_risk_score,
+      model = "Attention_Meta"
+    ) %>%
+    select(score, truth, model)
 )
 
-cat("\n===== BATCH: Single Best Model vs Best Ensemble Comparison =====\n")
-print(comparison_table)
+ggplot(density_compare_df,
+       aes(x = score, fill = truth)) +
+  geom_density(alpha = 0.4, adjust = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~ model, scales = "free_y") +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Risk score (log-odds of Cancer)",
+    y = "Density",
+    title = "Single Best Model vs Attention (External Test: GSE42568)"
+  )
 ```
 
-===== BATCH: Final score formula: Best by Balanced Accuracy ===== Combination: top7 | softmax_auc FINAL SCORE = 0.1601 * Ridge + 0.1564 * RF + 0.1493 * ElasticNet + 0.1475 * LASSO + 0.1351 * SVM_LINEAR + 0.1301 * kNN + 0.1214 * SVM_RBF
+```{r}
+# ============================================================
+# Single Best Model External Test
+# Save training-derived Top genes, then apply to GSE42568
+# Model: Ridge
+# ============================================================
 
-===== BATCH: Final score formula: Best by Minimum Density Overlap ===== Combination: top7 | equal_weight FINAL SCORE = 0.1429 * Ridge + 0.1429 * RF + 0.1429 * ElasticNet + 0.1429 * LASSO + 0.1429 * SVM_LINEAR + 0.1429 * kNN + 0.1429 * SVM_RBF
+library(dplyr)
+library(tibble)
+library(glmnet)
+library(ggplot2)
 
-final step: Use all samples to train the models. Use final fomular(best combination) to calculate final score.
+set.seed(3888)
+
+positive_class <- "Cancer"
+negative_class <- "Normal"
+single_best_model <- "Ridge"
+top_n_single <- 50
+
+# -----------------------------
+# 1. Prepare internal training data
+# -----------------------------
+
+ok_internal <- !is.na(pMat_big_bin$label_binary) &
+  pMat_big_bin$label_binary != ""
+
+X_internal_full <- t(eMat_big_bin[, ok_internal, drop = FALSE])
+
+y_internal <- factor(
+  pMat_big_bin$label_binary[ok_internal],
+  levels = c(negative_class, positive_class)
+)
+
+batch_internal <- as.character(pMat_big_bin$dataset_id[ok_internal])
+
+# -----------------------------
+# 2. Prepare external GSE42568 data
+# -----------------------------
+
+X_external_full <- external_42568$X_ext
+y_external <- external_42568$y_ext
+batch_external <- rep("GSE42568", nrow(X_external_full))
+
+common_genes_ext <- intersect(
+  colnames(X_internal_full),
+  colnames(X_external_full)
+)
+
+X_internal_full <- X_internal_full[, common_genes_ext, drop = FALSE]
+X_external_full <- X_external_full[, common_genes_ext, drop = FALSE]
+
+cat("Internal training data:", dim(X_internal_full), "\n")
+cat("External test data:", dim(X_external_full), "\n")
+print(table(y_internal))
+print(table(y_external))
+
+# -----------------------------
+# 3. Batch correction
+# Use y_train version of combat_fit_apply
+# -----------------------------
+
+expr_train_raw <- t(X_internal_full)
+expr_test_raw <- t(X_external_full)
+
+cb_ext <- combat_fit_apply(
+  expr_train = expr_train_raw,
+  batch_train = batch_internal,
+  y_train = y_internal,
+  expr_test = expr_test_raw,
+  batch_test = batch_external
+)
+
+X_internal_bc <- t(cb_ext$train)
+X_external_bc <- t(cb_ext$test)
+
+# -----------------------------
+# 4. Select Top genes from INTERNAL TRAINING DATA only
+# -----------------------------
+
+design_train <- model.matrix(~ y_internal)
+
+fit_train_de <- eBayes(lmFit(t(X_internal_bc), design_train))
+
+top_single_genes_table <- topTable(
+  fit_train_de,
+  n = top_n_single,
+  sort.by = "P"
+)
+
+genes_single_best <- rownames(top_single_genes_table)
+
+# keep only genes available in both train and external
+genes_single_best <- intersect(genes_single_best, colnames(X_internal_bc))
+genes_single_best <- intersect(genes_single_best, colnames(X_external_bc))
+
+cat("\n===== Saved Top genes for Single Best Model =====\n")
+cat("Number of genes:", length(genes_single_best), "\n")
+print(genes_single_best)
+
+# Optional: save gene list object
+single_best_gene_panel <- list(
+  model = single_best_model,
+  top_n = top_n_single,
+  genes = genes_single_best,
+  de_table = top_single_genes_table
+)
+
+# -----------------------------
+# 5. Use fixed Top genes for train and external test
+# -----------------------------
+
+X_train_sel <- X_internal_bc[, genes_single_best, drop = FALSE]
+X_test_sel <- X_external_bc[, genes_single_best, drop = FALSE]
+
+# -----------------------------
+# 6. Impute and scale using training data only
+# -----------------------------
+
+imp_single <- impute_fit(X_train_sel)
+
+X_train_i <- impute_apply(X_train_sel, imp_single)
+X_test_i <- impute_apply(X_test_sel, imp_single)
+
+sc_single <- standardize_fit(X_train_i)
+
+X_train_s <- standardize_apply(X_train_i, sc_single)
+X_test_s <- standardize_apply(X_test_i, sc_single)
+
+# -----------------------------
+# 7. Train Single Best Model: Ridge
+# -----------------------------
+
+y_num_cancer <- as.numeric(y_internal == positive_class)
+
+ridge_single_final <- glmnet::cv.glmnet(
+  x = as.matrix(X_train_s),
+  y = y_num_cancer,
+  family = "binomial",
+  alpha = 0,
+  standardize = FALSE
+)
+
+single_score_cancer <- as.numeric(
+  predict(
+    ridge_single_final,
+    newx = as.matrix(X_test_s),
+    type = "response",
+    s = "lambda.min"
+  )
+)
+
+clip_prob <- function(p, eps = 1e-6) {
+  pmin(pmax(as.numeric(p), eps), 1 - eps)
+}
+
+single_score_cancer <- clip_prob(single_score_cancer)
+
+single_external_result <- tibble(
+  sample_index = seq_along(single_score_cancer),
+  truth = as.character(y_external),
+  single_score_cancer = single_score_cancer,
+  single_risk_score = qlogis(single_score_cancer),
+  pred_class = ifelse(single_score_cancer >= 0.5, "Cancer", "Normal")
+)
+
+# -----------------------------
+# 8. External performance
+# -----------------------------
+
+binary_metrics_cancer <- function(truth, score_cancer, threshold = 0.5) {
+  truth <- as.character(truth)
+  pred <- ifelse(score_cancer >= threshold, "Cancer", "Normal")
+
+  tp <- sum(pred == "Cancer" & truth == "Cancer", na.rm = TRUE)
+  fn <- sum(pred != "Cancer" & truth == "Cancer", na.rm = TRUE)
+  tn <- sum(pred == "Normal" & truth == "Normal", na.rm = TRUE)
+  fp <- sum(pred != "Normal" & truth == "Normal", na.rm = TRUE)
+
+  tibble(
+    AUC = auc_roc(truth == "Cancer", score_cancer),
+    Accuracy = mean(pred == truth, na.rm = TRUE),
+    Sensitivity = ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+    Specificity = ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp)),
+    BalancedAccuracy = mean(c(
+      ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+      ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
+    ), na.rm = TRUE)
+  )
+}
+
+single_external_metrics <- binary_metrics_cancer(
+  truth = single_external_result$truth,
+  score_cancer = single_external_result$single_score_cancer,
+  threshold = 0.5
+) %>%
+  mutate(model = "Single_Ridge")
+
+cat("\n===== Single Best Model External Test Performance =====\n")
+print(single_external_metrics)
+
+# -----------------------------
+# 9. Density plot
+# -----------------------------
+
+ggplot(single_external_result,
+       aes(x = single_risk_score, fill = truth)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Single Ridge risk score: log-odds of Cancer",
+    y = "Density",
+    title = "GSE42568 External Test: Single Ridge Risk Score Distribution"
+  )
+```
+```{r}
+# ============================================================
+# Attention Meta Model External Test
+# Each base model uses its own training-derived Top 50 genes
+# Models: RF + Ridge + Logistic
+# External test: GSE42568
+# ============================================================
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(randomForest)
+library(glmnet)
+
+set.seed(3888)
+
+positive_class <- "Cancer"
+negative_class <- "Normal"
+
+selected_models <- c("RF", "Ridge", "Logistic")
+top_n_each_model <- 50
+
+# -----------------------------
+# 1. Prepare internal + external data
+# -----------------------------
+
+ok_internal <- !is.na(pMat_big_bin$label_binary) &
+  pMat_big_bin$label_binary != ""
+
+X_internal_full <- t(eMat_big_bin[, ok_internal, drop = FALSE])
+
+y_internal <- factor(
+  pMat_big_bin$label_binary[ok_internal],
+  levels = c(negative_class, positive_class)
+)
+
+batch_internal <- as.character(pMat_big_bin$dataset_id[ok_internal])
+
+X_external_full <- external_42568$X_ext
+y_external <- external_42568$y_ext
+batch_external <- rep("GSE42568", nrow(X_external_full))
+
+common_genes_ext <- intersect(
+  colnames(X_internal_full),
+  colnames(X_external_full)
+)
+
+X_internal_full <- X_internal_full[, common_genes_ext, drop = FALSE]
+X_external_full <- X_external_full[, common_genes_ext, drop = FALSE]
+
+cat("Internal training data:", dim(X_internal_full), "\n")
+cat("External test data:", dim(X_external_full), "\n")
+print(table(y_internal))
+print(table(y_external))
+
+# -----------------------------
+# 2. Batch correction using internal training only
+# -----------------------------
+
+expr_train_raw <- t(X_internal_full)
+expr_test_raw <- t(X_external_full)
+
+cb_ext <- combat_fit_apply(
+  expr_train = expr_train_raw,
+  batch_train = batch_internal,
+  y_train = y_internal,
+  expr_test = expr_test_raw,
+  batch_test = batch_external
+)
+
+X_internal_bc <- t(cb_ext$train)
+X_external_bc <- t(cb_ext$test)
+
+# -----------------------------
+# 3. Helper: select Top 50 genes from training only
+# -----------------------------
+
+select_training_top_genes <- function(X_train_full, y_train, top_n = 50) {
+  design_train <- model.matrix(~ y_train)
+
+  fit_train_de <- eBayes(
+    lmFit(t(X_train_full), design_train)
+  )
+
+  top_tbl <- topTable(
+    fit_train_de,
+    n = top_n,
+    sort.by = "P"
+  )
+
+  rownames(top_tbl)
+}
+
+# -----------------------------
+# 4. Helper: preprocessing for one model
+# -----------------------------
+
+prepare_model_data <- function(X_train_full, X_test_full, genes_use) {
+  genes_use <- intersect(genes_use, colnames(X_train_full))
+  genes_use <- intersect(genes_use, colnames(X_test_full))
+
+  X_train_sel <- X_train_full[, genes_use, drop = FALSE]
+  X_test_sel <- X_test_full[, genes_use, drop = FALSE]
+
+  imp_fit <- impute_fit(X_train_sel)
+  X_train_i <- impute_apply(X_train_sel, imp_fit)
+  X_test_i <- impute_apply(X_test_sel, imp_fit)
+
+  sc_fit <- standardize_fit(X_train_i)
+  X_train_s <- standardize_apply(X_train_i, sc_fit)
+  X_test_s <- standardize_apply(X_test_i, sc_fit)
+
+  list(
+    genes = genes_use,
+    X_train_i = X_train_i,
+    X_test_i = X_test_i,
+    X_train_s = X_train_s,
+    X_test_s = X_test_s,
+    imp_fit = imp_fit,
+    sc_fit = sc_fit
+  )
+}
+
+# -----------------------------
+# 5. Select and save model-specific Top 50 gene panels
+# -----------------------------
+# Important:
+# Each model gets its own saved gene panel.
+# Here all are selected from internal training data only.
+
+genes_RF <- select_training_top_genes(
+  X_train_full = X_internal_bc,
+  y_train = y_internal,
+  top_n = top_n_each_model
+)
+
+genes_Ridge <- select_training_top_genes(
+  X_train_full = X_internal_bc,
+  y_train = y_internal,
+  top_n = top_n_each_model
+)
+
+genes_Logistic <- select_training_top_genes(
+  X_train_full = X_internal_bc,
+  y_train = y_internal,
+  top_n = top_n_each_model
+)
+
+meta_gene_panels <- list(
+  RF = genes_RF,
+  Ridge = genes_Ridge,
+  Logistic = genes_Logistic
+)
+
+cat("\n===== Saved model-specific gene panels =====\n")
+cat("RF genes:", length(meta_gene_panels$RF), "\n")
+cat("Ridge genes:", length(meta_gene_panels$Ridge), "\n")
+cat("Logistic genes:", length(meta_gene_panels$Logistic), "\n")
+
+# Optional: union size
+cat("Union gene panel size:",
+    length(unique(unlist(meta_gene_panels))), "\n")
+
+# -----------------------------
+# 6. Train RF using RF Top 50 genes
+# -----------------------------
+
+rf_data <- prepare_model_data(
+  X_train_full = X_internal_bc,
+  X_test_full = X_external_bc,
+  genes_use = meta_gene_panels$RF
+)
+
+rf_final <- randomForest::randomForest(
+  x = rf_data$X_train_i,
+  y = y_internal,
+  ntree = 500
+)
+
+rf_prob <- predict(rf_final, rf_data$X_test_i, type = "prob")
+score_rf_cancer <- rf_prob[, positive_class]
+
+# -----------------------------
+# 7. Train Ridge using Ridge Top 50 genes
+# -----------------------------
+
+ridge_data <- prepare_model_data(
+  X_train_full = X_internal_bc,
+  X_test_full = X_external_bc,
+  genes_use = meta_gene_panels$Ridge
+)
+
+y_num_cancer <- as.numeric(y_internal == positive_class)
+
+ridge_final <- glmnet::cv.glmnet(
+  x = as.matrix(ridge_data$X_train_s),
+  y = y_num_cancer,
+  family = "binomial",
+  alpha = 0,
+  standardize = FALSE
+)
+
+score_ridge_cancer <- as.numeric(
+  predict(
+    ridge_final,
+    newx = as.matrix(ridge_data$X_test_s),
+    type = "response",
+    s = "lambda.min"
+  )
+)
+
+# -----------------------------
+# 8. Train Logistic using Logistic Top 50 genes
+# -----------------------------
+
+logistic_data <- prepare_model_data(
+  X_train_full = X_internal_bc,
+  X_test_full = X_external_bc,
+  genes_use = meta_gene_panels$Logistic
+)
+
+df_train_logistic <- data.frame(
+  y_num_cancer = y_num_cancer,
+  logistic_data$X_train_s,
+  check.names = TRUE
+)
+
+df_test_logistic <- data.frame(
+  logistic_data$X_test_s,
+  check.names = TRUE
+)
+
+logistic_final <- glm(
+  y_num_cancer ~ .,
+  data = df_train_logistic,
+  family = binomial()
+)
+
+score_logistic_cancer <- as.numeric(
+  predict(
+    logistic_final,
+    newdata = df_test_logistic,
+    type = "response"
+  )
+)
+
+# -----------------------------
+# 9. Base prediction table
+# -----------------------------
+
+clip_prob <- function(p, eps = 1e-6) {
+  pmin(pmax(as.numeric(p), eps), 1 - eps)
+}
+
+external_base_pred_model_specific <- tibble(
+  sample_index = seq_len(nrow(X_external_full)),
+  truth = as.character(y_external),
+  RF = clip_prob(score_rf_cancer),
+  Ridge = clip_prob(score_ridge_cancer),
+  Logistic = clip_prob(score_logistic_cancer)
+)
+
+cat("\nExternal base predictions preview:\n")
+print(head(external_base_pred_model_specific))
+
+# -----------------------------
+# 10. Apply trained attention meta model
+# -----------------------------
+
+softmax_temp <- function(z, temperature = 5.0) {
+  z <- z / temperature
+  z <- z - max(z)
+  exp_z <- exp(z)
+  exp_z / sum(exp_z)
+}
+
+attention_predict_external <- function(params, X_att, X_prob, temperature = 5.0) {
+  n_models <- ncol(X_att)
+
+  W <- matrix(
+    params[1:(n_models * n_models)],
+    nrow = n_models,
+    ncol = n_models
+  )
+
+  b <- params[
+    (n_models * n_models + 1):(n_models * n_models + n_models)
+  ]
+
+  weights <- t(apply(X_att, 1, function(x) {
+    logits <- as.numeric(x %*% W + b)
+    softmax_temp(logits, temperature = temperature)
+  }))
+
+  final_score <- rowSums(weights * X_prob)
+
+  list(
+    weights = weights,
+    final_score = clip_prob(final_score)
+  )
+}
+
+X_ext_prob <- as.matrix(
+  external_base_pred_model_specific[, selected_models]
+)
+
+X_ext_prob <- apply(X_ext_prob, 2, clip_prob)
+X_ext_att <- qlogis(X_ext_prob)
+
+att_ext_pred <- attention_predict_external(
+  params = attention_meta_model$params,
+  X_att = X_ext_att,
+  X_prob = X_ext_prob,
+  temperature = attention_meta_model$temperature
+)
+
+weight_ext_df <- as.data.frame(att_ext_pred$weights)
+colnames(weight_ext_df) <- paste0("weight_", selected_models)
+
+external_attention_result_model_specific <- external_base_pred_model_specific %>%
+  bind_cols(weight_ext_df) %>%
+  mutate(
+    attention_score_cancer = att_ext_pred$final_score,
+    attention_risk_score = qlogis(attention_score_cancer),
+    pred_class = ifelse(attention_score_cancer >= 0.5, "Cancer", "Normal")
+  )
+
+cat("\n===== External attention prediction result =====\n")
+print(head(external_attention_result_model_specific))
+
+# -----------------------------
+# 11. Performance metrics
+# -----------------------------
+
+binary_metrics_cancer <- function(truth, score_cancer, threshold = 0.5) {
+  truth <- as.character(truth)
+  pred <- ifelse(score_cancer >= threshold, "Cancer", "Normal")
+
+  tp <- sum(pred == "Cancer" & truth == "Cancer", na.rm = TRUE)
+  fn <- sum(pred != "Cancer" & truth == "Cancer", na.rm = TRUE)
+  tn <- sum(pred == "Normal" & truth == "Normal", na.rm = TRUE)
+  fp <- sum(pred != "Normal" & truth == "Normal", na.rm = TRUE)
+
+  tibble(
+    AUC = auc_roc(truth == "Cancer", score_cancer),
+    Accuracy = mean(pred == truth, na.rm = TRUE),
+    Sensitivity = ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+    Specificity = ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp)),
+    BalancedAccuracy = mean(c(
+      ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn)),
+      ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
+    ), na.rm = TRUE)
+  )
+}
+
+external_attention_metrics_model_specific <- binary_metrics_cancer(
+  truth = external_attention_result_model_specific$truth,
+  score_cancer = external_attention_result_model_specific$attention_score_cancer,
+  threshold = 0.5
+) %>%
+  mutate(model = "Attention_Meta_ModelSpecificGenes")
+
+base_external_metrics_model_specific <- selected_models %>%
+  lapply(function(m) {
+    binary_metrics_cancer(
+      truth = external_attention_result_model_specific$truth,
+      score_cancer = external_attention_result_model_specific[[m]],
+      threshold = 0.5
+    ) %>%
+      mutate(model = m)
+  }) %>%
+  bind_rows()
+
+external_comparison_model_specific <- bind_rows(
+  base_external_metrics_model_specific,
+  external_attention_metrics_model_specific
+) %>%
+  select(model, AUC, Accuracy, Sensitivity, Specificity, BalancedAccuracy) %>%
+  arrange(desc(AUC), desc(BalancedAccuracy))
+
+cat("\n===== GSE42568 Base Models vs Attention Meta Model =====\n")
+print(external_comparison_model_specific)
+
+# -----------------------------
+# 12. Plot: density
+# -----------------------------
+
+ggplot(external_attention_result_model_specific,
+       aes(x = attention_risk_score, fill = truth)) +
+  geom_density(alpha = 0.4, adjust = 1.2, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.8) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Attention meta risk score: log-odds of Cancer",
+    y = "Density",
+    title = "GSE42568 External Test: Attention Meta Model with Model-specific Top 50 Genes"
+  )
+
+# -----------------------------
+# 13. Plot: dynamic weights
+# -----------------------------
+
+external_weight_long_model_specific <- external_attention_result_model_specific %>%
+  select(sample_index, truth, starts_with("weight_")) %>%
+  pivot_longer(
+    cols = starts_with("weight_"),
+    names_to = "model",
+    values_to = "weight"
+  ) %>%
+  mutate(model = gsub("weight_", "", model))
+
+ggplot(external_weight_long_model_specific,
+       aes(x = model, y = weight, fill = truth)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.6) +
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Base model",
+    y = "Attention weight",
+    title = "GSE42568 External Test: Dynamic Attention Weights with Model-specific Gene Panels"
+  )
+```
