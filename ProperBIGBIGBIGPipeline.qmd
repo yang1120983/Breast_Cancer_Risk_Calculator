@@ -25,6 +25,9 @@ library(e1071)
 library(randomForest)
 library(cvTools)
 library(sva)
+library(glmnet)       # ElasticNet / Lasso (binary + multinomial)
+# XGBoost loaded conditionally below
+if (requireNamespace("xgboost", quietly = TRUE)) library(xgboost)
 ```
 
 ```{r}
@@ -39,7 +42,7 @@ set.seed(3888)
 #| message: false
 #| warning: false
 datasets_multiclass <- c("GSE25066","GSE45827")          # PAM50 multiclass (example; not merged yet)
-datasets_binary <- c("GSE15852", "GSE45827","GSE29431","GSE9574", "GSE7904","GSE54002", "GSE25066")  # Binary Normal vs Cancer (merged below)
+datasets_binary <- c("GSE15852", "GSE45827","GSE29431","GSE9574","GSE54002", "GSE25066")  # Binary Normal vs Cancer (merged below)
 
 normal_keywords <- c(
   "normal", "non-tumor", "nontumor", "non tumour", "nontumour",
@@ -370,6 +373,51 @@ rbind_fill <- function(dfs) {
     d[, all_cols, drop = FALSE]
   })
   do.call(rbind, dfs2)
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADDED HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Youden's J threshold (maximises TPR + TNR - 1)
+best_threshold_youden <- function(truth, score_pos, positive = "Normal") {
+  truth01 <- as.integer(as.character(truth) == positive)
+  cand <- sort(unique(score_pos))
+  if (length(cand) > 500)
+    cand <- quantile(cand, probs = seq(0, 1, length.out = 500), na.rm = TRUE)
+  j <- vapply(cand, function(t) {
+    p   <- score_pos >= t
+    tpr <- if (sum(truth01) == 0) 0 else sum(p & truth01 == 1) / sum(truth01)
+    tnr <- if (sum(1 - truth01) == 0) 0 else sum(!p & truth01 == 0) / sum(1 - truth01)
+    tpr + tnr - 1
+  }, numeric(1))
+  cand[which.max(j)]
+}
+
+# Macro-averaged one-vs-rest ROC AUC (multiclass)
+macro_auc_ovr <- function(truth, prob_mat) {
+  lvls <- colnames(prob_mat)
+  aucs <- vapply(lvls, function(k) {
+    tk <- as.integer(as.character(truth) == k)
+    tk[is.na(tk)] <- 0L          # NA truth rows treated as "not this class"
+    n_pos <- sum(tk, na.rm = TRUE)
+    if (n_pos == 0L || n_pos == length(tk)) return(NA_real_)
+    auc_roc(tk, prob_mat[, k])
+  }, numeric(1))
+  mean(aucs, na.rm = TRUE)
+}
+
+# Platt-scaling calibration
+calibrate_platt <- function(scores_df, score_col = "score_normal",
+                             truth_col = "truth", positive = "Normal") {
+  df  <- data.frame(y = as.integer(as.character(scores_df[[truth_col]]) == positive),
+                    s = scores_df[[score_col]])
+  fit <- glm(y ~ s, data = df, family = binomial())
+  list(fit = fit, positive = positive)
+}
+apply_calibration_platt <- function(cal, new_scores) {
+  as.numeric(predict(cal$fit, newdata = data.frame(s = new_scores), type = "response"))
 }
 
 # Per-fold batch correction with a training-only fit.
@@ -1281,6 +1329,62 @@ run_lodo_cv_binary <- function(X, y, batch, positive = "Normal", use_weights = T
                                                    fold = ds, truth = y_test, score_normal = p_lasso))
       }
     }
+
+    # --- ElasticNet (alpha = 0.5) ---
+    if (requireNamespace("glmnet", quietly = TRUE)) {
+      enet_fit <- tryCatch(
+        glmnet::cv.glmnet(x = as.matrix(X_train_s), y = as.numeric(y_train == positive),
+                          family = "binomial", alpha = 0.5, weights = w, standardize = FALSE),
+        error = function(e) { message("ElasticNet fold ", ds, ": ", conditionMessage(e)); NULL }
+      )
+      if (!is.null(enet_fit)) {
+        p_enet    <- as.numeric(predict(enet_fit, newx = as.matrix(X_test_s),
+                                        type = "response", s = "lambda.min"))
+        pred_enet <- factor(ifelse(p_enet >= 0.5, positive, neg_label), levels = levels(y_train))
+        m_enet    <- binary_metrics(y_test, pred_enet, positive = positive)
+        perf <- rbind(perf, data.frame(task = "binary", setting = setting_label,
+                                       model = ifelse(use_weights, "ElasticNet_w", "ElasticNet"),
+                                       fold = ds, m_enet))
+        all_preds <- rbind(all_preds, data.frame(task = "binary", setting = setting_label,
+                                                  model = ifelse(use_weights, "ElasticNet_w", "ElasticNet"),
+                                                  fold = ds, truth = y_test, pred = pred_enet))
+        all_scores <- rbind(all_scores, data.frame(task = "binary", setting = setting_label,
+                                                    model = ifelse(use_weights, "ElasticNet_w", "ElasticNet"),
+                                                    fold = ds, truth = y_test, score_normal = p_enet))
+      }
+    }
+
+    # --- XGBoost ---
+    if (requireNamespace("xgboost", quietly = TRUE)) {
+      y_num_xgb  <- as.numeric(y_train == positive)
+      xgb_dtrain <- xgboost::xgb.DMatrix(data = as.matrix(X_train_s), label = y_num_xgb, weight = w)
+      xgb_dtest  <- xgboost::xgb.DMatrix(data = as.matrix(X_test_s))
+      xgb_fit <- tryCatch(
+        xgboost::xgb.train(
+          params  = list(objective = "binary:logistic", eval_metric = "auc",
+                         eta = 0.05, max_depth = 4, subsample = 0.8,
+                         colsample_bytree = 0.8, min_child_weight = 5, nthread = 1),
+          data    = xgb_dtrain,
+          nrounds = 150,
+          verbose = 0
+        ),
+        error = function(e) { message("XGBoost fold ", ds, ": ", conditionMessage(e)); NULL }
+      )
+      if (!is.null(xgb_fit)) {
+        p_xgb    <- as.numeric(predict(xgb_fit, xgb_dtest))
+        pred_xgb <- factor(ifelse(p_xgb >= 0.5, positive, neg_label), levels = levels(y_train))
+        m_xgb    <- binary_metrics(y_test, pred_xgb, positive = positive)
+        perf <- rbind(perf, data.frame(task = "binary", setting = setting_label,
+                                       model = ifelse(use_weights, "XGB_w", "XGB"),
+                                       fold = ds, m_xgb))
+        all_preds <- rbind(all_preds, data.frame(task = "binary", setting = setting_label,
+                                                  model = ifelse(use_weights, "XGB_w", "XGB"),
+                                                  fold = ds, truth = y_test, pred = pred_xgb))
+        all_scores <- rbind(all_scores, data.frame(task = "binary", setting = setting_label,
+                                                    model = ifelse(use_weights, "XGB_w", "XGB"),
+                                                    fold = ds, truth = y_test, score_normal = p_xgb))
+      }
+    }
   }
 
   list(perf = perf, preds = all_preds, scores = all_scores, diag = fold_diag)
@@ -1426,6 +1530,9 @@ cat("Best binary run by ROC AUC then PR AUC then recall:", best_setting_bin, "/"
 score_best <- scores_bin %>% filter(setting == best_setting_bin, model == best_model_bin)
 thr_best <- best_threshold_f1(score_best$truth, score_best$score_normal, positive = "Normal")
 cat("Chosen threshold (max pooled F1 for Normal):", round(thr_best, 4), "\n")
+thr_youden <- best_threshold_youden(score_best$truth, score_best$score_normal, positive = "Normal")
+cat("Youden-J threshold (max TPR+TNR-1):", round(thr_youden, 4), "\n")
+
 
 neg_label_bin <- setdiff(levels(y_bin2), "Normal")[1]
 pred_default <- ifelse(score_best$score_normal >= 0.5, "Normal", neg_label_bin)
@@ -2262,4 +2369,983 @@ coef_tbl <- summary(fit_logistic)$coefficients %>%
   slice(1:20)
 
 knitr::kable(coef_tbl, caption = "Top 20 absolute logistic coefficients (Baseline structural interpretability)")
+```
+
+## Score Calibration (Platt scaling – binary)
+
+```{r}
+#| message: false
+#| warning: false
+# Fit Platt scaling on pooled LODO scores for the best binary model,
+# then show calibration curve (reliability diagram) on the same fold pool.
+
+cal_obj <- calibrate_platt(score_best, score_col = "score_normal",
+                           truth_col = "truth", positive = "Normal")
+
+score_best_cal <- score_best %>%
+  mutate(score_cal = apply_calibration_platt(cal_obj, score_normal))
+
+# Reliability diagram: bin predicted probs, compare to observed fraction
+make_reliability_df <- function(truth, score, positive = "Normal", n_bins = 10) {
+  breaks <- seq(0, 1, length.out = n_bins + 1)
+  idx    <- findInterval(score, breaks, rightmost.closed = TRUE)
+  idx    <- pmin(pmax(idx, 1L), n_bins)
+  df     <- data.frame(truth01 = as.integer(as.character(truth) == positive),
+                       score   = score, bin = idx)
+  df %>%
+    group_by(bin) %>%
+    summarise(mean_pred = mean(score, na.rm = TRUE),
+              mean_obs  = mean(truth01, na.rm = TRUE),
+              n         = n(), .groups = "drop")
+}
+
+rel_raw <- make_reliability_df(score_best$truth, score_best$score_normal)
+rel_cal <- make_reliability_df(score_best_cal$truth, score_best_cal$score_cal)
+
+rel_both <- bind_rows(
+  rel_raw %>% mutate(type = "Raw scores"),
+  rel_cal %>% mutate(type = "Platt calibrated")
+)
+
+ggplot(rel_both, aes(x = mean_pred, y = mean_obs, colour = type)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  scale_size_area(max_size = 6) +
+  theme_bw() +
+  labs(x = "Mean predicted probability", y = "Observed fraction (P(Normal))",
+       colour = NULL, size = "n",
+       title = paste0("Reliability diagram: ", best_setting_bin, " / ", best_model_bin)) +
+  coord_fixed(xlim = c(0, 1), ylim = c(0, 1))
+
+cat("Calibrated ROC AUC:", round(auc_roc(score_best_cal$truth == "Normal", score_best_cal$score_cal), 3), "\n")
+cat("Calibrated PR  AUC:", round(auc_pr( score_best_cal$truth == "Normal", score_best_cal$score_cal), 3), "\n")
+```
+
+## Dev/Hold-out Top-K ensemble (using current pipeline preprocessing)
+
+```{r}
+#| message: false
+#| warning: false
+# Build ensemble on top of your current pipeline choices:
+# ranking metric priority = ROC AUC -> PR AUC -> Recall.
+set.seed(3888)
+
+split_stratified_by_dataset_class <- function(y, dataset, train_prop = 0.75) {
+  dev_idx <- c()
+  test_idx <- c()
+  y_chr <- as.character(y)
+  ds_chr <- as.character(dataset)
+  for (ds in unique(ds_chr)) {
+    for (cl in unique(y_chr)) {
+      idx <- which(ds_chr == ds & y_chr == cl)
+      if (length(idx) == 0) next
+      idx <- sample(idx)
+      if (length(idx) == 1) {
+        dev_idx <- c(dev_idx, idx)
+      } else {
+        n_dev <- floor(length(idx) * train_prop)
+        n_dev <- max(1, min(n_dev, length(idx) - 1))
+        dev_idx <- c(dev_idx, idx[seq_len(n_dev)])
+        test_idx <- c(test_idx, idx[(n_dev + 1):length(idx)])
+      }
+    }
+  }
+  list(dev_idx = sort(unique(dev_idx)), test_idx = sort(unique(test_idx)))
+}
+
+fit_predict_binary_setting_once <- function(X_train_full, y_train, batch_train,
+                                            X_test_full, batch_test,
+                                            positive = "Normal",
+                                            use_weights = TRUE,
+                                            apply_batch_correction = TRUE,
+                                            weight_scheme = c("ratio", "balanced", "balanced_capped"),
+                                            weight_cap = 4,
+                                            use_downsampling = TRUE,
+                                            downsample_ratio_cap = 3) {
+  weight_scheme <- match.arg(weight_scheme)
+  setting_label <- if (!isTRUE(use_weights)) {
+    "unweighted"
+  } else if (weight_scheme == "ratio") {
+    "weighted_ratio"
+  } else if (weight_scheme == "balanced") {
+    "weighted_balanced"
+  } else {
+    paste0("weighted_balanced_cap", format(weight_cap, trim = TRUE, scientific = FALSE))
+  }
+
+  y_train <- factor(y_train)
+  y_test <- factor(rep(NA_character_, nrow(X_test_full)), levels = levels(y_train))
+
+  expr_train_raw <- t(X_train_full)
+  expr_test_raw <- t(X_test_full)
+
+  # Same downsampling strategy as run_lodo_cv_binary()
+  if (isTRUE(use_downsampling)) {
+    idx_pos <- which(y_train == positive)
+    idx_neg <- which(y_train != positive)
+    if (length(idx_pos) > 0 && length(idx_neg) > 0) {
+      max_n <- function(n_min) max(1L, as.integer(downsample_ratio_cap * n_min))
+      keep_idx <- seq_along(y_train)
+      if (length(idx_neg) > max_n(length(idx_pos))) {
+        keep_idx <- sort(c(idx_pos, sample(idx_neg, max_n(length(idx_pos)))))
+      } else if (length(idx_pos) > max_n(length(idx_neg))) {
+        keep_idx <- sort(c(sample(idx_pos, max_n(length(idx_neg))), idx_neg))
+      }
+      if (length(keep_idx) < length(y_train)) {
+        y_train <- droplevels(y_train[keep_idx])
+        expr_train_raw <- expr_train_raw[, keep_idx, drop = FALSE]
+        batch_train <- batch_train[keep_idx]
+      }
+    }
+  }
+
+  mod_train <- model.matrix(~ y_train)
+  cb <- if (isTRUE(apply_batch_correction)) {
+    combat_fit_apply(
+      expr_train = expr_train_raw,
+      batch_train = batch_train,
+      mod_train = mod_train,
+      expr_test = expr_test_raw,
+      batch_test = batch_test
+    )
+  } else {
+    list(train = expr_train_raw, test = expr_test_raw)
+  }
+
+  X_train_corr <- t(cb$train)
+  X_test_corr <- t(cb$test)
+
+  design_train <- model.matrix(~ y_train)
+  fit_lm <- eBayes(lmFit(t(X_train_corr), design_train))
+  tt <- topTable(fit_lm, n = 50, sort.by = "P")
+  sel_genes <- intersect(rownames(tt), colnames(X_train_corr))
+  if (length(sel_genes) < 10) {
+    return(tibble::tibble(
+      sample_id = seq_len(nrow(X_test_full)),
+      setting = setting_label,
+      model = character(0),
+      score_normal = numeric(0)
+    ))
+  }
+
+  X_train <- X_train_corr[, sel_genes, drop = FALSE]
+  X_test <- X_test_corr[, sel_genes, drop = FALSE]
+
+  imp <- impute_fit(X_train)
+  X_train_i <- impute_apply(X_train, imp)
+  X_test_i <- impute_apply(X_test, imp)
+
+  sc <- standardize_fit(X_train_i)
+  X_train_s <- standardize_apply(X_train_i, sc)
+  X_test_s <- standardize_apply(X_test_i, sc)
+
+  n_pos <- sum(y_train == positive)
+  n_neg <- sum(y_train != positive)
+  if (isTRUE(use_weights)) {
+    if (weight_scheme == "ratio") {
+      pos_w <- if (n_pos > 0) n_neg / n_pos else 1
+      neg_w <- 1
+    } else {
+      n_total <- n_pos + n_neg
+      pos_w <- if (n_pos > 0) n_total / (2 * n_pos) else 1
+      neg_w <- if (n_neg > 0) n_total / (2 * n_neg) else 1
+      if (weight_scheme == "balanced_capped") {
+        pos_w <- min(pos_w, weight_cap)
+        neg_w <- min(neg_w, weight_cap)
+      }
+    }
+  } else {
+    pos_w <- 1
+    neg_w <- 1
+  }
+
+  neg_label <- setdiff(levels(y_train), positive)[1]
+  cw <- c()
+  cw[positive] <- pos_w
+  cw[neg_label] <- neg_w
+  w <- if (use_weights) ifelse(y_train == positive, pos_w, neg_w) else rep(1, length(y_train))
+
+  out <- list()
+
+  pred_knn <- class::knn(train = X_train_s, test = X_test_s, cl = y_train, k = 7, prob = TRUE)
+  out[["kNN"]] <- ifelse(pred_knn == positive, attr(pred_knn, "prob"), 1 - attr(pred_knn, "prob"))
+
+  svm_fit <- e1071::svm(
+    x = X_train_s, y = y_train, kernel = "radial",
+    cost = 1, gamma = 1 / ncol(X_train_s),
+    probability = TRUE,
+    class.weights = if (use_weights) cw else NULL
+  )
+  pred_svm <- predict(svm_fit, X_test_s, probability = TRUE)
+  prob_svm <- attr(pred_svm, "probabilities")
+  out[[if (use_weights) "SVM_RBF_w" else "SVM_RBF"]] <- if ("Normal" %in% colnames(prob_svm)) prob_svm[, "Normal"] else prob_svm[, 1]
+
+  rf_fit <- randomForest::randomForest(x = X_train_i, y = y_train, classwt = if (use_weights) cw else NULL)
+  prob_rf <- predict(rf_fit, X_test_i, type = "prob")
+  out[[if (use_weights) "RF_w" else "RF"]] <- if ("Normal" %in% colnames(prob_rf)) prob_rf[, "Normal"] else prob_rf[, 1]
+
+  glm_fit <- glm(y_train ~ ., data = data.frame(y_train = y_train, X_train_s), family = binomial(), weights = w)
+  out[[if (use_weights) "Logistic_w" else "Logistic"]] <- as.numeric(predict(glm_fit, newdata = data.frame(X_test_s), type = "response"))
+
+  if (requireNamespace("glmnet", quietly = TRUE)) {
+    lasso_fit <- tryCatch(
+      glmnet::cv.glmnet(x = as.matrix(X_train_s), y = as.numeric(y_train == positive), family = "binomial",
+                        alpha = 1, weights = w, standardize = FALSE),
+      error = function(e) NULL
+    )
+    if (!is.null(lasso_fit)) {
+      out[[if (use_weights) "Lasso_w" else "Lasso"]] <- as.numeric(
+        predict(lasso_fit, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
+      )
+    }
+  }
+
+  if (requireNamespace("glmnet", quietly = TRUE)) {
+    enet_fit_once <- tryCatch(
+      glmnet::cv.glmnet(x = as.matrix(X_train_s), y = as.numeric(y_train == positive),
+                        family = "binomial", alpha = 0.5, weights = w, standardize = FALSE),
+      error = function(e) NULL
+    )
+    if (!is.null(enet_fit_once)) {
+      out[[if (use_weights) "ElasticNet_w" else "ElasticNet"]] <- as.numeric(
+        predict(enet_fit_once, newx = as.matrix(X_test_s), type = "response", s = "lambda.min")
+      )
+    }
+  }
+
+  if (requireNamespace("xgboost", quietly = TRUE)) {
+    xgb_dtrain_once <- xgboost::xgb.DMatrix(
+      data  = as.matrix(X_train_s),
+      label = as.numeric(y_train == positive),
+      weight = w
+    )
+    xgb_dtest_once <- xgboost::xgb.DMatrix(data = as.matrix(X_test_s))
+    xgb_fit_once <- tryCatch(
+      xgboost::xgb.train(
+        params  = list(objective = "binary:logistic", eval_metric = "auc",
+                       eta = 0.05, max_depth = 4, subsample = 0.8,
+                       colsample_bytree = 0.8, min_child_weight = 5, nthread = 1),
+        data    = xgb_dtrain_once, nrounds = 150, verbose = 0
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(xgb_fit_once)) {
+      out[[if (use_weights) "XGB_w" else "XGB"]] <- as.numeric(predict(xgb_fit_once, xgb_dtest_once))
+    }
+  }
+
+  score_df <- tibble::as_tibble(out) %>%
+    mutate(sample_id = seq_len(nrow(X_test_full))) %>%
+    tidyr::pivot_longer(cols = -sample_id, names_to = "model", values_to = "score_normal") %>%
+    mutate(setting = setting_label) %>%
+    select(sample_id, setting, model, score_normal)
+
+  score_df
+}
+
+make_ensemble_weights <- function(selected_df, method = c("rank_roc_pr_recall", "softmax_roc", "roc_x_pr", "equal_weight"), temp = 0.2) {
+  method <- match.arg(method)
+  d <- selected_df %>%
+    arrange(desc(mean_roc_auc), desc(mean_pr_auc), desc(mean_recall)) %>%
+    mutate(rank_score = rev(seq_len(n())))
+
+  if (method == "rank_roc_pr_recall") {
+    d <- d %>% mutate(raw_weight = mean_roc_auc * rank_score + 0.5 * mean_pr_auc + 0.25 * mean_recall)
+  } else if (method == "softmax_roc") {
+    d <- d %>% mutate(raw_weight = exp(mean_roc_auc / temp))
+  } else if (method == "roc_x_pr") {
+    d <- d %>% mutate(raw_weight = pmax(mean_roc_auc * mean_pr_auc, 1e-8))
+  } else {
+    d <- d %>% mutate(raw_weight = 1)
+  }
+
+  d %>% mutate(final_weight = raw_weight / sum(raw_weight))
+}
+
+ok_all <- !is.na(pMat_big_bin$label_binary) & pMat_big_bin$label_binary != ""
+X_all_ens <- t(eMat_big_bin[, ok_all, drop = FALSE])
+y_all_ens <- factor(pMat_big_bin$label_binary[ok_all], levels = c("Cancer", "Normal"))
+batch_all_ens <- as.character(pMat_big_bin$dataset_id[ok_all])
+
+split_obj <- split_stratified_by_dataset_class(y_all_ens, batch_all_ens, train_prop = 0.75)
+dev_idx <- split_obj$dev_idx
+test_idx <- split_obj$test_idx
+
+X_dev <- X_all_ens[dev_idx, , drop = FALSE]
+y_dev <- y_all_ens[dev_idx]
+batch_dev <- batch_all_ens[dev_idx]
+
+X_hold <- X_all_ens[test_idx, , drop = FALSE]
+y_hold <- y_all_ens[test_idx]
+batch_hold <- batch_all_ens[test_idx]
+
+cat("Development set size:", nrow(X_dev), "samples\n")
+cat("Hold-out set size:", nrow(X_hold), "samples\n")
+
+dev_runs <- lapply(seq_len(nrow(weight_cfg)), function(i) {
+  cfg <- weight_cfg[i, ]
+  run_lodo_cv_binary(
+    X = X_dev, y = y_dev, batch = batch_dev, positive = "Normal",
+    use_weights = cfg$use_weights,
+    apply_batch_correction = TRUE,
+    weight_scheme = cfg$weight_scheme,
+    weight_cap = cfg$weight_cap,
+    use_downsampling = use_fold_downsampling,
+    downsample_ratio_cap = downsample_max_ratio
+  )
+})
+
+dev_perf <- bind_rows(lapply(dev_runs, `[[`, "perf"))
+dev_scores <- bind_rows(lapply(dev_runs, `[[`, "scores"))
+
+dev_rank <- dev_perf %>%
+  group_by(setting, model) %>%
+  summarise(mean_recall = mean(recall_normal, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    dev_scores %>%
+      group_by(setting, model) %>%
+      summarise(
+        mean_roc_auc = auc_roc(truth == "Normal", score_normal),
+        mean_pr_auc = auc_pr(truth == "Normal", score_normal),
+        .groups = "drop"
+      ),
+    by = c("setting", "model")
+  ) %>%
+  arrange(desc(mean_roc_auc), desc(mean_pr_auc), desc(mean_recall)) %>%
+  mutate(overall_rank = row_number())
+
+knitr::kable(dev_rank %>% mutate(across(c(mean_roc_auc, mean_pr_auc, mean_recall), round, 3)),
+             caption = "Development ranking (priority: ROC AUC -> PR AUC -> Recall)")
+
+hold_base_scores <- bind_rows(lapply(seq_len(nrow(weight_cfg)), function(i) {
+  cfg <- weight_cfg[i, ]
+  fit_predict_binary_setting_once(
+    X_train_full = X_dev, y_train = y_dev, batch_train = batch_dev,
+    X_test_full = X_hold, batch_test = batch_hold,
+    positive = "Normal",
+    use_weights = cfg$use_weights,
+    apply_batch_correction = TRUE,
+    weight_scheme = cfg$weight_scheme,
+    weight_cap = cfg$weight_cap,
+    use_downsampling = use_fold_downsampling,
+    downsample_ratio_cap = downsample_max_ratio
+  )
+}))
+
+hold_truth <- tibble::tibble(sample_id = seq_len(length(y_hold)), truth = y_hold)
+
+hold_single_metrics <- hold_base_scores %>%
+  left_join(hold_truth, by = "sample_id") %>%
+  group_by(setting, model) %>%
+  summarise(
+    roc_auc = auc_roc(truth == "Normal", score_normal),
+    pr_auc = auc_pr(truth == "Normal", score_normal),
+    recall = binary_metrics(truth, ifelse(score_normal >= 0.5, "Normal", "Cancer"), positive = "Normal")$recall_normal,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(roc_auc), desc(pr_auc), desc(recall)) %>%
+  mutate(overall_rank = row_number())
+
+top_k_vec <- c(4, 5, 6, 7)
+ensemble_weight_methods <- c("rank_roc_pr_recall", "softmax_roc", "roc_x_pr", "equal_weight")
+
+ens_metrics <- list()
+ens_scores <- list()
+for (k in top_k_vec) {
+  selected <- dev_rank %>% arrange(overall_rank) %>% slice_head(n = k)
+  if (nrow(selected) == 0) next
+  for (wm in ensemble_weight_methods) {
+    wdf <- make_ensemble_weights(selected, method = wm)
+    hold_sel <- hold_base_scores %>%
+      inner_join(wdf %>% select(setting, model, final_weight), by = c("setting", "model")) %>%
+      group_by(sample_id) %>%
+      summarise(score_normal = sum(score_normal * final_weight, na.rm = TRUE), .groups = "drop") %>%
+      left_join(hold_truth, by = "sample_id")
+
+    pred <- ifelse(hold_sel$score_normal >= 0.5, "Normal", "Cancer")
+    met <- binary_metrics(hold_sel$truth, pred, positive = "Normal")
+    ens_metrics[[length(ens_metrics) + 1]] <- tibble::tibble(
+      top_k = k,
+      weight_method = wm,
+      combo = paste0("top", k, " | ", wm),
+      roc_auc = auc_roc(hold_sel$truth == "Normal", hold_sel$score_normal),
+      pr_auc = auc_pr(hold_sel$truth == "Normal", hold_sel$score_normal),
+      recall = met$recall_normal,
+      balanced_accuracy = met$balanced_accuracy
+    )
+    ens_scores[[length(ens_scores) + 1]] <- hold_sel %>%
+      mutate(
+        top_k = k,
+        weight_method = wm,
+        combo = paste0("top", k, " | ", wm)
+      )
+  }
+}
+
+hold_ens_metrics <- bind_rows(ens_metrics) %>%
+  arrange(desc(roc_auc), desc(pr_auc), desc(recall)) %>%
+  mutate(overall_rank = row_number())
+hold_ens_scores <- bind_rows(ens_scores)
+
+knitr::kable(hold_single_metrics %>% mutate(across(c(roc_auc, pr_auc, recall), round, 3)),
+             caption = "Hold-out single-model performance (ranked by ROC AUC -> PR AUC -> Recall)")
+knitr::kable(hold_ens_metrics %>% mutate(across(c(roc_auc, pr_auc, recall, balanced_accuracy), round, 3)),
+             caption = "Hold-out ensemble performance (ranked by ROC AUC -> PR AUC -> Recall)")
+
+best_single <- hold_single_metrics %>% slice(1) %>%
+  transmute(
+    method = "Best single model",
+    id = paste(setting, model, sep = " / "),
+    roc_auc, pr_auc, recall
+  )
+
+best_ensemble <- hold_ens_metrics %>% slice(1) %>%
+  transmute(
+    method = "Best ensemble",
+    id = combo,
+    roc_auc, pr_auc, recall
+  )
+
+comparison_tbl <- bind_rows(best_single, best_ensemble) %>%
+  mutate(across(c(roc_auc, pr_auc, recall), round, 3))
+
+knitr::kable(comparison_tbl, caption = "Best single vs best ensemble (hold-out)")
+
+best_ens_combo <- hold_ens_metrics %>% slice(1) %>% pull(combo)
+best_ens_scores <- hold_ens_scores %>% filter(combo == best_ens_combo)
+
+cat("Best ensemble combo on hold-out:", best_ens_combo, "\n")
+
+thr_best_ens <- best_threshold_f1(best_ens_scores$truth, best_ens_scores$score_normal, positive = "Normal")
+cat("Best-ensemble tuned threshold (max F1 for Normal):", round(thr_best_ens, 4), "\n")
+
+neg_label_ens <- setdiff(levels(factor(best_ens_scores$truth)), "Normal")[1]
+pred_ens_default <- ifelse(best_ens_scores$score_normal >= 0.5, "Normal", neg_label_ens)
+pred_ens_tuned <- ifelse(best_ens_scores$score_normal >= thr_best_ens, "Normal", neg_label_ens)
+
+# 1) Score-density separation
+ggplot(best_ens_scores %>% mutate(truth = factor(truth, levels = c("Cancer", "Normal"))),
+       aes(x = score_normal, fill = truth)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0.5, linetype = 2, linewidth = 0.8) +
+  geom_vline(xintercept = thr_best_ens, linetype = 1, linewidth = 0.8, color = "#2C7FB8") +
+  theme_bw() +
+  labs(
+    x = "Predicted P(Normal)",
+    y = "Density",
+    fill = "True class",
+    title = paste0("Best ensemble score separation: ", best_ens_combo)
+  )
+
+# 2) Confusion matrices (default vs tuned threshold)
+tab_ens_default <- as.data.frame(table(truth = best_ens_scores$truth, pred = pred_ens_default))
+tab_ens_tuned <- as.data.frame(table(truth = best_ens_scores$truth, pred = pred_ens_tuned))
+
+p_cm_ens_default <- ggplot(tab_ens_default, aes(x = pred, y = truth, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 4.5) +
+  scale_fill_gradient(low = "white", high = "#41AB5D") +
+  theme_bw() +
+  labs(x = "Predicted", y = "True", title = "Best ensemble confusion matrix @ 0.5")
+
+p_cm_ens_tuned <- ggplot(tab_ens_tuned, aes(x = pred, y = truth, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 4.5) +
+  scale_fill_gradient(low = "white", high = "#2C7FB8") +
+  theme_bw() +
+  labs(x = "Predicted", y = "True", title = "Best ensemble confusion matrix @ tuned threshold")
+
+print(p_cm_ens_default)
+print(p_cm_ens_tuned)
+
+# 3) ROC + PR curves for best ensemble
+truth01_ens <- as.integer(best_ens_scores$truth == "Normal")
+score_ens <- best_ens_scores$score_normal
+
+roc_thresh_ens <- sort(unique(score_ens), decreasing = TRUE)
+roc_df_ens <- lapply(roc_thresh_ens, function(t) {
+  pred <- score_ens >= t
+  tp <- sum(pred & truth01_ens == 1)
+  fn <- sum(!pred & truth01_ens == 1)
+  fp <- sum(pred & truth01_ens == 0)
+  tn <- sum(!pred & truth01_ens == 0)
+  tibble(
+    threshold = t,
+    tpr = if ((tp + fn) == 0) NA_real_ else tp / (tp + fn),
+    fpr = if ((fp + tn) == 0) NA_real_ else fp / (fp + tn)
+  )
+}) %>% bind_rows()
+
+pr_df_ens <- pr_curve_df(truth01_ens, score_ens)
+
+p_roc_ens <- ggplot(roc_df_ens, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2C7FB8", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  theme_bw() +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    title = paste0("Best ensemble ROC (AUC = ", round(auc_roc(truth01_ens, score_ens), 3), ")")
+  )
+
+p_pr_ens <- ggplot(pr_df_ens, aes(x = recall, y = precision)) +
+  geom_line(color = "#41AB5D", linewidth = 1) +
+  theme_bw() +
+  labs(
+    x = "Recall (Normal)",
+    y = "Precision (Normal)",
+    title = paste0("Best ensemble PR (AUC = ", round(auc_pr(truth01_ens, score_ens), 3), ")")
+  )
+
+print(p_roc_ens)
+print(p_pr_ens)
+```
+
+## Multiclass pipeline v2 – log2 + ComBat + class weights + probabilities
+
+> **Note on preprocessing**: `build_merged_multiclass_dataset` calls `collapse_to_genes` which applies the same GEO2R-style auto-log2 heuristic used for binary. Within each LODO fold the same `combat_fit_apply` (ComBat → limma fallback) is used. The v2 function below adds **(a)** balanced class weights, **(b)** probability outputs enabling macro OvR ROC AUC, **(c)** multinomial Lasso, and **(d)** a full scorecard, hold-out ensemble, and per-subtype risk calculator mirroring the binary pipeline.
+
+```{r}
+#| message: false
+#| warning: false
+# ── Enhanced multiclass LODO CV ────────────────────────────────────────────
+run_lodo_cv_multiclass_v2 <- function(X, y, batch,
+                                      use_weights  = TRUE,
+                                      n_per_class  = 25) {
+  y     <- factor(y)
+  batch <- as.character(batch)
+  perf       <- data.frame()
+  all_preds  <- data.frame()
+  all_probs  <- list()
+
+  for (ds in unique(batch)) {
+    test_id  <- which(batch == ds)
+    train_id <- setdiff(seq_along(batch), test_id)
+
+    y_train <- droplevels(y[train_id])
+    y_test  <- factor(as.character(y[test_id]), levels = levels(y_train))
+    if (nlevels(y_train) < 2) next
+
+    expr_tr_raw <- t(X[train_id, , drop = FALSE])
+    expr_te_raw <- t(X[test_id,  , drop = FALSE])
+    mod_train   <- model.matrix(~ y_train)
+
+    cb <- combat_fit_apply(expr_train = expr_tr_raw, batch_train = batch[train_id],
+                           mod_train  = mod_train,
+                           expr_test  = expr_te_raw, batch_test  = batch[test_id])
+
+    X_tr_full <- t(cb$train)
+    X_te_full <- t(cb$test)
+
+    # OvR limma gene selection (fold-internal)
+    genes_sel <- select_genes_one_vs_rest(t(X_tr_full), y = y_train,
+                                          n_per_class = n_per_class)
+    sel_genes <- intersect(genes_sel, colnames(X_tr_full))
+    if (length(sel_genes) < 10) next
+
+    X_tr <- X_tr_full[, sel_genes, drop = FALSE]
+    X_te <- X_te_full[, sel_genes, drop = FALSE]
+
+    imp <- impute_fit(X_tr); X_tr_i <- impute_apply(X_tr, imp); X_te_i <- impute_apply(X_te, imp)
+    sc  <- standardize_fit(X_tr_i); X_tr_s <- standardize_apply(X_tr_i, sc); X_te_s <- standardize_apply(X_te_i, sc)
+
+    lvls <- levels(y_train)
+    n_cl <- length(lvls)
+    n_te <- nrow(X_te_s)
+
+    # Class weights (balanced)
+    tab_tr <- table(y_train)
+    n_tot  <- sum(tab_tr)
+    cw_mc  <- if (use_weights) {
+      setNames(vapply(lvls, function(k) n_tot / (n_cl * max(1, tab_tr[k])), numeric(1)), lvls)
+    } else setNames(rep(1, n_cl), lvls)
+    sw_mc  <- cw_mc[as.character(y_train)]
+
+    y_te_chr <- as.character(y_test)
+
+    add_result <- function(model_nm, pred_chr, prob_matrix) {
+      perf <<- rbind(perf, data.frame(
+        fold = ds, model = model_nm,
+        accuracy  = mean(pred_chr == y_te_chr, na.rm = TRUE),
+        macro_f1  = macro_f1(y_te_chr, pred_chr),
+        macro_auc = macro_auc_ovr(y_te_chr, prob_matrix)
+      ))
+      all_preds <<- rbind(all_preds, data.frame(
+        fold = ds, model = model_nm, truth = y_te_chr, pred = pred_chr
+      ))
+      pdf <- as.data.frame(prob_matrix)
+      pdf$fold  <- ds; pdf$model <- model_nm; pdf$truth <- y_te_chr
+      all_probs[[length(all_probs) + 1]] <<- pdf
+    }
+
+    # kNN – approximate OvR probs from win probability
+    pred_knn <- class::knn(X_tr_s, X_te_s, cl = y_train, k = 7, prob = TRUE)
+    knn_win  <- attr(pred_knn, "prob")
+    pred_chr_knn <- as.character(pred_knn)
+    prob_knn <- matrix(0, n_te, n_cl, dimnames = list(NULL, lvls))
+    for (i in seq_len(n_te)) {
+      prob_knn[i, pred_chr_knn[i]] <- knn_win[i]
+      oth <- setdiff(lvls, pred_chr_knn[i])
+      if (length(oth)) prob_knn[i, oth] <- (1 - knn_win[i]) / length(oth)
+    }
+    add_result("kNN", pred_chr_knn, prob_knn)
+
+    # SVM (probability + class weights)
+    svm_mc <- tryCatch(
+      e1071::svm(X_tr_s, y_train, kernel = "radial", cost = 1,
+                 gamma = 1 / ncol(X_tr_s), probability = TRUE,
+                 class.weights = if (use_weights) cw_mc else NULL),
+      error = function(e) NULL
+    )
+    if (!is.null(svm_mc)) {
+      pred_svm_mc   <- predict(svm_mc, X_te_s, probability = TRUE)
+      prob_svm_mc   <- attr(pred_svm_mc, "probabilities")[, lvls, drop = FALSE]
+      add_result(if (use_weights) "SVM_RBF_w" else "SVM_RBF",
+                 as.character(pred_svm_mc), prob_svm_mc)
+    }
+
+    # RF (class weights)
+    rf_mc    <- randomForest::randomForest(X_tr_i, y_train,
+                                           classwt = if (use_weights) cw_mc else NULL)
+    pred_rf_mc  <- predict(rf_mc, X_te_i)
+    prob_rf_mc  <- predict(rf_mc, X_te_i, type = "prob")[, lvls, drop = FALSE]
+    add_result(if (use_weights) "RF_w" else "RF",
+               as.character(pred_rf_mc), prob_rf_mc)
+
+    # Multinomial Lasso (glmnet)
+    if (requireNamespace("glmnet", quietly = TRUE)) {
+      lasso_mc <- tryCatch(
+        glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family = "multinomial",
+                          alpha = 1, weights = sw_mc, standardize = FALSE,
+                          type.multinomial = "grouped"),
+        error = function(e) { message("Multinom-Lasso fold ", ds, ": ", conditionMessage(e)); NULL }
+      )
+      if (!is.null(lasso_mc)) {
+        prob_raw <- predict(lasso_mc, as.matrix(X_te_s), type = "response", s = "lambda.min")[,,1]
+        if (is.null(dim(prob_raw))) prob_raw <- t(as.matrix(prob_raw))
+        prob_raw <- prob_raw[, intersect(lvls, colnames(prob_raw)), drop = FALSE]
+        pred_lasso_mc <- lvls[max.col(prob_raw)]
+        add_result(if (use_weights) "LassoMC_w" else "LassoMC",
+                   pred_lasso_mc, prob_raw)
+      }
+    }
+
+    # Multinomial logistic (nnet, sample weights)
+    if (requireNamespace("nnet", quietly = TRUE)) {
+      mn_mc <- tryCatch(
+        nnet::multinom(y_train ~ ., data = data.frame(y_train, X_tr_s),
+                       weights = sw_mc, trace = FALSE, MaxNWts = 100000),
+        error = function(e) NULL
+      )
+      if (!is.null(mn_mc)) {
+        prob_mn <- predict(mn_mc, newdata = data.frame(X_te_s), type = "probs")
+        if (is.null(dim(prob_mn))) prob_mn <- t(as.matrix(prob_mn))
+        prob_mn <- prob_mn[, intersect(lvls, colnames(prob_mn)), drop = FALSE]
+        pred_mn_mc <- lvls[max.col(prob_mn)]
+        add_result(if (use_weights) "Multinom_w" else "Multinom",
+                   pred_mn_mc, prob_mn)
+      }
+    }
+  }
+
+  list(perf = perf, preds = all_preds, probs = bind_rows(all_probs))
+}
+
+res_mc_v2 <- run_lodo_cv_multiclass_v2(X_mc, y_mc, batch_mc,
+                                        use_weights = TRUE, n_per_class = 25)
+cat("Multiclass v2 folds completed. Models:\n")
+print(unique(res_mc_v2$perf$model))
+```
+
+## Multiclass v2 – performance plots
+
+```{r, fig.cap="Multiclass v2: accuracy, macro-F1 and macro OvR AUC per model (LODO CV)."}
+#| message: false
+#| warning: false
+perf_mc_v2_long <- res_mc_v2$perf %>%
+  pivot_longer(cols = c(accuracy, macro_f1, macro_auc), names_to = "metric", values_to = "value")
+
+ggplot(perf_mc_v2_long, aes(x = model, y = value, fill = model)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.6) +
+  facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  labs(x = "", y = "", title = "Multiclass v2 model comparison (LODO CV, weighted)") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+## Multiclass v2 – scorecard
+
+```{r}
+#| message: false
+#| warning: false
+mc_v2_scorecard <- res_mc_v2$perf %>%
+  group_by(model) %>%
+  summarise(
+    mean_accuracy  = mean(accuracy,  na.rm = TRUE),
+    sd_accuracy    = sd(accuracy,    na.rm = TRUE),
+    mean_macro_f1  = mean(macro_f1,  na.rm = TRUE),
+    sd_macro_f1    = sd(macro_f1,    na.rm = TRUE),
+    mean_macro_auc = mean(macro_auc, na.rm = TRUE),
+    sd_macro_auc   = sd(macro_auc,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_macro_auc), desc(mean_macro_f1), desc(mean_accuracy)) %>%
+  mutate(
+    overall_rank = row_number(),
+    accuracy     = sprintf("%.3f \u00B1 %.3f", mean_accuracy,  sd_accuracy),
+    macro_f1     = sprintf("%.3f \u00B1 %.3f", mean_macro_f1,  sd_macro_f1),
+    macro_auc    = sprintf("%.3f \u00B1 %.3f", mean_macro_auc, sd_macro_auc)
+  ) %>%
+  select(overall_rank, model, macro_auc, macro_f1, accuracy)
+
+knitr::kable(mc_v2_scorecard,
+             caption = "Multiclass v2 scorecard (ranked: macro OvR AUC → macro F1 → accuracy)")
+
+best_model_mc_v2 <- res_mc_v2$perf %>%
+  group_by(model) %>%
+  summarise(m = mean(macro_auc, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(m)) %>%
+  slice(1) %>%
+  pull(model)
+cat("Best multiclass v2 model (macro OvR AUC):", best_model_mc_v2, "\n")
+```
+
+## Multiclass v2 – confusion matrix (best model)
+
+```{r, fig.cap="Multiclass v2: pooled confusion matrix for best model."}
+#| message: false
+#| warning: false
+preds_best_mc_v2 <- res_mc_v2$preds %>% filter(model == best_model_mc_v2)
+tab_mc_v2 <- table(truth = preds_best_mc_v2$truth, pred = preds_best_mc_v2$pred)
+tab_mc_v2_df <- as.data.frame(tab_mc_v2)
+
+ggplot(tab_mc_v2_df, aes(x = pred, y = truth, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 4) +
+  scale_fill_gradient(low = "white", high = "#2C7FB8") +
+  theme_bw() +
+  labs(x = "Predicted", y = "True",
+       title = paste0("Multiclass v2 confusion matrix: ", best_model_mc_v2)) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+## Multiclass v2 – hold-out ensemble
+
+```{r}
+#| message: false
+#| warning: false
+set.seed(3888)
+
+# Stratified dev/hold-out split (reuse helper from binary)
+split_mc <- split_stratified_by_dataset_class(y_mc, batch_mc, train_prop = 0.75)
+dev_mc_idx  <- split_mc$dev_idx
+hold_mc_idx <- split_mc$test_idx
+
+X_mc_dev  <- X_mc[dev_mc_idx,  , drop = FALSE]; y_mc_dev  <- y_mc[dev_mc_idx];  batch_mc_dev  <- batch_mc[dev_mc_idx]
+X_mc_hold <- X_mc[hold_mc_idx, , drop = FALSE]; y_mc_hold <- y_mc[hold_mc_idx]; batch_mc_hold <- batch_mc[hold_mc_idx]
+
+cat("MC dev size:", nrow(X_mc_dev), "  hold size:", nrow(X_mc_hold), "\n")
+
+# LODO on dev set to rank models
+res_mc_dev <- run_lodo_cv_multiclass_v2(X_mc_dev, y_mc_dev, batch_mc_dev,
+                                         use_weights = TRUE, n_per_class = 25)
+
+mc_dev_rank <- res_mc_dev$perf %>%
+  group_by(model) %>%
+  summarise(mean_mac_auc = mean(macro_auc, na.rm = TRUE),
+            mean_mac_f1  = mean(macro_f1,  na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_mac_auc), desc(mean_mac_f1)) %>%
+  mutate(dev_rank = row_number())
+
+knitr::kable(mc_dev_rank %>% mutate(across(where(is.numeric), round, 3)),
+             caption = "Multiclass dev-set ranking (macro OvR AUC)")
+
+# ── Fit each model on full dev set, predict hold-out ─────────────────────
+fit_predict_mc_once <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
+                                use_weights = TRUE, n_per_class = 25) {
+  y_tr <- factor(y_tr); lvls <- levels(y_tr); n_cl <- length(lvls)
+  expr_tr_raw <- t(X_tr); expr_te_raw <- t(X_te)
+  mod_tr <- model.matrix(~ y_tr)
+  cb <- combat_fit_apply(expr_tr_raw, batch_tr, mod_tr, expr_te_raw, batch_te)
+  X_tr_c <- t(cb$train); X_te_c <- t(cb$test)
+
+  genes_sel <- select_genes_one_vs_rest(t(X_tr_c), y = y_tr, n_per_class = n_per_class)
+  sel_g <- intersect(genes_sel, colnames(X_tr_c))
+  if (length(sel_g) < 10) return(NULL)
+
+  X_tr2 <- X_tr_c[, sel_g]; X_te2 <- X_te_c[, sel_g]
+  imp <- impute_fit(X_tr2)
+  X_tr_i <- impute_apply(X_tr2, imp); X_te_i <- impute_apply(X_te2, imp)
+  sc <- standardize_fit(X_tr_i)
+  X_tr_s <- standardize_apply(X_tr_i, sc); X_te_s <- standardize_apply(X_te_i, sc)
+
+  tab_tr <- table(y_tr); n_tot <- sum(tab_tr)
+  cw_mc <- if (use_weights) setNames(vapply(lvls, function(k) n_tot / (n_cl * max(1,tab_tr[k])), numeric(1)), lvls) else setNames(rep(1,n_cl),lvls)
+  sw_mc <- cw_mc[as.character(y_tr)]
+  n_te  <- nrow(X_te_s)
+
+  out <- list()
+
+  # kNN
+  pk <- class::knn(X_tr_s, X_te_s, y_tr, k=7, prob=TRUE)
+  kw <- attr(pk,"prob"); pkc <- as.character(pk)
+  pm_knn <- matrix(0,n_te,n_cl,dimnames=list(NULL,lvls))
+  for(i in seq_len(n_te)){ pm_knn[i,pkc[i]] <- kw[i]; oth <- setdiff(lvls,pkc[i]); if(length(oth)) pm_knn[i,oth]<-(1-kw[i])/length(oth) }
+  out[["kNN"]] <- pm_knn
+
+  # RF
+  rf2 <- randomForest::randomForest(X_tr_i, y_tr, classwt=if(use_weights)cw_mc else NULL)
+  out[[if(use_weights)"RF_w"else"RF"]] <- predict(rf2, X_te_i, type="prob")[,lvls,drop=FALSE]
+
+  # Multinomial Lasso
+  if(requireNamespace("glmnet",quietly=TRUE)){
+    lf <- tryCatch(glmnet::cv.glmnet(as.matrix(X_tr_s),y_tr,family="multinomial",alpha=1,weights=sw_mc,standardize=FALSE,type.multinomial="grouped"),error=function(e)NULL)
+    if(!is.null(lf)){
+      pr <- predict(lf,as.matrix(X_te_s),type="response",s="lambda.min")[,,1]
+      if(is.null(dim(pr))) pr <- t(as.matrix(pr))
+      out[[if(use_weights)"LassoMC_w"else"LassoMC"]] <- pr[,intersect(lvls,colnames(pr)),drop=FALSE]
+    }
+  }
+
+  # Multinom
+  if(requireNamespace("nnet",quietly=TRUE)){
+    mn2 <- tryCatch(nnet::multinom(y_tr~.,data=data.frame(y_tr,X_tr_s),weights=sw_mc,trace=FALSE,MaxNWts=100000),error=function(e)NULL)
+    if(!is.null(mn2)){
+      pm_mn <- predict(mn2,newdata=data.frame(X_te_s),type="probs")
+      if(is.null(dim(pm_mn))) pm_mn <- t(as.matrix(pm_mn))
+      out[[if(use_weights)"Multinom_w"else"Multinom"]] <- pm_mn[,intersect(lvls,colnames(pm_mn)),drop=FALSE]
+    }
+  }
+
+  out
+}
+
+hold_mc_probs_list <- fit_predict_mc_once(
+  X_mc_dev, y_mc_dev, batch_mc_dev,
+  X_mc_hold, batch_mc_hold,
+  use_weights = TRUE, n_per_class = 25
+)
+
+if (!is.null(hold_mc_probs_list)) {
+  lvls_hold <- levels(factor(y_mc_dev))
+
+  # Single-model hold-out metrics
+  hold_mc_single <- bind_rows(lapply(names(hold_mc_probs_list), function(nm) {
+    pm  <- hold_mc_probs_list[[nm]]
+    lvls_pm <- intersect(lvls_hold, colnames(pm))
+    pred_chr <- lvls_pm[max.col(pm[, lvls_pm, drop=FALSE])]
+    tibble::tibble(
+      model     = nm,
+      accuracy  = mean(pred_chr == as.character(y_mc_hold), na.rm = TRUE),
+      macro_f1  = macro_f1(as.character(y_mc_hold), pred_chr),
+      macro_auc = macro_auc_ovr(as.character(y_mc_hold), pm[, lvls_pm, drop=FALSE])
+    )
+  })) %>% arrange(desc(macro_auc), desc(macro_f1)) %>% mutate(hold_rank = row_number())
+
+  knitr::kable(hold_mc_single %>% mutate(across(where(is.numeric), round, 3)),
+               caption = "Multiclass hold-out: single-model performance (macro OvR AUC ranked)")
+
+  # Ensemble: top-k equal-weight probability averaging
+  top_k_mc_vec <- c(2, 3, 4)
+  ens_mc_metrics <- list()
+  for (k in top_k_mc_vec) {
+    sel_models <- mc_dev_rank %>% slice_head(n = k) %>% pull(model)
+    sel_models <- intersect(sel_models, names(hold_mc_probs_list))
+    if (length(sel_models) < 2) next
+
+    avg_pm <- Reduce("+", lapply(sel_models, function(nm) {
+      pm <- hold_mc_probs_list[[nm]]
+      pm[, intersect(lvls_hold, colnames(pm)), drop = FALSE]
+    })) / length(sel_models)
+
+    pred_ens_chr <- colnames(avg_pm)[max.col(avg_pm)]
+    ens_mc_metrics[[as.character(k)]] <- tibble::tibble(
+      top_k     = k,
+      models    = paste(sel_models, collapse = " + "),
+      accuracy  = mean(pred_ens_chr == as.character(y_mc_hold), na.rm = TRUE),
+      macro_f1  = macro_f1(as.character(y_mc_hold), pred_ens_chr),
+      macro_auc = macro_auc_ovr(as.character(y_mc_hold), avg_pm)
+    )
+  }
+
+  hold_mc_ens <- bind_rows(ens_mc_metrics) %>% arrange(desc(macro_auc))
+  knitr::kable(hold_mc_ens %>% mutate(across(where(is.numeric), round, 3)),
+               caption = "Multiclass hold-out: ensemble performance (equal-weight prob averaging)")
+
+  # Best ensemble confusion matrix
+  best_k_mc <- hold_mc_ens$top_k[1]
+  best_sel_mc <- mc_dev_rank %>% slice_head(n = best_k_mc) %>% pull(model)
+  best_sel_mc <- intersect(best_sel_mc, names(hold_mc_probs_list))
+  best_avg_pm <- Reduce("+", lapply(best_sel_mc, function(nm) {
+    pm <- hold_mc_probs_list[[nm]]
+    pm[, intersect(lvls_hold, colnames(pm)), drop = FALSE]
+  })) / length(best_sel_mc)
+  best_pred_ens_mc <- colnames(best_avg_pm)[max.col(best_avg_pm)]
+
+  tab_mc_ens <- as.data.frame(table(truth = as.character(y_mc_hold), pred = best_pred_ens_mc))
+  ggplot(tab_mc_ens, aes(x = pred, y = truth, fill = Freq)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = Freq), size = 4) +
+    scale_fill_gradient(low = "white", high = "#41AB5D") +
+    theme_bw() +
+    labs(x = "Predicted", y = "True",
+         title = paste0("Multiclass ensemble confusion matrix (top-", best_k_mc, " avg)")) +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1))
+} else {
+  cat("Hold-out prediction skipped (insufficient data in hold set).\n")
+}
+```
+
+## Multiclass risk calculator (subtype probabilities)
+
+```{r}
+#| message: false
+#| warning: false
+# Output: per-sample probability of each PAM50 subtype from the best LODO model.
+
+if (!is.null(hold_mc_probs_list) && best_model_mc_v2 %in% names(hold_mc_probs_list)) {
+  lvls_rc <- colnames(hold_mc_probs_list[[best_model_mc_v2]])
+  mc_risk_df <- as.data.frame(hold_mc_probs_list[[best_model_mc_v2]])
+  colnames(mc_risk_df) <- lvls_rc
+  mc_risk_df$predicted_subtype <- lvls_rc[max.col(mc_risk_df[, lvls_rc])]
+  mc_risk_df$confidence        <- apply(mc_risk_df[, lvls_rc], 1, max)
+  mc_risk_df$true_subtype      <- as.character(y_mc_hold)
+  mc_risk_df$correct           <- mc_risk_df$predicted_subtype == mc_risk_df$true_subtype
+
+  cat("Multiclass risk calculator: hold-out subtype probability table (top 20 rows)\n")
+  knitr::kable(head(mc_risk_df %>%
+                      arrange(desc(confidence)) %>%
+                      mutate(across(all_of(lvls_rc), ~ round(.x, 3)),
+                             confidence = round(confidence, 3)), 20),
+               caption = paste0("Per-sample PAM50 subtype probabilities (", best_model_mc_v2, ")"))
+
+  # Stacked bar: predicted probability profile per true subtype
+  mc_risk_long <- mc_risk_df %>%
+    mutate(sample_idx = row_number()) %>%
+    pivot_longer(cols = all_of(lvls_rc), names_to = "subtype", values_to = "probability") %>%
+    mutate(true_subtype = factor(true_subtype))
+
+  ggplot(mc_risk_long, aes(x = sample_idx, y = probability, fill = subtype)) +
+    geom_col(width = 1) +
+    facet_wrap(~ true_subtype, scales = "free_x") +
+    theme_bw() +
+    labs(x = "Sample", y = "P(subtype)", fill = "Predicted",
+         title = paste0("PAM50 subtype probability profiles (", best_model_mc_v2, ")")) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+  # OvR calibration per subtype
+  mc_cal_df <- bind_rows(lapply(lvls_rc, function(k) {
+    tibble::tibble(
+      subtype  = k,
+      roc_auc  = auc_roc(as.integer(mc_risk_df$true_subtype == k), mc_risk_df[[k]]),
+      pr_auc   = auc_pr( as.integer(mc_risk_df$true_subtype == k), mc_risk_df[[k]])
+    )
+  }))
+  knitr::kable(mc_cal_df %>% mutate(across(c(roc_auc, pr_auc), round, 3)),
+               caption = "Per-subtype OvR AUC on hold-out (multiclass risk model)")
+
+} else {
+  cat("Multiclass risk calculator skipped: best model probabilities not available.\n")
+}
 ```
