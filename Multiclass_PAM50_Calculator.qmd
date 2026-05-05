@@ -1,0 +1,1191 @@
+---
+title: "Breast Cancer PAM50 Subtype Risk Calculator (Multiclass)"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    df-print: paged
+    toc: true
+editor: visual
+---
+
+This notebook builds a **PAM50 subtype classifier** from merged GEO microarray datasets. It is structured in three clearly separated stages:
+
+1.  **QC & normalisation** — per-dataset, completely separate from modelling
+2.  **Model building** — LODO cross-validation with fold-safe batch correction
+3.  **Risk calculator** — subtype probabilities with uncertainty quantification
+
+```{r setup}
+#| message: false
+#| warning: false
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(class)
+library(e1071)
+library(randomForest)
+library(sva)
+library(glmnet)
+if (requireNamespace("nnet", quietly = TRUE)) library(nnet)
+
+set.seed(3888)
+
+# ── Dataset registry ──────────────────────────────────────────────────────────
+datasets_multiclass <- c("GSE25066", "GSE45827","GSE65194")
+
+# ── PAM50 subtype dictionary ──────────────────────────────────────────────────
+subtype_variants <- list(
+  "Luminal A"   = c("luminal a","lum a","luma","lum-a","lum_a","luminala"),
+  "Luminal B"   = c("luminal b","lum b","lumb","lum-b","lum_b","luminalb"),
+  "Basal"       = c("basal","basal-like","basal like","basallike","basal_like"),
+  "HER2"        = c("her2","her2+","her-2","her2-enriched","her2enriched","her2e"),
+  "Normal-like" = c("normal-like","normal like","normallike","normal_like")
+)
+```
+
+------------------------------------------------------------------------
+
+# Stage 1 — QC & Normalisation (per dataset)
+
+> **Design principle:** normalisation is applied within each dataset *before* any merging or modelling. This ensures samples within a study are on a common scale. Cross-dataset harmonisation (ComBat) happens later, *inside* each CV fold.
+
+## Helper functions
+
+```{r helpers-qc}
+#| message: false
+#| warning: false
+
+# ── GEO loader ────────────────────────────────────────────────────────────────
+load_geo_eset <- function(gse_id) {
+  geo_cache_dir <- file.path("data", "geo-cache")
+  if (!dir.exists(geo_cache_dir)) dir.create(geo_cache_dir, recursive = TRUE)
+
+  gse_matrix_url <- function(id, host = "ftp.ncbi.nlm.nih.gov") {
+    num    <- sub("^GSE", "", id)
+    prefix <- substr(num, 1, max(1, nchar(num) - 3))
+    paste0("https://", host, "/geo/series/GSE", prefix, "nnn/", id,
+           "/matrix/", id, "_series_matrix.txt.gz")
+  }
+
+  g <- tryCatch(GEOquery::getGEO(gse_id, destdir = geo_cache_dir), error = function(e) e)
+  if (!inherits(g, "error")) {
+    if (inherits(g, "ExpressionSet")) return(g)
+    if (is.list(g) && length(g) >= 1) return(g[[1]])
+  }
+
+  destfile <- file.path(geo_cache_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+  for (host in c("ftp.ncbi.nlm.nih.gov", "download.ncbi.nlm.nih.gov")) {
+    for (attempt in 1:3) {
+      try({
+        h <- curl::new_handle(); curl::handle_setopt(h, connecttimeout=60, timeout=1800)
+        curl::curl_download(gse_matrix_url(gse_id, host), destfile, quiet=FALSE, handle=h)
+      }, silent = TRUE)
+      if (file.exists(destfile) && file.info(destfile)$size > 0) break
+      Sys.sleep(3 * attempt)
+    }
+  }
+  g2 <- GEOquery::getGEO(filename = destfile)
+  if (inherits(g2, "ExpressionSet")) return(g2)
+  if (is.list(g2) && length(g2) >= 1) return(g2[[1]])
+  stop("Could not load ExpressionSet for ", gse_id)
+}
+
+# ── Log2 transform (GEO2R heuristic) ─────────────────────────────────────────
+needs_log2 <- function(e) {
+  v <- as.numeric(e); v <- v[is.finite(v)]
+  if (length(v) < 10) return(FALSE)
+  qx <- quantile(v, c(0, 0.25, 0.5, 0.75, 0.99, 1), na.rm = TRUE)
+  (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0) ||
+    (qx[2] > 0 && qx[2] < 1 && qx[4] > 1 && qx[4] < 2)
+}
+
+safe_log2 <- function(e) {
+  pos    <- e[e > 0 & is.finite(e)]
+  pseudo <- min(pos, na.rm = TRUE) / 2
+  e2 <- e; e2[!is.finite(e2)] <- NA_real_; e2[e2 <= 0] <- pseudo
+  log2(e2)
+}
+
+# ── Within-dataset quantile normalisation ────────────────────────────────────
+quantile_normalise <- function(e) limma::normalizeBetweenArrays(e, method = "quantile")
+
+# ── Probe → gene collapse (avereps) ──────────────────────────────────────────
+collapse_probes <- function(eset) {
+  e   <- exprs(eset)
+  fd  <- fData(eset)
+  sym_col <- grep("gene\\s*symbol|^symbol$", colnames(fd), ignore.case=TRUE, value=TRUE)[1]
+  gene_sym_raw <- if (!is.na(sym_col)) as.character(fd[, sym_col]) else rep(NA_character_, nrow(fd))
+  gene_sym <- ifelse(is.na(gene_sym_raw) | trimws(gene_sym_raw) == "",
+                     rownames(e),
+                     vapply(gene_sym_raw, function(s) {
+                       s <- trimws(as.character(s))
+                       if (is.na(s) || s == "") return(NA_character_)
+                       trimws(strsplit(s, " /// ", fixed=TRUE)[[1]][1])
+                     }, character(1)))
+  gene_sym[is.na(gene_sym) | gene_sym == ""] <- rownames(e)[is.na(gene_sym) | gene_sym == ""]
+  limma::avereps(e, ID = gene_sym)
+}
+
+# ── PAM50 label inference ─────────────────────────────────────────────────────
+norm_label_txt <- function(x) {
+  x <- tolower(as.character(x)); x[is.na(x)] <- ""
+  trimws(gsub("[^a-z0-9]+", " ", x))
+}
+
+map_to_subtype <- function(x_raw) {
+  x_chr  <- as.character(x_raw)
+  x_norm <- norm_label_txt(x_chr)
+  if (x_norm == "") return(NA_character_)
+  if (grepl("pam50_class", tolower(x_chr), fixed=TRUE)) {
+    m <- regexpr("pam50_class:\\s*", x_chr, ignore.case=TRUE)
+    if (m > 0) x_norm <- norm_label_txt(substring(x_chr, m + attr(m,"match.length")))
+  }
+  for (canon in names(subtype_variants)) {
+    if (any(vapply(subtype_variants[[canon]],
+                   function(kw) grepl(kw, x_norm, fixed=TRUE), logical(1))))
+      return(canon)
+  }
+  NA_character_
+}
+
+infer_multiclass_label <- function(pMat) {
+  cols_try <- c(
+    grep("pam50",  colnames(pMat), ignore.case=TRUE, value=TRUE),
+    grep("^characteristics_ch", colnames(pMat), value=TRUE),
+    setdiff(colnames(pMat), c(
+      grep("pam50", colnames(pMat), ignore.case=TRUE, value=TRUE),
+      grep("^characteristics_ch", colnames(pMat), value=TRUE)))
+  )
+  for (cn in cols_try) {
+    lab <- vapply(as.character(pMat[[cn]]), map_to_subtype, character(1))
+    y   <- droplevels(factor(lab[!is.na(lab)]))
+    if (nlevels(y) >= 2) return(list(label = factor(lab), label_col = cn))
+  }
+  list(label = factor(rep(NA_character_, nrow(pMat))), label_col = NA_character_)
+}
+
+# ── Full per-dataset QC pipeline ──────────────────────────────────────────────
+process_dataset_qc <- function(gse_id) {
+  eset <- load_geo_eset(gse_id)
+  e    <- exprs(eset)
+
+  log2_applied <- needs_log2(e)
+  if (log2_applied) e <- safe_log2(e)
+
+  e_norm <- quantile_normalise(e)
+  exprs(eset) <- e_norm
+
+  e_gene <- collapse_probes(eset)
+  lab    <- infer_multiclass_label(pData(eset))
+
+  p              <- pData(eset)
+  p$dataset_id   <- gse_id
+  p$label_mc     <- as.character(lab$label)
+
+  list(
+    id           = gse_id,
+    e_raw        = e,          # log2-only, pre-normalisation (for QC plot)
+    e_norm       = e_gene,     # quantile-normalised + gene-collapsed
+    pMat         = p,
+    log2_applied = log2_applied,
+    label_col    = lab$label_col
+  )
+}
+```
+
+## Load and normalise each dataset
+
+```{r load-datasets}
+#| message: false
+#| warning: false
+qc_pieces <- lapply(datasets_multiclass, function(id) {
+  tryCatch(process_dataset_qc(id), error = function(e) {
+    message("Failed: ", id, " — ", conditionMessage(e)); NULL
+  })
+})
+names(qc_pieces) <- datasets_multiclass
+qc_pieces <- Filter(Negate(is.null), qc_pieces)
+
+for (id in names(qc_pieces)) {
+  p <- qc_pieces[[id]]
+  cat("\n", id, "— log2 applied:", p$log2_applied,
+      "| genes:", nrow(p$e_norm),
+      "| samples:", ncol(p$e_norm), "\n")
+  print(table(p$pMat$label_mc, useNA = "ifany"))
+}
+```
+
+## QC: Per-sample expression distributions
+
+```{r qc-boxplots, fig.cap="Per-sample expression distributions after within-dataset quantile normalisation. Boxes should be tightly aligned within each dataset."}
+#| message: false
+#| warning: false
+set.seed(3888)
+qc_box_list <- lapply(names(qc_pieces), function(id) {
+  p       <- qc_pieces[[id]]
+  n_genes <- min(1500L, nrow(p$e_norm))
+  gsamp   <- sample(rownames(p$e_norm), n_genes)
+  e_sub   <- p$e_norm[gsamp, , drop = FALSE]
+  lab_vec <- p$pMat$label_mc
+
+  data.frame(
+    expr    = as.vector(e_sub),
+    sample  = rep(seq_len(ncol(e_sub)), each = nrow(e_sub)),
+    dataset = id,
+    subtype = rep(lab_vec, each = nrow(e_sub)),
+    stringsAsFactors = FALSE
+  )
+})
+
+qc_box_df <- bind_rows(qc_box_list)
+
+# Sample median for ordering
+sample_med <- qc_box_df %>%
+  group_by(dataset, sample) %>%
+  summarise(med = median(expr, na.rm=TRUE), .groups="drop") %>%
+  arrange(dataset, med) %>%
+  group_by(dataset) %>%
+  mutate(sample_ord = row_number()) %>%
+  ungroup()
+
+qc_box_df <- qc_box_df %>%
+  left_join(sample_med %>% select(dataset, sample, sample_ord),
+            by = c("dataset","sample"))
+
+for (ds in unique(qc_box_df$dataset)) {
+  df_ds <- qc_box_df %>% filter(dataset == ds)
+  print(
+    ggplot(df_ds, aes(x = factor(sample_ord), y = expr, colour = subtype)) +
+      geom_boxplot(outlier.shape = NA, size = 0.2) +
+      theme_bw(base_size = 10) +
+      labs(x = "Sample (ordered by median)", y = "log2 expression",
+           colour = "Subtype",
+           title = paste0(ds, " — per-sample expression after quantile normalisation")) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  )
+}
+
+# Summary table
+qc_box_df %>%
+  group_by(dataset) %>%
+  summarise(n_samples  = n_distinct(sample),
+            median_expr = round(median(expr, na.rm=TRUE), 3),
+            IQR_expr    = round(IQR(expr,   na.rm=TRUE), 3),
+            q01         = round(quantile(expr, .01, na.rm=TRUE), 3),
+            q99         = round(quantile(expr, .99, na.rm=TRUE), 3),
+            .groups = "drop") %>%
+  knitr::kable(caption = "Per-dataset expression summary (post normalisation)")
+```
+
+## QC: PCA per dataset
+
+```{r qc-pca, fig.cap="PCA of each dataset after normalisation. Points coloured by PAM50 subtype. Subtypes should separate along PCs."}
+#| message: false
+#| warning: false
+for (id in names(qc_pieces)) {
+  p   <- qc_pieces[[id]]
+  ok  <- !is.na(p$pMat$label_mc) & p$pMat$label_mc != ""
+  e_s <- p$e_norm[, ok, drop=FALSE]
+  y_s <- p$pMat$label_mc[ok]
+
+  e_v <- e_s[apply(e_s, 1, var, na.rm=TRUE) > 0, ]
+  if (nrow(e_v) < 5 || ncol(e_v) < 3) { cat(id, ": skipping PCA\n"); next }
+
+  # impute NAs with row means before PCA
+  e_v[is.na(e_v)] <- rowMeans(e_v, na.rm=TRUE)[row(e_v)[is.na(e_v)]]
+
+  pca <- prcomp(t(e_v), scale.=TRUE)
+  ve  <- round(pca$sdev^2 / sum(pca$sdev^2) * 100, 1)
+
+  df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], subtype = y_s)
+  print(
+    ggplot(df, aes(PC1, PC2, colour = subtype)) +
+      geom_point(size = 2, alpha = .8) +
+      theme_bw() +
+      labs(x = paste0("PC1 (", ve[1], "%)"),
+           y = paste0("PC2 (", ve[2], "%)"),
+           colour = "Subtype",
+           title  = paste0(id, " — PCA after normalisation"))
+  )
+}
+```
+
+------------------------------------------------------------------------
+
+# Stage 2 — Model Building
+
+> **Design principle:** normalised datasets are merged by gene intersection. Batch correction (ComBat) is applied **inside** each LODO fold using training samples only, then transferred to the test fold.
+
+## Merge normalised datasets
+
+```{r merge-datasets}
+#| message: false
+#| warning: false
+
+# Keep only genes present in all datasets
+all_genes_mc <- Reduce(intersect, lapply(qc_pieces, function(p) rownames(p$e_norm)))
+cat("Shared genes across all multiclass datasets:", length(all_genes_mc), "\n")
+
+# Filter genes with >30% missing across all samples
+e_merged_mc <- do.call(cbind, lapply(qc_pieces, function(p)
+  p$e_norm[all_genes_mc, , drop=FALSE]))
+
+na_frac <- rowMeans(is.na(e_merged_mc))
+e_merged_mc <- e_merged_mc[na_frac < 0.3, , drop=FALSE]
+cat("Genes after NA filter:", nrow(e_merged_mc), "\n")
+
+p_merged_mc <- do.call(rbind, lapply(qc_pieces, function(p) {
+  data.frame(sample_id  = rownames(p$pMat),
+             dataset_id = p$id,
+             label_mc   = p$pMat$label_mc,
+             stringsAsFactors = FALSE)
+}))
+
+ok_mc <- !is.na(p_merged_mc$label_mc) & p_merged_mc$label_mc != ""
+y_mc   <- factor(p_merged_mc$label_mc[ok_mc])
+e_mc   <- e_merged_mc[, ok_mc, drop=FALSE]
+batch_mc <- p_merged_mc$dataset_id[ok_mc]
+
+cat("\nClass counts (merged):\n"); print(table(y_mc))
+cat("\nSamples per dataset:\n");  print(table(batch_mc))
+```
+
+## Modelling helper functions
+
+```{r helpers-model}
+#| message: false
+#| warning: false
+
+# ── Macro F1 ──────────────────────────────────────────────────────────────────
+macro_f1 <- function(truth, pred) {
+  truth <- factor(truth); pred <- factor(pred, levels=levels(truth))
+  lvls  <- levels(truth)
+  f1s <- vapply(lvls, function(k) {
+    tp <- sum(pred==k & truth==k, na.rm=TRUE)
+    fp <- sum(pred==k & truth!=k, na.rm=TRUE)
+    fn <- sum(pred!=k & truth==k, na.rm=TRUE)
+    p  <- if ((tp+fp)==0) NA_real_ else tp/(tp+fp)
+    r  <- if ((tp+fn)==0) NA_real_ else tp/(tp+fn)
+    if (is.na(p)||is.na(r)||(p+r)==0) NA_real_ else 2*p*r/(p+r)
+  }, numeric(1))
+  mean(f1s, na.rm=TRUE)
+}
+
+# ── Macro OvR AUC ────────────────────────────────────────────────────────────
+auc_roc_vec <- function(truth01, score) {
+  truth01 <- as.integer(truth01); score <- as.numeric(score)
+  n_pos <- sum(truth01==1); n_neg <- sum(truth01==0)
+  if (n_pos==0 || n_neg==0) return(NA_real_)
+  r <- rank(score, ties.method="average")
+  (sum(r[truth01==1]) - n_pos*(n_pos+1)/2) / (n_pos*n_neg)
+}
+
+macro_auc_ovr <- function(truth, prob_mat) {
+  lvls <- colnames(prob_mat)
+  aucs <- vapply(lvls, function(k) {
+    tk <- as.integer(as.character(truth) == k)
+    tk[is.na(tk)] <- 0L
+    n_pos <- sum(tk, na.rm=TRUE)
+    if (n_pos==0L || n_pos==length(tk)) return(NA_real_)
+    auc_roc_vec(tk, prob_mat[, k])
+  }, numeric(1))
+  mean(aucs, na.rm=TRUE)
+}
+
+# ── ComBat: fit on train, apply to test ───────────────────────────────────────
+combat_fit_apply <- function(expr_train, batch_train, mod_train,
+                              expr_test, batch_test) {
+  if (length(unique(as.character(batch_train))) < 2) {
+    message("Single batch in fold — skipping ComBat.")
+    return(list(train=expr_train, test=expr_test))
+  }
+  corrected_train <- tryCatch(
+    sva::ComBat(dat=expr_train, batch=batch_train, mod=mod_train,
+                par.prior=TRUE, mean.only=FALSE),
+    error = function(e) {
+      message("ComBat failed, falling back to removeBatchEffect: ", conditionMessage(e))
+      limma::removeBatchEffect(expr_train, batch=batch_train, design=mod_train)
+    }
+  )
+  # Apply training batch means to test
+  batch_train_f <- factor(as.character(batch_train))
+  batch_test_f  <- factor(as.character(batch_test), levels=levels(batch_train_f))
+  grand_mean    <- rowMeans(expr_train)
+  batch_means   <- sapply(levels(batch_train_f), function(b) {
+    idx <- which(batch_train_f==b)
+    if (length(idx)==0) return(rep(0, nrow(expr_train)))
+    rowMeans(expr_train[, idx, drop=FALSE])
+  })
+  corrected_test <- expr_test
+  for (b in levels(batch_train_f)) {
+    idx <- which(as.character(batch_test_f)==b)
+    if (length(idx)==0) next
+    corrected_test[, idx] <- expr_test[, idx, drop=FALSE] -
+      (batch_means[, b] - grand_mean)
+  }
+  # Novel test batches: mean-centre only
+  novel <- which(!(as.character(batch_test) %in% levels(batch_train_f)))
+  if (length(novel) > 0) {
+    smeans <- colMeans(expr_test[, novel, drop=FALSE])
+    corrected_test[, novel] <- sweep(expr_test[, novel, drop=FALSE], 2, smeans, "-") + grand_mean
+  }
+  list(train=corrected_train, test=corrected_test)
+}
+
+# ── Imputation & standardisation (fit on train, apply to test) ───────────────
+impute_fit    <- function(X) list(med=apply(X,2,function(v) {m<-median(v,na.rm=TRUE); if(is.na(m)) 0 else m}))
+impute_apply  <- function(X, fit) { X2<-X; for(j in seq_len(ncol(X2))) { idx<-is.na(X2[,j]); if(any(idx)) X2[idx,j]<-fit$med[j] }; X2 }
+std_fit       <- function(X) { mu<-colMeans(X); sd<-apply(X,2,sd); sd[sd==0]<-1; list(mu=mu,sd=sd) }
+std_apply     <- function(X, fit) sweep(sweep(X,2,fit$mu,"-"),2,fit$sd,"/")
+
+# ── OvR limma gene selection ──────────────────────────────────────────────────
+select_genes_ovr <- function(e_mat, y, n_per_class=25) {
+  ok <- !is.na(y) & y!=""; e<-e_mat[, ok, drop=FALSE]; y<-factor(y[ok])
+  lvls_s <- make.names(levels(y))
+  design  <- model.matrix(~0+y); colnames(design)<-lvls_s
+  fit     <- lmFit(e, design)
+  genes   <- character(0)
+  for (i in seq_along(levels(y))) {
+    lvl <- lvls_s[i]; others <- lvls_s[-i]
+    cont_str <- paste0(lvl," - (",paste(others,collapse="+"),")/",length(others))
+    cont <- makeContrasts(contrasts=cont_str, levels=design)
+    fit2 <- eBayes(contrasts.fit(fit, cont))
+    genes <- union(genes, rownames(topTable(fit2, n=n_per_class, sort.by="P")))
+  }
+  genes
+}
+
+# ── Stratified split helper ───────────────────────────────────────────────────
+stratified_split <- function(y, dataset, train_prop=0.75) {
+  dev_idx <- c(); test_idx <- c()
+  for (ds in unique(as.character(dataset))) {
+    for (cl in unique(as.character(y))) {
+      idx <- which(as.character(dataset)==ds & as.character(y)==cl)
+      if (length(idx)==0) next
+      idx <- sample(idx)
+      n_dev <- max(1, min(floor(length(idx)*train_prop), length(idx)-1))
+      dev_idx  <- c(dev_idx,  idx[seq_len(n_dev)])
+      test_idx <- c(test_idx, idx[(n_dev+1):length(idx)])
+    }
+  }
+  list(dev=sort(unique(dev_idx)), test=sort(unique(test_idx)))
+}
+```
+
+## LODO cross-validation
+
+```{r lodo-cv}
+#| message: false
+#| warning: false
+
+run_lodo_multiclass <- function(X, y, batch, n_per_class=25, use_weights=TRUE) {
+  y     <- factor(y)
+  batch <- as.character(batch)
+  perf_list  <- list()
+  probs_list <- list()
+
+  for (ds in unique(batch)) {
+    test_id  <- which(batch==ds)
+    train_id <- setdiff(seq_along(batch), test_id)
+
+    y_train <- droplevels(y[train_id])
+    y_test  <- factor(as.character(y[test_id]), levels=levels(y_train))
+    if (nlevels(y_train)<2) next
+
+    # Batch correction (train only → apply to test)
+    cb <- combat_fit_apply(
+      expr_train=t(X[train_id,,drop=FALSE]), batch_train=batch[train_id],
+      mod_train=model.matrix(~y_train),
+      expr_test=t(X[test_id,,drop=FALSE]),  batch_test=batch[test_id]
+    )
+    X_tr_full <- t(cb$train); X_te_full <- t(cb$test)
+
+    # Gene selection from training data only
+    genes_sel <- select_genes_ovr(t(X_tr_full), y=y_train, n_per_class=n_per_class)
+    sel_g     <- intersect(genes_sel, colnames(X_tr_full))
+    if (length(sel_g)<10) next
+
+    X_tr <- X_tr_full[, sel_g]; X_te <- X_te_full[, sel_g]
+    imp  <- impute_fit(X_tr); X_tr_i <- impute_apply(X_tr,imp); X_te_i <- impute_apply(X_te,imp)
+    sc   <- std_fit(X_tr_i);  X_tr_s <- std_apply(X_tr_i,sc);  X_te_s <- std_apply(X_te_i,sc)
+
+    lvls <- levels(y_train); n_cl <- length(lvls); n_te <- nrow(X_te_s)
+    tab_tr <- table(y_train); n_tot <- sum(tab_tr)
+    cw <- if (use_weights)
+      setNames(vapply(lvls, function(k) n_tot/(n_cl*max(1,tab_tr[k])), numeric(1)), lvls)
+    else setNames(rep(1,n_cl), lvls)
+    sw <- cw[as.character(y_train)]
+
+    y_te_chr <- as.character(y_test)
+
+    record <- function(nm, pred_chr, prob_mat) {
+      perf_list[[length(perf_list)+1]] <<- tibble::tibble(
+        fold=ds, model=nm,
+        accuracy  = mean(pred_chr==y_te_chr, na.rm=TRUE),
+        macro_f1  = macro_f1(y_te_chr, pred_chr),
+        macro_auc = macro_auc_ovr(y_te_chr, prob_mat)
+      )
+      pd <- as.data.frame(prob_mat); pd$fold<-ds; pd$model<-nm; pd$truth<-y_te_chr
+      probs_list[[length(probs_list)+1]] <<- pd
+    }
+
+    # kNN
+    pk  <- class::knn(X_tr_s, X_te_s, y_train, k=7, prob=TRUE)
+    kw  <- attr(pk,"prob"); pkc <- as.character(pk)
+    pm_knn <- matrix(0,n_te,n_cl,dimnames=list(NULL,lvls))
+    for(i in seq_len(n_te)) {
+      pm_knn[i,pkc[i]] <- kw[i]
+      oth <- setdiff(lvls,pkc[i])
+      if (length(oth)) pm_knn[i,oth] <- (1-kw[i])/length(oth)
+    }
+    record("kNN", pkc, pm_knn)
+
+    # SVM-RBF
+    svm_fit <- tryCatch(
+      e1071::svm(X_tr_s, y_train, kernel="radial", cost=1,
+                 gamma=1/ncol(X_tr_s), probability=TRUE,
+                 class.weights=if(use_weights)cw else NULL),
+      error=function(e) NULL
+    )
+    if (!is.null(svm_fit)) {
+      ps  <- predict(svm_fit, X_te_s, probability=TRUE)
+      pm  <- attr(ps,"probabilities")[,lvls,drop=FALSE]
+      record(if(use_weights)"SVM_RBF_w"else"SVM_RBF", as.character(ps), pm)
+    }
+
+    # Random Forest
+    rf_fit  <- randomForest::randomForest(X_tr_i, y_train,
+                 classwt=if(use_weights)cw else NULL)
+    pred_rf <- predict(rf_fit, X_te_i)
+    prob_rf <- predict(rf_fit, X_te_i, type="prob")[,lvls,drop=FALSE]
+    record(if(use_weights)"RF_w"else"RF", as.character(pred_rf), prob_rf)
+
+    # Multinomial Lasso
+    if (requireNamespace("glmnet", quietly=TRUE)) {
+      lf <- tryCatch(
+        glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                          alpha=1, weights=sw, standardize=FALSE,
+                          type.multinomial="grouped"),
+        error=function(e) NULL
+      )
+      if (!is.null(lf)) {
+        pr <- predict(lf, as.matrix(X_te_s), type="response", s="lambda.min")[,,1]
+        if (is.null(dim(pr))) pr <- t(as.matrix(pr))
+        pr <- pr[, intersect(lvls,colnames(pr)), drop=FALSE]
+        record(if(use_weights)"LassoMC_w"else"LassoMC", lvls[max.col(pr)], pr)
+      }
+    }
+
+    # Multinomial logistic (nnet)
+    if (requireNamespace("nnet", quietly=TRUE)) {
+      mn <- tryCatch(
+        nnet::multinom(y_train~., data=data.frame(y_train, X_tr_s),
+                       weights=sw, trace=FALSE, MaxNWts=100000),
+        error=function(e) NULL
+      )
+      if (!is.null(mn)) {
+        pm_mn <- predict(mn, newdata=data.frame(X_te_s), type="probs")
+        if (is.null(dim(pm_mn))) pm_mn <- t(as.matrix(pm_mn))
+        pm_mn <- pm_mn[, intersect(lvls,colnames(pm_mn)), drop=FALSE]
+        record(if(use_weights)"Multinom_w"else"Multinom", lvls[max.col(pm_mn)], pm_mn)
+      }
+    }
+  }
+
+  list(perf=bind_rows(perf_list), probs=bind_rows(probs_list))
+}
+
+X_mc <- t(e_mc)
+cat("Running LODO CV...\n")
+res_lodo <- run_lodo_multiclass(X_mc, y_mc, batch_mc, n_per_class=25, use_weights=TRUE)
+cat("Models evaluated:", paste(unique(res_lodo$perf$model), collapse=", "), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Stage 3 — Results
+
+## Model scorecard
+
+```{r scorecard}
+#| message: false
+#| warning: false
+scorecard <- res_lodo$perf %>%
+  group_by(model) %>%
+  summarise(
+    macro_auc_mean = mean(macro_auc, na.rm=TRUE),
+    macro_auc_sd   = sd(macro_auc,   na.rm=TRUE),
+    macro_f1_mean  = mean(macro_f1,  na.rm=TRUE),
+    macro_f1_sd    = sd(macro_f1,    na.rm=TRUE),
+    accuracy_mean  = mean(accuracy,  na.rm=TRUE),
+    accuracy_sd    = sd(accuracy,    na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  arrange(desc(macro_auc_mean), desc(macro_f1_mean)) %>%
+  mutate(
+    rank      = row_number(),
+    macro_auc = sprintf("%.3f ± %.3f", macro_auc_mean, macro_auc_sd),
+    macro_f1  = sprintf("%.3f ± %.3f", macro_f1_mean,  macro_f1_sd),
+    accuracy  = sprintf("%.3f ± %.3f", accuracy_mean,  accuracy_sd)
+  ) %>%
+  select(rank, model, macro_auc, macro_f1, accuracy)
+
+knitr::kable(scorecard,
+  caption="Model scorecard — LODO CV (ranked by macro OvR AUC → macro F1 → accuracy)")
+
+best_model_mc <- res_lodo$perf %>%
+  group_by(model) %>%
+  summarise(m=mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(m)) %>% slice(1) %>% pull(model)
+cat("\nBest single model:", best_model_mc, "\n")
+```
+
+## Performance plots
+
+```{r perf-plots, fig.cap="LODO CV performance across models. Higher is better for all three metrics."}
+#| message: false
+#| warning: false
+res_lodo$perf %>%
+  pivot_longer(cols=c(macro_auc, macro_f1, accuracy),
+               names_to="metric", values_to="value") %>%
+  mutate(metric = recode(metric,
+    macro_auc = "Macro OvR AUC",
+    macro_f1  = "Macro F1",
+    accuracy  = "Accuracy")) %>%
+  ggplot(aes(x=reorder(model, value, median), y=value, fill=model)) +
+  geom_boxplot(alpha=0.75, outlier.size=0.8) +
+  facet_wrap(~metric, scales="free_y") +
+  coord_flip() +
+  theme_bw() +
+  labs(x=NULL, y=NULL, title="LODO CV: model comparison") +
+  theme(legend.position="none")
+```
+
+## Confusion matrix (best model)
+
+```{r confusion-best}
+#| message: false
+#| warning: false
+preds_best <- res_lodo$probs %>%
+  filter(model==best_model_mc) %>%
+  mutate(pred = {
+    prob_cols <- setdiff(colnames(.), c("fold","model","truth"))
+    lvls_here <- prob_cols[prob_cols %in% levels(y_mc)]
+    lvls_here[max.col(.[ , lvls_here, drop=FALSE])]
+  })
+
+tab_best <- table(truth=preds_best$truth, pred=preds_best$pred)
+as.data.frame(tab_best) %>%
+  ggplot(aes(x=pred, y=truth, fill=Freq)) +
+  geom_tile(colour="white") +
+  geom_text(aes(label=Freq), size=4) +
+  scale_fill_gradient(low="white", high="#2C7FB8") +
+  theme_bw() +
+  labs(x="Predicted", y="True",
+       title=paste0("Confusion matrix — ", best_model_mc, " (pooled LODO)")) +
+  theme(axis.text.x=element_text(angle=40, hjust=1))
+```
+
+------------------------------------------------------------------------
+
+# Single model vs Ensemble — is it worth it?
+
+```{r ensemble-eval}
+#| message: false
+#| warning: false
+
+# ── Dev / hold-out split ──────────────────────────────────────────────────────
+split_mc <- stratified_split(y_mc, batch_mc, train_prop=0.75)
+dev_idx  <- split_mc$dev; hold_idx <- split_mc$test
+
+X_dev  <- X_mc[dev_idx,,drop=FALSE]; y_dev  <- y_mc[dev_idx]; batch_dev  <- batch_mc[dev_idx]
+X_hold <- X_mc[hold_idx,,drop=FALSE]; y_hold <- y_mc[hold_idx]; batch_hold <- batch_mc[hold_idx]
+cat("Dev:", nrow(X_dev), " Hold-out:", nrow(X_hold), "\n")
+
+# LODO on dev to rank models
+res_dev <- run_lodo_multiclass(X_dev, y_dev, batch_dev, n_per_class=25)
+
+dev_rank <- res_dev$perf %>%
+  group_by(model) %>%
+  summarise(mean_auc=mean(macro_auc,na.rm=TRUE),
+            mean_f1 =mean(macro_f1, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(mean_auc)) %>% mutate(dev_rank=row_number())
+
+# ── Fit on full dev, predict hold-out ─────────────────────────────────────────
+fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
+                        n_per_class=25, use_weights=TRUE) {
+  y_tr  <- factor(y_tr); lvls <- levels(y_tr); n_cl <- length(lvls)
+  cb    <- combat_fit_apply(t(X_tr), batch_tr, model.matrix(~y_tr), t(X_te), batch_te)
+  X_trc <- t(cb$train); X_tec <- t(cb$test)
+  gs    <- intersect(select_genes_ovr(t(X_trc), y=y_tr, n_per_class=n_per_class), colnames(X_trc))
+  if (length(gs)<10) return(NULL)
+  X_t2 <- X_trc[,gs]; X_e2 <- X_tec[,gs]
+  imp  <- impute_fit(X_t2); X_ti <- impute_apply(X_t2,imp); X_ei <- impute_apply(X_e2,imp)
+  sc   <- std_fit(X_ti);   X_ts <- std_apply(X_ti,sc);    X_es <- std_apply(X_ei,sc)
+  tab_tr <- table(y_tr); n_tot <- sum(tab_tr); n_te <- nrow(X_es)
+  cw <- if(use_weights) setNames(vapply(lvls,function(k) n_tot/(n_cl*max(1,tab_tr[k])),numeric(1)),lvls) else setNames(rep(1,n_cl),lvls)
+  sw <- cw[as.character(y_tr)]
+  out <- list()
+
+  pk <- class::knn(X_ts,X_es,y_tr,k=7,prob=TRUE)
+  kw <- attr(pk,"prob"); pkc <- as.character(pk)
+  pm_k <- matrix(0,n_te,n_cl,dimnames=list(NULL,lvls))
+  for(i in seq_len(n_te)){pm_k[i,pkc[i]]<-kw[i]; oth<-setdiff(lvls,pkc[i]); if(length(oth))pm_k[i,oth]<-(1-kw[i])/length(oth)}
+  out[["kNN"]] <- pm_k
+
+  rf2 <- randomForest::randomForest(X_ti,y_tr,classwt=if(use_weights)cw else NULL)
+  out[[if(use_weights)"RF_w"else"RF"]] <- predict(rf2,X_ei,type="prob")[,lvls,drop=FALSE]
+
+  if(requireNamespace("glmnet",quietly=TRUE)){
+    lf <- tryCatch(glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw,standardize=FALSE,type.multinomial="grouped"),error=function(e)NULL)
+    if(!is.null(lf)){pr<-predict(lf,as.matrix(X_es),type="response",s="lambda.min")[,,1]; if(is.null(dim(pr)))pr<-t(as.matrix(pr)); out[[if(use_weights)"LassoMC_w"else"LassoMC"]]<-pr[,intersect(lvls,colnames(pr)),drop=FALSE]}
+  }
+  if(requireNamespace("nnet",quietly=TRUE)){
+    mn <- tryCatch(nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw,trace=FALSE,MaxNWts=100000),error=function(e)NULL)
+    if(!is.null(mn)){pm_mn<-predict(mn,newdata=data.frame(X_es),type="probs"); if(is.null(dim(pm_mn)))pm_mn<-t(as.matrix(pm_mn)); out[[if(use_weights)"Multinom_w"else"Multinom"]]<-pm_mn[,intersect(lvls,colnames(pm_mn)),drop=FALSE]}
+  }
+  out
+}
+
+hold_probs <- fit_once_mc(X_dev, y_dev, batch_dev, X_hold, batch_hold)
+
+if (!is.null(hold_probs)) {
+  lvls_hold <- levels(y_dev)
+
+  # Single model metrics on hold-out
+  single_hold <- bind_rows(lapply(names(hold_probs), function(nm) {
+    pm       <- hold_probs[[nm]]
+    lv       <- intersect(lvls_hold, colnames(pm))
+    pred_chr <- lv[max.col(pm[,lv,drop=FALSE])]
+    tibble::tibble(
+      type      = "Single model",
+      id        = nm,
+      accuracy  = mean(pred_chr==as.character(y_hold), na.rm=TRUE),
+      macro_f1  = macro_f1(as.character(y_hold), pred_chr),
+      macro_auc = macro_auc_ovr(as.character(y_hold), pm[,lv,drop=FALSE])
+    )
+  })) %>% arrange(desc(macro_auc))
+
+  # Ensemble metrics (top-k equal-weight averaging)
+  ens_hold <- bind_rows(lapply(c(2,3,4), function(k) {
+    sel_mods <- dev_rank %>% slice_head(n=k) %>% pull(model)
+    sel_mods <- intersect(sel_mods, names(hold_probs))
+    if (length(sel_mods)<2) return(NULL)
+    avg_pm   <- Reduce("+", lapply(sel_mods, function(nm) {
+      pm <- hold_probs[[nm]]; pm[,intersect(lvls_hold,colnames(pm)),drop=FALSE]
+    })) / length(sel_mods)
+    pred_chr <- colnames(avg_pm)[max.col(avg_pm)]
+    tibble::tibble(
+      type      = paste0("Ensemble (top-", k, ")"),
+      id        = paste(sel_mods, collapse=" + "),
+      accuracy  = mean(pred_chr==as.character(y_hold), na.rm=TRUE),
+      macro_f1  = macro_f1(as.character(y_hold), pred_chr),
+      macro_auc = macro_auc_ovr(as.character(y_hold), avg_pm)
+    )
+  })) %>% arrange(desc(macro_auc))
+
+  comparison_tbl <- bind_rows(single_hold, ens_hold) %>%
+    mutate(across(c(macro_auc, macro_f1, accuracy), round, 3))
+
+  knitr::kable(comparison_tbl,
+    caption="Hold-out: single model vs ensemble (equal-weight probability averaging)")
+
+  # ── Visual comparison ─────────────────────────────────────────────────────
+  comparison_tbl %>%
+    pivot_longer(cols=c(macro_auc, macro_f1, accuracy),
+                 names_to="metric", values_to="value") %>%
+    mutate(metric=recode(metric,
+      macro_auc="Macro OvR AUC", macro_f1="Macro F1", accuracy="Accuracy")) %>%
+    ggplot(aes(x=reorder(id, value), y=value, fill=type)) +
+    geom_col(alpha=0.85) +
+    geom_text(aes(label=round(value,3)), hjust=-0.1, size=3) +
+    facet_wrap(~metric, scales="free_x") +
+    coord_flip() +
+    theme_bw() +
+    labs(x=NULL, y=NULL, fill=NULL,
+         title="Single model vs ensemble — hold-out performance",
+         subtitle="Is the extra complexity of an ensemble justified?") +
+    theme(legend.position="bottom")
+}
+```
+
+------------------------------------------------------------------------
+
+# Uncertainty Quantification
+
+> **Two complementary uncertainty signals:**
+>
+> 1.  **Model disagreement** — when ensemble members assign very different probabilities to the same sample, gene expression alone may not be sufficient to make a confident call.
+>
+> 2.  **Bootstrap confidence intervals** — resampling the hold-out set 500 times gives a distribution over macro AUC and per-sample risk scores, quantifying how stable the estimates are.
+
+## Model disagreement per sample
+
+```{r uncertainty-disagreement, fig.cap="Model disagreement (SD of predicted subtype probability across ensemble members). High disagreement = low confidence in the call."}
+#| message: false
+#| warning: false
+if (!is.null(hold_probs) && length(hold_probs) >= 2) {
+  lvls_u <- lvls_hold
+  sel_mods_u <- dev_rank %>% slice_head(n=min(4,nrow(dev_rank))) %>%
+    pull(model) %>% intersect(names(hold_probs))
+
+  # For each sample × subtype, collect probabilities across models
+  prob_stack <- array(NA_real_, dim=c(nrow(X_hold), length(lvls_u), length(sel_mods_u)),
+                      dimnames=list(NULL, lvls_u, sel_mods_u))
+  for (nm in sel_mods_u) {
+    pm <- hold_probs[[nm]]; lv <- intersect(lvls_u, colnames(pm))
+    prob_stack[, lv, nm] <- pm[, lv]
+  }
+
+  # Predicted class = argmax of ensemble average
+  avg_stack <- apply(prob_stack, c(1,2), mean, na.rm=TRUE)
+  pred_class <- lvls_u[max.col(avg_stack)]
+
+  # Disagreement = SD of predicted-class probability across models
+  pred_class_idx <- match(pred_class, lvls_u)
+  disagreement <- vapply(seq_len(nrow(X_hold)), function(i) {
+    probs_for_pred <- prob_stack[i, pred_class_idx[i], ]
+    sd(probs_for_pred, na.rm=TRUE)
+  }, numeric(1))
+
+  # Entropy of ensemble mean (overall uncertainty)
+  entropy <- apply(avg_stack, 1, function(p) {
+    p <- p[p > 0]; -sum(p * log(p))
+  })
+
+  uncertainty_df <- tibble::tibble(
+    sample_idx    = seq_len(nrow(X_hold)),
+    true_subtype  = as.character(y_hold),
+    pred_subtype  = pred_class,
+    correct       = pred_class == as.character(y_hold),
+    confidence    = apply(avg_stack, 1, max),
+    disagreement  = disagreement,
+    entropy       = entropy
+  )
+
+  # Plot: confidence vs disagreement
+  p1 <- ggplot(uncertainty_df, aes(x=confidence, y=disagreement, colour=correct)) +
+    geom_point(alpha=0.75, size=2) +
+    scale_colour_manual(values=c("TRUE"="#41AB5D","FALSE"="#D7191C"),
+                        labels=c("TRUE"="Correct","FALSE"="Incorrect")) +
+    theme_bw() +
+    labs(x="Ensemble confidence (max P)", y="Model disagreement (SD of P)",
+         colour=NULL,
+         title="Confidence vs model disagreement",
+         subtitle="Top-right = high confidence but models disagree (flag for review)")
+
+  # Plot: disagreement by true subtype
+  p2 <- ggplot(uncertainty_df, aes(x=true_subtype, y=disagreement, fill=true_subtype)) +
+    geom_boxplot(alpha=0.75, outlier.size=0.8) +
+    theme_bw() +
+    labs(x="True subtype", y="Model disagreement (SD)",
+         title="Which subtypes are hardest to predict consistently?") +
+    theme(legend.position="none",
+          axis.text.x=element_text(angle=30, hjust=1))
+
+  print(p1); print(p2)
+
+  cat("\nHigh-uncertainty samples (disagreement > 75th percentile):\n")
+  threshold_u <- quantile(uncertainty_df$disagreement, 0.75, na.rm=TRUE)
+  knitr::kable(
+    uncertainty_df %>%
+      filter(disagreement > threshold_u) %>%
+      arrange(desc(disagreement)) %>%
+      mutate(across(c(confidence, disagreement, entropy), round, 3)) %>%
+      head(15),
+    caption="High-uncertainty samples — models disagree most on these"
+  )
+}
+```
+
+## Per-patient bootstrap CI on subtype probabilities
+
+> For each bootstrap iteration we: **(1)** resample the dev (training) set with replacement, **(2)** refit the best model (Multinomial Lasso) on that resample, **(3)** predict subtype probabilities on the **fixed** hold-out patients. The spread of B predictions per patient is the CI on that patient's risk score.
+
+```{r bootstrap-ci}
+#| message: false
+#| warning: false
+set.seed(3888)
+B_boot_mc <- 200
+
+run_bootstrap_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
+                              B = 200, n_per_class = 25) {
+  y_tr  <- factor(y_tr)
+  lvls  <- levels(y_tr)
+  n_cl  <- length(lvls)
+  n_te  <- nrow(X_te)
+
+  # Batch-correct full training set once
+  cb <- combat_fit_apply(t(X_tr), batch_tr, model.matrix(~y_tr), t(X_te), batch_te)
+  X_trc <- t(cb$train); X_tec <- t(cb$test)
+
+  # Gene selection on full corrected training set
+  gs <- tryCatch({
+    sel <- select_genes_ovr(t(X_trc), y=y_tr, n_per_class=n_per_class)
+    intersect(sel, colnames(X_trc))
+  }, error=function(e) character(0))
+  if (length(gs) < 10) { message("Too few genes for bootstrap"); return(NULL) }
+
+  X_t2 <- X_trc[,gs]; X_e2 <- X_tec[,gs]
+  imp  <- impute_fit(X_t2)
+  X_ti <- impute_apply(X_t2,imp); X_ei <- impute_apply(X_e2,imp)
+  sc   <- std_fit(X_ti)
+  X_ts <- std_apply(X_ti,sc);    X_es <- std_apply(X_ei,sc)
+
+  n_tr <- nrow(X_ts)
+  tab_tr <- table(y_tr); n_tot <- sum(tab_tr)
+  cw <- setNames(vapply(lvls,function(k) n_tot/(n_cl*max(1,tab_tr[k])),numeric(1)),lvls)
+  sw_full <- cw[as.character(y_tr)]
+
+  # Find best lambda ONCE on full training set — reuse in every bootstrap iteration
+  # This avoids 10-fold inner CV per iteration (~10x speedup)
+  cv_once <- tryCatch(
+    glmnet::cv.glmnet(as.matrix(X_ts), y_tr, family="multinomial",
+                      alpha=1, weights=sw_full, standardize=FALSE,
+                      type.multinomial="grouped"),
+    error=function(e) NULL
+  )
+  if (is.null(cv_once)) { message("cv.glmnet setup failed"); return(NULL) }
+  lambda_fixed_mc <- cv_once$lambda.min
+  cat(sprintf("  Fixed lambda: %.5f\n", lambda_fixed_mc))
+
+  # Boot array: samples × subtypes × iterations
+  boot_arr <- array(NA_real_, dim=c(n_te, n_cl, B),
+                    dimnames=list(NULL, lvls, NULL))
+
+  for (b in seq_len(B)) {
+    idx_b  <- sample(n_tr, n_tr, replace=TRUE)
+    y_b    <- droplevels(y_tr[idx_b])
+    X_b    <- X_ts[idx_b,,drop=FALSE]
+    if (nlevels(y_b) < 2) next
+
+    tab_b <- table(y_b); n_tot_b <- sum(tab_b)
+    lvls_b <- levels(y_b)
+    sw_b   <- setNames(vapply(lvls_b,function(k) n_tot_b/(length(lvls_b)*max(1,tab_b[k])),
+                              numeric(1)), lvls_b)[as.character(y_b)]
+
+    # Plain glmnet with fixed lambda — no inner CV per iteration
+    lf <- tryCatch(
+      glmnet::glmnet(as.matrix(X_b), y_b, family="multinomial",
+                     alpha=1, weights=sw_b, standardize=FALSE,
+                     lambda=lambda_fixed_mc,
+                     type.multinomial="grouped"),
+      error=function(e) NULL
+    )
+    if (is.null(lf)) next
+
+    pr <- predict(lf, as.matrix(X_es), type="response",
+                  s=lambda_fixed_mc)[,,1]
+    if (is.null(dim(pr))) pr <- t(as.matrix(pr))
+    lv_common <- intersect(lvls, colnames(pr))
+    boot_arr[, lv_common, b] <- pr[, lv_common]
+  }
+
+  boot_arr
+}
+
+cat("Running", B_boot_mc, "bootstrap iterations (Multinomial Lasso refit)...
+")
+boot_arr_mc <- run_bootstrap_mc(
+  X_dev, y_dev, batch_dev, X_hold, batch_hold,
+  B=B_boot_mc, n_per_class=25
+)
+
+if (!is.null(boot_arr_mc)) {
+  lvls_b <- dimnames(boot_arr_mc)[[2]]
+
+  # Per-patient, per-subtype: mean and 95% CI across B iterations
+  prob_mean <- apply(boot_arr_mc, c(1,2), mean, na.rm=TRUE)
+  prob_lo   <- apply(boot_arr_mc, c(1,2), quantile, 0.025, na.rm=TRUE)
+  prob_hi   <- apply(boot_arr_mc, c(1,2), quantile, 0.975, na.rm=TRUE)
+  ci_width  <- prob_hi - prob_lo
+
+  # Predicted subtype = argmax of mean probability
+  pred_subtype_boot <- lvls_b[max.col(prob_mean)]
+  confidence_boot   <- apply(prob_mean, 1, max)
+  ci_of_pred        <- vapply(seq_len(nrow(prob_mean)), function(i)
+    ci_width[i, pred_subtype_boot[i]], numeric(1))
+
+  boot_risk_mc <- tibble::tibble(
+    sample_id      = seq_len(nrow(X_hold)),
+    true_subtype   = as.character(y_hold),
+    pred_subtype   = pred_subtype_boot,
+    correct        = pred_subtype_boot == as.character(y_hold),
+    confidence     = round(confidence_boot, 3),
+    ci_width_pred  = round(ci_of_pred, 3),
+    uncertainty_band = case_when(
+      ci_of_pred <= 0.10 ~ "Narrow (confident)",
+      ci_of_pred <= 0.20 ~ "Moderate",
+      TRUE               ~ "Wide (uncertain — review)"
+    )
+  )
+
+  # Add per-subtype probability + CI columns
+  for (k in lvls_b) {
+    boot_risk_mc[[paste0("P_", k)]]      <- round(prob_mean[, k], 3)
+    boot_risk_mc[[paste0("CI_lo_", k)]]  <- round(prob_lo[,  k], 3)
+    boot_risk_mc[[paste0("CI_hi_", k)]]  <- round(prob_hi[,  k], 3)
+  }
+
+  cat("
+Uncertainty band distribution:
+")
+  print(table(boot_risk_mc$uncertainty_band))
+  cat("
+Accuracy (bootstrap mean prediction):",
+      round(mean(boot_risk_mc$correct, na.rm=TRUE), 3), "
+")
+
+  knitr::kable(
+    boot_risk_mc %>%
+      arrange(desc(confidence)) %>%
+      select(sample_id, true_subtype, pred_subtype, correct,
+             confidence, ci_width_pred, uncertainty_band) %>%
+      head(20),
+    caption=paste0("Per-patient PAM50 predictions with bootstrap 95% CI (B=",
+                   B_boot_mc, " Lasso refits). Wide CI = uncertain.")
+  )
+
+  # ── Forest plot: top 40 most confident patients ──
+  boot_risk_mc %>%
+    arrange(desc(confidence)) %>%
+    slice_head(n=40) %>%
+    mutate(sample_id=factor(sample_id, levels=rev(sample_id))) %>%
+    ggplot(aes(x=confidence, y=sample_id, colour=correct)) +
+    geom_errorbarh(aes(xmin=confidence - ci_width_pred/2,
+                       xmax=confidence + ci_width_pred/2),
+                   height=0.4, alpha=0.6) +
+    geom_point(size=2) +
+    scale_colour_manual(values=c("TRUE"="#41AB5D","FALSE"="#D7191C"),
+                        labels=c("TRUE"="Correct","FALSE"="Incorrect")) +
+    theme_bw(base_size=9) +
+    labs(x="Predicted subtype confidence  [point = mean, bar = 95% CI]",
+         y="Hold-out patient",
+         colour=NULL,
+         title=paste0("Per-patient subtype confidence with bootstrap uncertainty (B=",B_boot_mc,")"),
+         subtitle="Wide bars = model uncertain. Dashed = 0.5 threshold.") +
+    geom_vline(xintercept=0.5, linetype=2, colour="grey50") +
+    theme(axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+          legend.position="bottom")
+
+  # ── CI width by true subtype ──
+  ggplot(boot_risk_mc, aes(x=true_subtype, y=ci_width_pred, fill=true_subtype)) +
+    geom_violin(alpha=0.7, trim=FALSE) +
+    geom_boxplot(width=0.15, fill="white", outlier.size=0.8) +
+    theme_bw() +
+    labs(x="True subtype", y="Bootstrap 95% CI width on predicted subtype",
+         title="Which subtypes are hardest to predict with confidence?",
+         subtitle="Wider CI = model less certain across training resamples") +
+    theme(legend.position="none",
+          axis.text.x=element_text(angle=30, hjust=1))
+
+  cat(sprintf("\nMedian CI width: %.3f  |  Mean CI width: %.3f\n",
+    median(boot_risk_mc$ci_width_pred, na.rm=TRUE),
+    mean(boot_risk_mc$ci_width_pred, na.rm=TRUE)))
+} else {
+  cat("Bootstrap could not run.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+# PAM50 Subtype Risk Calculator
+
+```{r risk-calculator}
+#| message: false
+#| warning: false
+if (!is.null(hold_probs) && exists("uncertainty_df")) {
+  risk_df <- uncertainty_df %>%
+    bind_cols(as.data.frame(avg_stack)) %>%
+    mutate(
+      risk_band = case_when(
+        confidence >= 0.70 & disagreement <= quantile(disagreement, 0.25, na.rm=TRUE) ~ "High confidence",
+        confidence >= 0.50 ~ "Moderate confidence",
+        TRUE ~ "Low confidence — review recommended"
+      )
+    ) %>%
+    select(sample_idx, true_subtype, pred_subtype, correct,
+           confidence, disagreement,
+           any_of("boot_ci_width"),  # populated later by bootstrap section
+           entropy, risk_band,
+           all_of(lvls_hold))
+
+  cat("\nRisk band distribution:\n")
+  print(table(risk_df$risk_band))
+
+  knitr::kable(
+    risk_df %>%
+      arrange(desc(confidence)) %>%
+      mutate(across(all_of(lvls_hold), ~paste0(round(.x * 100, 1), "%")),
+       confidence    = paste0(round(confidence * 100, 1), "%"),
+       across(any_of("boot_ci_width"), ~paste0(round(.x * 100, 1), "%")),
+       across(c(disagreement, entropy), round, 3)) %>%
+      head(20),
+    caption="PAM50 subtype risk calculator — top 20 most confident predictions"
+  )
+
+  # Distribution of confidence by predicted subtype
+  ggplot(risk_df, aes(x=pred_subtype, y=confidence, fill=pred_subtype)) +
+    geom_violin(alpha=0.7, trim=FALSE) +
+    geom_boxplot(width=0.15, fill="white", outlier.size=0.8) +
+    theme_bw() +
+    labs(x="Predicted subtype", y="Confidence (max P)",
+         title="Prediction confidence by PAM50 subtype") +
+    theme(legend.position="none",
+          axis.text.x=element_text(angle=30, hjust=1))
+
+  # Stacked probability bars (top 30 samples sorted by confidence)
+  risk_df %>%
+    arrange(desc(confidence)) %>%
+    slice_head(n=30) %>%
+    mutate(sample_idx=factor(sample_idx, levels=sample_idx)) %>%
+    pivot_longer(cols=all_of(lvls_hold), names_to="subtype", values_to="prob") %>%
+    ggplot(aes(x=sample_idx, y=prob, fill=subtype)) +
+    geom_col(width=0.9) +
+    theme_bw(base_size=9) +
+    labs(x="Sample (top 30 by confidence)", y="P(subtype)", fill="Subtype",
+         title="Predicted subtype probability profiles — top 30 most confident") +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+}
+```
+
+## Summary for clinical interpretation
+
+```{r summary-table}
+#| message: false
+#| warning: false
+if (exists("risk_df")) {
+  cat("=== CLASSIFIER SUMMARY ===\n\n")
+  cat("Best single model (LODO CV):", best_model_mc, "\n")
+
+  best_ens_k <- ens_hold %>% arrange(desc(macro_auc)) %>% slice(1)
+  cat("Best ensemble:", best_ens_k$id, "\n")
+  cat(sprintf("  High-confidence predictions: %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "High confidence"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "High confidence", na.rm=TRUE)))
+  cat(sprintf("  Moderate-confidence:         %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "Moderate confidence"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "Moderate confidence", na.rm=TRUE)))
+  cat(sprintf("  Low-confidence (review):     %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "Low confidence — review recommended"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "Low confidence — review recommended", na.rm=TRUE)))
+  cat(sprintf("\n  Median predicted confidence: %.1f%%\n",
+              median(as.numeric(gsub("%","",risk_df$confidence)), na.rm=TRUE)*100))
+
+  if (exists("boot_arr_mc") && !is.null(boot_arr_mc)) {
+    cat(sprintf("  Bootstrap 95%% CI (median ci_width): %.1f%%\n",
+                median(boot_risk_mc$ci_width_pred, na.rm=TRUE)*100))
+  }
+
+  cat(sprintf("\nHigh-confidence predictions (≥0.70, low disagreement): %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band=="High confidence"),
+              nrow(risk_df),
+              100*mean(risk_df$risk_band=="High confidence", na.rm=TRUE)))
+}
+```
