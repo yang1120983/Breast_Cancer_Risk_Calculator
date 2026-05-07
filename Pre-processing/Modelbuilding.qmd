@@ -85,7 +85,7 @@ table(y)
 # =========================================================
 # Step 3: LODO with fold-specific limma feature selection
 # =========================================================
-
+library(sva)
 library(limma)
 
 top_n <- 50
@@ -101,8 +101,25 @@ for (test_ds in dataset_list) {
   
   expr_train <- expr[, train_idx, drop = FALSE]
   meta_train <- meta[train_idx, ]
+  # -----------------------------
+  # Batch correction on TRAIN fold only
+  # -----------------------------
+  batch_train <- factor(meta_train$dataset)
   
-  group <- factor(meta_train$Status, levels = c("Normal", "Cancer"))
+group <- factor(y[train_idx], levels = c("Normal", "Cancer"))
+
+
+  mod <- model.matrix(~ group)
+  
+  expr_train <- ComBat(
+    dat = as.matrix(expr_train),
+    batch = batch_train,
+    mod = mod,
+    par.prior = TRUE
+  )
+  
+  
+  
   design <- model.matrix(~ group)
   
   fit <- lmFit(expr_train, design)
@@ -131,6 +148,7 @@ library(glmnet)
 library(randomForest)
 library(e1071)
 library(class)
+library(sva)
 
 model_cols <- c(
   "Ridge", "RF", "SVM_LINEAR", "Logistic", "ElasticNet",
@@ -654,6 +672,26 @@ ggplot(att_long, aes(
 ```
 ```{r}
 library(limma)
+library(sva)
+
+
+# batch variable: 
+batch <- factor(meta$dataset)
+
+# biological label
+group <- factor(meta$Status, levels = c("Normal", "Cancer"))
+
+# model matrix
+mod <- model.matrix(~ group)
+
+# batch correction on TRAINING DATA ONLY
+expr <- ComBat(
+  dat = as.matrix(expr),
+  batch = batch,
+  mod = mod,
+  par.prior = TRUE
+)
+
 # FINAL GENE SELECTION
 top_n <- 50
 
@@ -816,6 +854,13 @@ colnames(external_weights) <- attention_model$selected_models
 head(external_risk_score)
 colMeans(external_weights)
 # 4. Evaluate performance
+eps <- 1e-6
+
+external_logit_score <- qlogis(
+  pmin(pmax(external_risk_score, eps), 1 - eps)
+)
+
+summary(external_logit_score)
 
 roc_obj <- roc(
   response = y_external,
@@ -862,7 +907,7 @@ plot(
 # 6. Risk score distribution plot
 
 plot_df <- data.frame(
-  risk_score = external_risk_score,
+  risk_score = external_logit_score,
   truth = y_external
 )
 
@@ -873,6 +918,19 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
     title = "External Test Risk Score Distribution: GSE42568",
     x = "Predicted cancer risk score",
     y = "Density",
+    fill = "True label"
+  )
+ggplot(plot_df, aes(x = risk_score, fill = truth)) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.5,
+    position = "identity"
+  ) +
+  theme_minimal(base_size = 15) +
+  labs(
+    title = "External Test Risk Score Distribution: GSE42568",
+    x = "Predicted risk score",
+    y = "Count",
     fill = "True label"
   )
 ```
@@ -895,6 +953,13 @@ ridge_pred <- as.numeric(
 
 head(ridge_pred)
 summary(ridge_pred)
+eps <- 1e-6
+
+ridge_logit_score <- qlogis(
+  pmin(pmax(ridge_pred, eps), 1 - eps)
+)
+
+summary(ridge_logit_score)
 library(pROC)
 
 roc_obj <- roc(
@@ -932,7 +997,7 @@ ridge_results
 library(ggplot2)
 
 plot_df <- data.frame(
-  risk_score = ridge_pred,
+  risk_score = ridge_logit_score,
   truth = y_external
 )
 
@@ -943,6 +1008,19 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
     title = "Ridge Risk Score Distribution (External Test)",
     x = "Predicted risk score",
     y = "Density",
+    fill = "True label"
+  )
+ggplot(plot_df, aes(x = risk_score, fill = truth)) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.5,
+    position = "identity"
+  ) +
+  theme_minimal(base_size = 15) +
+  labs(
+    title = "Ridge Risk Score Distribution (External Test)",
+    x = "Predicted risk score",
+    y = "Count",
     fill = "True label"
   )
 ```
@@ -1120,7 +1198,7 @@ main_risk <- external_risk_score[sample_idx]
 
 boot_risks <- bootstrap_scores[sample_idx, ]
 
-ci_low <- quantile(boot_risks, 0.025, na.rm = TRUE)
+ci_low <- quantile(boot_risks, 0.25, na.rm = TRUE)
 ci_high <- quantile(boot_risks, 0.975, na.rm = TRUE)
 
 main_risk
