@@ -1,0 +1,71 @@
+---
+title: "Breast Cancer Risk Report"
+author: "Zerek Lee"
+date: "`r Sys.Date()`"
+output: pdf_document
+params:
+  patient_id: NULL
+  risk_score: NULL
+  risk_category: NULL
+  ci_low: NULL
+  ci_high: NULL
+  rf: NULL
+  ridge: NULL
+  nb: NULL
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Patient Information
+
+**Patient ID:** `r params$patient_id`
+
+---
+
+# Main Risk Result
+
+## Risk Score
+
+`r params$risk_score`
+
+## Risk Category
+
+`r params$risk_category`
+
+## 95% Confidence Interval
+
+`r params$ci_low` — `r params$ci_high`
+
+---
+
+# Base Model Predictions
+
+| Model | Output |
+|---|---|
+| Random Forest | `r params$rf` |
+| Ridge Regression | `r params$ridge` |
+| Naive Bayes | `r params$nb` |
+
+---
+
+# Clinical Interpretation
+
+```{r clinical_interpretation}
+if (params$risk_category == "High Risk") {
+  cat("The gene expression profile indicates a high predicted risk.")
+} else if (params$risk_category == "Medium Risk") {
+  cat("The gene expression profile indicates an intermediate predicted risk.")
+} else {
+  cat("The gene expression profile indicates a low predicted risk.")
+}
+```
+
+---
+
+# Important Notice
+
+This report is generated from a prototype clinical decision-support dashboard.
+
+Clinical interpretation should always be combined with professional medical judgement.
