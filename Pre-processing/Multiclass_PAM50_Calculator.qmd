@@ -29,7 +29,11 @@ library(e1071)
 library(randomForest)
 library(sva)
 library(glmnet)
-if (requireNamespace("nnet", quietly = TRUE)) library(nnet)
+if (requireNamespace("nnet",    quietly = TRUE)) library(nnet)
+if (requireNamespace("MASS",    quietly = TRUE)) library(MASS)      # LDA
+select <- dplyr::select   # prevent MASS from masking dplyr::select
+filter <- dplyr::filter   # prevent MASS from masking dplyr::filter
+if (requireNamespace("xgboost", quietly = TRUE)) library(xgboost)   # XGBoost
 
 set.seed(3888)
 
@@ -600,7 +604,7 @@ std_fit       <- function(X) { mu<-colMeans(X); sd<-apply(X,2,sd); sd[sd==0]<-1;
 std_apply     <- function(X, fit) sweep(sweep(X,2,fit$mu,"-"),2,fit$sd,"/")
 
 # ── OvR limma gene selection ──────────────────────────────────────────────────
-select_genes_ovr <- function(e_mat, y, n_per_class=25) {
+select_genes_ovr <- function(e_mat, y, n_per_class=50) {
   ok <- !is.na(y) & y!=""; e<-e_mat[, ok, drop=FALSE]; y<-factor(y[ok])
   lvls_s <- make.names(levels(y))
   design  <- model.matrix(~0+y); colnames(design)<-lvls_s
@@ -639,7 +643,7 @@ stratified_split <- function(y, dataset, train_prop=0.75) {
 #| message: false
 #| warning: false
 
-run_lodo_multiclass <- function(X, y, batch, n_per_class=25, use_weights=TRUE) {
+run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
   y     <- factor(y)
   batch <- as.character(batch)
   perf_list  <- list()
@@ -692,71 +696,227 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=25, use_weights=TRUE) {
       probs_list[[length(probs_list)+1]] <<- pd
     }
 
-    # kNN
-    tryCatch({
-      pk  <- class::knn(X_tr_s, X_te_s, y_train, k=7, prob=TRUE)
-      kw  <- attr(pk,"prob"); pkc <- as.character(pk)
-      pm_knn <- matrix(0,n_te,n_cl,dimnames=list(NULL,lvls))
-      for(i in seq_len(n_te)) {
-        pm_knn[i,pkc[i]] <- kw[i]
-        oth <- setdiff(lvls,pkc[i])
-        if (length(oth)) pm_knn[i,oth] <- (1-kw[i])/length(oth)
+    # ── Helper: glmnet predict → clean prob matrix ───────────────────────────
+    glmnet_probs <- function(fit, X_te, lvls) {
+      pr <- predict(fit, as.matrix(X_te), type="response", s="lambda.min")[,,1]
+      if (is.null(dim(pr))) pr <- t(as.matrix(pr))
+      pr[, intersect(lvls, colnames(pr)), drop=FALSE]
+    }
+
+    # ── Helper: build kNN prob matrix from win prob ───────────────────────────
+    knn_prob_mat <- function(X_tr, X_te, y_tr, k=7) {
+      pk  <- class::knn(X_tr, X_te, y_tr, k=k, prob=TRUE)
+      kw  <- attr(pk, "prob"); pkc <- as.character(pk)
+      lvls_k <- levels(y_tr); n_te_k <- nrow(X_te); n_cl_k <- length(lvls_k)
+      pm <- matrix(0, n_te_k, n_cl_k, dimnames=list(NULL, lvls_k))
+      for (i in seq_len(n_te_k)) {
+        pm[i, pkc[i]] <- kw[i]
+        oth <- setdiff(lvls_k, pkc[i])
+        if (length(oth)) pm[i, oth] <- (1 - kw[i]) / length(oth)
       }
-      record("kNN", pkc, pm_knn)
+      pm
+    }
+
+    # ════════════════════════════════════════════════════════════════════════
+    # UNWEIGHTED MODELS
+    # ════════════════════════════════════════════════════════════════════════
+    sw0 <- rep(1, nrow(X_tr_s))
+    cw0 <- setNames(rep(1, n_cl), lvls)
+
+    # kNN (unweighted — no native weight support)
+    tryCatch({
+      pm <- knn_prob_mat(X_tr_s, X_te_s, y_train)
+      record("kNN", colnames(pm)[max.col(pm)], pm)
     }, error=function(e) message("kNN fold ", ds, ": ", conditionMessage(e)))
 
-    # SVM-RBF
-    svm_fit <- tryCatch(
-      e1071::svm(X_tr_s, y_train, kernel="radial", cost=1,
-                 gamma=1/ncol(X_tr_s), probability=TRUE,
-                 class.weights=if(use_weights)cw else NULL),
-      error=function(e) NULL
-    )
-    if (!is.null(svm_fit)) {
-      ps  <- predict(svm_fit, X_te_s, probability=TRUE)
-      pm  <- attr(ps,"probabilities")[,lvls,drop=FALSE]
-      record(if(use_weights)"SVM_RBF_w"else"SVM_RBF", as.character(ps), pm)
-    }
-
-    # Random Forest
+    # SVM RBF (unweighted)
     tryCatch({
-      rf_fit  <- randomForest::randomForest(X_tr_i, y_train,
-                   classwt=if(use_weights)cw else NULL)
-      pred_rf <- predict(rf_fit, X_te_i)
-      prob_rf <- predict(rf_fit, X_te_i, type="prob")[,lvls,drop=FALSE]
-      record(if(use_weights)"RF_w"else"RF", as.character(pred_rf), prob_rf)
-    }, error=function(e) message("RF fold ", ds, ": ", conditionMessage(e)))
+      fit <- e1071::svm(X_tr_s, y_train, kernel="radial", cost=1,
+                        gamma=1/ncol(X_tr_s), probability=TRUE)
+      ps  <- predict(fit, X_te_s, probability=TRUE)
+      pm  <- attr(ps,"probabilities")[, lvls, drop=FALSE]
+      record("SVM_RBF", as.character(ps), pm)
+    }, error=function(e) message("SVM_RBF fold ", ds, ": ", conditionMessage(e)))
 
-    # Multinomial Lasso
-    if (requireNamespace("glmnet", quietly=TRUE)) {
-      lf <- tryCatch(
-        glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
-                          alpha=1, weights=sw, standardize=FALSE,
-                          type.multinomial="grouped"),
-        error=function(e) NULL
-      )
-      if (!is.null(lf)) {
-        pr <- predict(lf, as.matrix(X_te_s), type="response", s="lambda.min")[,,1]
-        if (is.null(dim(pr))) pr <- t(as.matrix(pr))
-        pr <- pr[, intersect(lvls,colnames(pr)), drop=FALSE]
-        record(if(use_weights)"LassoMC_w"else"LassoMC", lvls[max.col(pr)], pr)
-      }
-    }
+    # SVM Linear (unweighted)
+    tryCatch({
+      fit <- e1071::svm(X_tr_s, y_train, kernel="linear", cost=1,
+                        probability=TRUE)
+      ps  <- predict(fit, X_te_s, probability=TRUE)
+      pm  <- attr(ps,"probabilities")[, lvls, drop=FALSE]
+      record("SVM_Linear", as.character(ps), pm)
+    }, error=function(e) message("SVM_Linear fold ", ds, ": ", conditionMessage(e)))
 
-    # Multinomial logistic (nnet)
-    if (requireNamespace("nnet", quietly=TRUE)) {
-      mn <- tryCatch(
-        nnet::multinom(y_train~., data=data.frame(y_train, X_tr_s),
-                       weights=sw, trace=FALSE, MaxNWts=100000),
-        error=function(e) NULL
+    # Multinomial Lasso (unweighted, alpha=1)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=1, weights=sw0, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("LassoMC", lvls[max.col(pm)], pm)
+    }, error=function(e) message("LassoMC fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial Ridge (unweighted, alpha=0)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0, weights=sw0, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("RidgeMC", lvls[max.col(pm)], pm)
+    }, error=function(e) message("RidgeMC fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial ElasticNet (unweighted, alpha=0.5)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0.5, weights=sw0, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("ElasticNetMC", lvls[max.col(pm)], pm)
+    }, error=function(e) message("ElasticNetMC fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial logistic / nnet (unweighted)
+    tryCatch({
+      fit <- nnet::multinom(y_train~., data=data.frame(y_train, X_tr_s),
+                            weights=sw0, trace=FALSE, MaxNWts=100000)
+      pm  <- predict(fit, newdata=data.frame(X_te_s), type="probs")
+      if (is.null(dim(pm))) pm <- t(as.matrix(pm))
+      pm  <- pm[, intersect(lvls, colnames(pm)), drop=FALSE]
+      record("Multinom", lvls[max.col(pm)], pm)
+    }, error=function(e) message("Multinom fold ", ds, ": ", conditionMessage(e)))
+
+    # Naive Bayes (unweighted — no native weight support)
+    tryCatch({
+      fit <- e1071::naiveBayes(x=X_tr_s, y=y_train)
+      pm  <- predict(fit, X_te_s, type="raw")
+      pm  <- pm[, intersect(lvls, colnames(pm)), drop=FALSE]
+      record("NaiveBayes", colnames(pm)[max.col(pm)], pm)
+    }, error=function(e) message("NaiveBayes fold ", ds, ": ", conditionMessage(e)))
+
+    # LDA (unweighted)
+    tryCatch({
+      fit     <- MASS::lda(x=X_tr_s, grouping=y_train)
+      pred_lda <- predict(fit, X_te_s)
+      pm      <- pred_lda$posterior[, intersect(lvls, colnames(pred_lda$posterior)), drop=FALSE]
+      record("LDA", as.character(pred_lda$class), pm)
+    }, error=function(e) message("LDA fold ", ds, ": ", conditionMessage(e)))
+
+    # XGBoost (unweighted)
+    tryCatch({
+      y_int    <- as.integer(y_train) - 1L
+      dtrain   <- xgboost::xgb.DMatrix(data=as.matrix(X_tr_s), label=y_int)
+      dtest    <- xgboost::xgb.DMatrix(data=as.matrix(X_te_s))
+      fit_xgb  <- xgboost::xgb.train(
+        params  = list(objective="multi:softprob", eval_metric="mlogloss",
+                       num_class=n_cl, eta=0.05, max_depth=4,
+                       subsample=0.8, colsample_bytree=0.8,
+                       min_child_weight=5, nthread=1),
+        data=dtrain, nrounds=150, verbose=0
       )
-      if (!is.null(mn)) {
-        pm_mn <- predict(mn, newdata=data.frame(X_te_s), type="probs")
-        if (is.null(dim(pm_mn))) pm_mn <- t(as.matrix(pm_mn))
-        pm_mn <- pm_mn[, intersect(lvls,colnames(pm_mn)), drop=FALSE]
-        record(if(use_weights)"Multinom_w"else"Multinom", lvls[max.col(pm_mn)], pm_mn)
-      }
-    }
+      prob_raw <- matrix(predict(fit_xgb, dtest), ncol=n_cl, byrow=TRUE)
+      colnames(prob_raw) <- lvls
+      record("XGBoost", lvls[max.col(prob_raw)], prob_raw)
+    }, error=function(e) message("XGBoost fold ", ds, ": ", conditionMessage(e)))
+
+    # ════════════════════════════════════════════════════════════════════════
+    # WEIGHTED MODELS (balanced class weights)
+    # ════════════════════════════════════════════════════════════════════════
+
+    # kNN_w (same as kNN — no native weight support, noted)
+    tryCatch({
+      pm <- knn_prob_mat(X_tr_s, X_te_s, y_train)
+      record("kNN_w", colnames(pm)[max.col(pm)], pm)
+    }, error=function(e) message("kNN_w fold ", ds, ": ", conditionMessage(e)))
+
+    # SVM RBF (weighted)
+    tryCatch({
+      fit <- e1071::svm(X_tr_s, y_train, kernel="radial", cost=1,
+                        gamma=1/ncol(X_tr_s), probability=TRUE,
+                        class.weights=cw)
+      ps  <- predict(fit, X_te_s, probability=TRUE)
+      pm  <- attr(ps,"probabilities")[, lvls, drop=FALSE]
+      record("SVM_RBF_w", as.character(ps), pm)
+    }, error=function(e) message("SVM_RBF_w fold ", ds, ": ", conditionMessage(e)))
+
+    # SVM Linear (weighted)
+    tryCatch({
+      fit <- e1071::svm(X_tr_s, y_train, kernel="linear", cost=1,
+                        probability=TRUE, class.weights=cw)
+      ps  <- predict(fit, X_te_s, probability=TRUE)
+      pm  <- attr(ps,"probabilities")[, lvls, drop=FALSE]
+      record("SVM_Linear_w", as.character(ps), pm)
+    }, error=function(e) message("SVM_Linear_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial Lasso (weighted)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=1, weights=sw, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("LassoMC_w", lvls[max.col(pm)], pm)
+    }, error=function(e) message("LassoMC_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial Ridge (weighted)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0, weights=sw, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("RidgeMC_w", lvls[max.col(pm)], pm)
+    }, error=function(e) message("RidgeMC_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial ElasticNet (weighted)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0.5, weights=sw, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("ElasticNetMC_w", lvls[max.col(pm)], pm)
+    }, error=function(e) message("ElasticNetMC_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial logistic / nnet (weighted)
+    tryCatch({
+      fit <- nnet::multinom(y_train~., data=data.frame(y_train, X_tr_s),
+                            weights=sw, trace=FALSE, MaxNWts=100000)
+      pm  <- predict(fit, newdata=data.frame(X_te_s), type="probs")
+      if (is.null(dim(pm))) pm <- t(as.matrix(pm))
+      pm  <- pm[, intersect(lvls, colnames(pm)), drop=FALSE]
+      record("Multinom_w", lvls[max.col(pm)], pm)
+    }, error=function(e) message("Multinom_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Naive Bayes_w (same as NaiveBayes — no native weight support, noted)
+    tryCatch({
+      fit <- e1071::naiveBayes(x=X_tr_s, y=y_train)
+      pm  <- predict(fit, X_te_s, type="raw")
+      pm  <- pm[, intersect(lvls, colnames(pm)), drop=FALSE]
+      record("NaiveBayes_w", colnames(pm)[max.col(pm)], pm)
+    }, error=function(e) message("NaiveBayes_w fold ", ds, ": ", conditionMessage(e)))
+
+    # LDA with weighted prior (weighted proportional to inverse class frequency)
+    tryCatch({
+      prior_w <- cw / sum(cw)
+      fit     <- MASS::lda(x=X_tr_s, grouping=y_train, prior=prior_w)
+      pred_lda <- predict(fit, X_te_s)
+      pm      <- pred_lda$posterior[, intersect(lvls, colnames(pred_lda$posterior)), drop=FALSE]
+      record("LDA_w", as.character(pred_lda$class), pm)
+    }, error=function(e) message("LDA_w fold ", ds, ": ", conditionMessage(e)))
+
+    # XGBoost (weighted via sample weights)
+    tryCatch({
+      y_int   <- as.integer(y_train) - 1L
+      dtrain  <- xgboost::xgb.DMatrix(data=as.matrix(X_tr_s), label=y_int,
+                                       weight=sw)
+      dtest   <- xgboost::xgb.DMatrix(data=as.matrix(X_te_s))
+      fit_xgb <- xgboost::xgb.train(
+        params  = list(objective="multi:softprob", eval_metric="mlogloss",
+                       num_class=n_cl, eta=0.05, max_depth=4,
+                       subsample=0.8, colsample_bytree=0.8,
+                       min_child_weight=5, nthread=1),
+        data=dtrain, nrounds=150, verbose=0
+      )
+      prob_raw <- matrix(predict(fit_xgb, dtest), ncol=n_cl, byrow=TRUE)
+      colnames(prob_raw) <- lvls
+      record("XGBoost_w", lvls[max.col(prob_raw)], prob_raw)
+    }, error=function(e) message("XGBoost_w fold ", ds, ": ", conditionMessage(e)))
 
     }, error = function(e) {
       message("LODO fold ", ds, " failed entirely: ", conditionMessage(e))
@@ -771,7 +931,7 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=25, use_weights=TRUE) {
 
 X_mc <- t(e_mc)
 cat("Running LODO CV (", length(unique(batch_mc)), "folds)...\n")
-res_lodo <- run_lodo_multiclass(X_mc, y_mc, batch_mc, n_per_class=25, use_weights=TRUE)
+res_lodo <- run_lodo_multiclass(X_mc, y_mc, batch_mc, n_per_class=50, use_weights=TRUE)
 
 if (nrow(res_lodo$perf) == 0) {
   stop("res_lodo is empty — all LODO folds failed. ",
@@ -816,9 +976,12 @@ knitr::kable(scorecard,
 
 best_model_mc <- res_lodo$perf %>%
   group_by(model) %>%
-  summarise(m=mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
-  arrange(desc(m)) %>% slice(1) %>% pull(model)
-cat("\nBest single model:", best_model_mc, "\n")
+  summarise(m = mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(m)) %>%
+  slice(1) %>%
+  pull(model)
+
+cat("\nBest model:", best_model_mc, "\n")
 ```
 
 ## Performance plots
@@ -869,7 +1032,7 @@ as.data.frame(tab_best) %>%
 
 ------------------------------------------------------------------------
 
-# Single model vs Ensemble — is it worth it?
+# Single model comparison — hold-out evaluation
 
 ```{r ensemble-eval}
 #| message: false
@@ -884,48 +1047,120 @@ X_hold <- X_mc[hold_idx,,drop=FALSE]; y_hold <- y_mc[hold_idx]; batch_hold <- ba
 cat("Dev:", nrow(X_dev), " Hold-out:", nrow(X_hold), "\n")
 
 # LODO on dev to rank models
-res_dev <- run_lodo_multiclass(X_dev, y_dev, batch_dev, n_per_class=25)
+res_dev <- run_lodo_multiclass(X_dev, y_dev, batch_dev, n_per_class=50)
 
 dev_rank <- res_dev$perf %>%
   group_by(model) %>%
-  summarise(mean_auc=mean(macro_auc,na.rm=TRUE),
-            mean_f1 =mean(macro_f1, na.rm=TRUE), .groups="drop") %>%
-  arrange(desc(mean_auc)) %>% mutate(dev_rank=row_number())
+  summarise(mean_auc = median(macro_auc, na.rm=TRUE),
+            mean_f1  = median(macro_f1,  na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(mean_auc)) %>%
+  mutate(dev_rank = row_number())
 
 # ── Fit on full dev, predict hold-out ─────────────────────────────────────────
-fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
-                        n_per_class=25, use_weights=TRUE) {
-  y_tr  <- factor(y_tr); lvls <- levels(y_tr); n_cl <- length(lvls)
-  cb    <- combat_fit_apply(t(X_tr), batch_tr, model.matrix(~y_tr), t(X_te), batch_te)
+fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te, n_per_class=50) {
+  y_tr <- factor(y_tr); lvls <- levels(y_tr); n_cl <- length(lvls)
+  cb   <- combat_fit_apply(t(X_tr), batch_tr, model.matrix(~y_tr), t(X_te), batch_te)
   X_trc <- t(cb$train); X_tec <- t(cb$test)
   gs    <- intersect(select_genes_ovr(t(X_trc), y=y_tr, n_per_class=n_per_class), colnames(X_trc))
   if (length(gs)<10) return(NULL)
+
   X_t2 <- X_trc[,gs]; X_e2 <- X_tec[,gs]
-  imp  <- impute_fit(X_t2); X_ti <- impute_apply(X_t2,imp); X_ei <- impute_apply(X_e2,imp)
-  sc   <- std_fit(X_ti);   X_ts <- std_apply(X_ti,sc);    X_es <- std_apply(X_ei,sc)
+  imp  <- impute_fit(X_t2);  X_ti <- impute_apply(X_t2,imp); X_ei <- impute_apply(X_e2,imp)
+  sc   <- std_fit(X_ti);     X_ts <- std_apply(X_ti,sc);     X_es <- std_apply(X_ei,sc)
+
   tab_tr <- table(y_tr); n_tot <- sum(tab_tr); n_te <- nrow(X_es)
-  cw <- if(use_weights) setNames(vapply(lvls,function(k) n_tot/(n_cl*max(1,tab_tr[k])),numeric(1)),lvls) else setNames(rep(1,n_cl),lvls)
-  sw <- cw[as.character(y_tr)]
+  cw  <- setNames(vapply(lvls, function(k) n_tot/(n_cl*max(1,tab_tr[k])), numeric(1)), lvls)
+  sw  <- cw[as.character(y_tr)]
+  sw0 <- rep(1, length(y_tr))
+  cw0 <- setNames(rep(1, n_cl), lvls)
+
   out <- list()
 
-  pk <- class::knn(X_ts,X_es,y_tr,k=7,prob=TRUE)
-  kw <- attr(pk,"prob"); pkc <- as.character(pk)
-  pm_k <- matrix(0,n_te,n_cl,dimnames=list(NULL,lvls))
-  for(i in seq_len(n_te)){pm_k[i,pkc[i]]<-kw[i]; oth<-setdiff(lvls,pkc[i]); if(length(oth))pm_k[i,oth]<-(1-kw[i])/length(oth)}
-  out[["kNN"]] <- pm_k
-
-  rf2 <- randomForest::randomForest(X_ti,y_tr,classwt=if(use_weights)cw else NULL)
-  out[[if(use_weights)"RF_w"else"RF"]] <- predict(rf2,X_ei,type="prob")[,lvls,drop=FALSE]
-
-  if(requireNamespace("glmnet",quietly=TRUE)){
-    lf <- tryCatch(glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw,standardize=FALSE,type.multinomial="grouped"),error=function(e)NULL)
-    if(!is.null(lf)){pr<-predict(lf,as.matrix(X_es),type="response",s="lambda.min")[,,1]; if(is.null(dim(pr)))pr<-t(as.matrix(pr)); out[[if(use_weights)"LassoMC_w"else"LassoMC"]]<-pr[,intersect(lvls,colnames(pr)),drop=FALSE]}
+  # ── helper ────────────────────────────────────────────────────────────────
+  gp <- function(fit) {   # glmnet → clean prob matrix
+    pr <- predict(fit, as.matrix(X_es), type="response", s="lambda.min")[,,1]
+    if (is.null(dim(pr))) pr <- t(as.matrix(pr))
+    pr[, intersect(lvls, colnames(pr)), drop=FALSE]
   }
-  if(requireNamespace("nnet",quietly=TRUE)){
-    mn <- tryCatch(nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw,trace=FALSE,MaxNWts=100000),error=function(e)NULL)
-    if(!is.null(mn)){pm_mn<-predict(mn,newdata=data.frame(X_es),type="probs"); if(is.null(dim(pm_mn)))pm_mn<-t(as.matrix(pm_mn)); out[[if(use_weights)"Multinom_w"else"Multinom"]]<-pm_mn[,intersect(lvls,colnames(pm_mn)),drop=FALSE]}
+  kp <- function() {      # kNN → prob matrix
+    pk  <- class::knn(X_ts, X_es, y_tr, k=7, prob=TRUE)
+    kw  <- attr(pk,"prob"); pkc <- as.character(pk)
+    pm  <- matrix(0, n_te, n_cl, dimnames=list(NULL,lvls))
+    for (i in seq_len(n_te)) {
+      pm[i,pkc[i]] <- kw[i]; oth <- setdiff(lvls,pkc[i])
+      if (length(oth)) pm[i,oth] <- (1-kw[i])/length(oth)
+    }
+    pm
   }
-  out
+
+  # ── unweighted ────────────────────────────────────────────────────────────
+  tryCatch({ out[["kNN"]]          <- kp() }, error=function(e) NULL)
+  tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="radial",cost=1,gamma=1/ncol(X_ts),probability=TRUE)
+             ps  <- predict(fit,X_es,probability=TRUE)
+             out[["SVM_RBF"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="linear",cost=1,probability=TRUE)
+             ps  <- predict(fit,X_es,probability=TRUE)
+             out[["SVM_Linear"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- randomForest::randomForest(X_ti,y_tr)
+             out[["RF"]] <- predict(fit,X_ei,type="prob")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw0,standardize=FALSE,type.multinomial="grouped")
+             out[["LassoMC"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw0,standardize=FALSE,type.multinomial="grouped")
+             out[["RidgeMC"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw0,standardize=FALSE,type.multinomial="grouped")
+             out[["ElasticNetMC"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw0,trace=FALSE,MaxNWts=100000)
+             pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
+             if (is.null(dim(pm))) pm <- t(as.matrix(pm))
+             out[["Multinom"]] <- pm[,intersect(lvls,colnames(pm)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- e1071::naiveBayes(x=X_ts,y=y_tr)
+             pm  <- predict(fit,X_es,type="raw")
+             out[["NaiveBayes"]] <- pm[,intersect(lvls,colnames(pm)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- MASS::lda(x=X_ts,grouping=y_tr)
+             pl  <- predict(fit,X_es)
+             out[["LDA"]] <- pl$posterior[,intersect(lvls,colnames(pl$posterior)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ y_int <- as.integer(y_tr)-1L
+             dtr   <- xgboost::xgb.DMatrix(data=as.matrix(X_ts),label=y_int)
+             dte   <- xgboost::xgb.DMatrix(data=as.matrix(X_es))
+             fit   <- xgboost::xgb.train(params=list(objective="multi:softprob",eval_metric="mlogloss",num_class=n_cl,eta=0.05,max_depth=4,subsample=0.8,colsample_bytree=0.8,min_child_weight=5,nthread=1),data=dtr,nrounds=150,verbose=0)
+             pm    <- matrix(predict(fit,dte),ncol=n_cl,byrow=TRUE); colnames(pm)<-lvls
+             out[["XGBoost"]] <- pm }, error=function(e) NULL)
+
+  # ── weighted ──────────────────────────────────────────────────────────────
+  tryCatch({ out[["kNN_w"]]       <- kp() }, error=function(e) NULL)  # no native weights
+  tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="radial",cost=1,gamma=1/ncol(X_ts),probability=TRUE,class.weights=cw)
+             ps  <- predict(fit,X_es,probability=TRUE)
+             out[["SVM_RBF_w"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="linear",cost=1,probability=TRUE,class.weights=cw)
+             ps  <- predict(fit,X_es,probability=TRUE)
+             out[["SVM_Linear_w"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- randomForest::randomForest(X_ti,y_tr,classwt=cw)
+             out[["RF_w"]] <- predict(fit,X_ei,type="prob")[,lvls,drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw,standardize=FALSE,type.multinomial="grouped")
+             out[["LassoMC_w"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw,standardize=FALSE,type.multinomial="grouped")
+             out[["RidgeMC_w"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw,standardize=FALSE,type.multinomial="grouped")
+             out[["ElasticNetMC_w"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw,trace=FALSE,MaxNWts=100000)
+             pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
+             if (is.null(dim(pm))) pm <- t(as.matrix(pm))
+             out[["Multinom_w"]] <- pm[,intersect(lvls,colnames(pm)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ fit <- e1071::naiveBayes(x=X_ts,y=y_tr)  # no native weights
+             pm  <- predict(fit,X_es,type="raw")
+             out[["NaiveBayes_w"]] <- pm[,intersect(lvls,colnames(pm)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ prior_w <- cw/sum(cw)
+             fit <- MASS::lda(x=X_ts,grouping=y_tr,prior=prior_w)
+             pl  <- predict(fit,X_es)
+             out[["LDA_w"]] <- pl$posterior[,intersect(lvls,colnames(pl$posterior)),drop=FALSE] }, error=function(e) NULL)
+  tryCatch({ y_int <- as.integer(y_tr)-1L
+             dtr   <- xgboost::xgb.DMatrix(data=as.matrix(X_ts),label=y_int,weight=sw)
+             dte   <- xgboost::xgb.DMatrix(data=as.matrix(X_es))
+             fit   <- xgboost::xgb.train(params=list(objective="multi:softprob",eval_metric="mlogloss",num_class=n_cl,eta=0.05,max_depth=4,subsample=0.8,colsample_bytree=0.8,min_child_weight=5,nthread=1),data=dtr,nrounds=150,verbose=0)
+             pm    <- matrix(predict(fit,dte),ncol=n_cl,byrow=TRUE); colnames(pm)<-lvls
+             out[["XGBoost_w"]] <- pm }, error=function(e) NULL)
+
+  Filter(Negate(is.null), out)
 }
 
 hold_probs <- fit_once_mc(X_dev, y_dev, batch_dev, X_hold, batch_hold)
@@ -933,59 +1168,46 @@ hold_probs <- fit_once_mc(X_dev, y_dev, batch_dev, X_hold, batch_hold)
 if (!is.null(hold_probs)) {
   lvls_hold <- levels(y_dev)
 
-  # Single model metrics on hold-out
   single_hold <- bind_rows(lapply(names(hold_probs), function(nm) {
-    pm       <- hold_probs[[nm]]
-    lv       <- intersect(lvls_hold, colnames(pm))
-    pred_chr <- lv[max.col(pm[,lv,drop=FALSE])]
-    tibble::tibble(
-      type      = "Single model",
-      id        = nm,
-      accuracy  = mean(pred_chr==as.character(y_hold), na.rm=TRUE),
-      macro_f1  = macro_f1(as.character(y_hold), pred_chr),
-      macro_auc = macro_auc_ovr(as.character(y_hold), pm[,lv,drop=FALSE])
-    )
-  })) %>% arrange(desc(macro_auc))
+    tryCatch({
+      pm  <- hold_probs[[nm]]
+      if (is.null(pm) || ncol(pm)==0) return(NULL)
+      lv  <- intersect(lvls_hold, colnames(pm))
+      if (length(lv)<2) return(NULL)
+      pred_chr <- lv[max.col(pm[,lv,drop=FALSE])]
+      tibble::tibble(type="Single model", id=nm,
+        accuracy  = mean(pred_chr==as.character(y_hold), na.rm=TRUE),
+        macro_f1  = macro_f1(as.character(y_hold), pred_chr),
+        macro_auc = macro_auc_ovr(as.character(y_hold), pm[,lv,drop=FALSE]))
+    }, error=function(e) NULL)
+  }))
+  if (nrow(single_hold)==0) stop("No models produced valid hold-out predictions — check fit_once_mc output")
+  single_hold <- single_hold %>% arrange(desc(macro_auc))
 
-  # Ensemble metrics (top-k equal-weight averaging)
-  ens_hold <- bind_rows(lapply(c(2,3,4), function(k) {
-    sel_mods <- dev_rank %>% slice_head(n=k) %>% pull(model)
-    sel_mods <- intersect(sel_mods, names(hold_probs))
-    if (length(sel_mods)<2) return(NULL)
-    avg_pm   <- Reduce("+", lapply(sel_mods, function(nm) {
-      pm <- hold_probs[[nm]]; pm[,intersect(lvls_hold,colnames(pm)),drop=FALSE]
-    })) / length(sel_mods)
-    pred_chr <- colnames(avg_pm)[max.col(avg_pm)]
-    tibble::tibble(
-      type      = paste0("Ensemble (top-", k, ")"),
-      id        = paste(sel_mods, collapse=" + "),
-      accuracy  = mean(pred_chr==as.character(y_hold), na.rm=TRUE),
-      macro_f1  = macro_f1(as.character(y_hold), pred_chr),
-      macro_auc = macro_auc_ovr(as.character(y_hold), avg_pm)
-    )
-  })) %>% arrange(desc(macro_auc))
+  knitr::kable(
+    single_hold %>% mutate(across(c(macro_auc, macro_f1, accuracy), round, 3)),
+    caption="Hold-out: single model performance ranked by macro OvR AUC"
+  )
 
-  comparison_tbl <- bind_rows(single_hold, ens_hold) %>%
-    mutate(across(c(macro_auc, macro_f1, accuracy), round, 3))
-
-  knitr::kable(comparison_tbl,
-    caption="Hold-out: single model vs ensemble (equal-weight probability averaging)")
-
-  # ── Visual comparison ─────────────────────────────────────────────────────
-  comparison_tbl %>%
+  # ── Visual: all single models ranked ─────────────────────────────────────
+  single_hold %>%
+    mutate(across(c(macro_auc, macro_f1, accuracy), round, 3)) %>%
     pivot_longer(cols=c(macro_auc, macro_f1, accuracy),
                  names_to="metric", values_to="value") %>%
     mutate(metric=recode(metric,
-      macro_auc="Macro OvR AUC", macro_f1="Macro F1", accuracy="Accuracy")) %>%
-    ggplot(aes(x=reorder(id, value), y=value, fill=type)) +
+      macro_auc="Macro OvR AUC", macro_f1="Macro F1", accuracy="Accuracy"),
+      weighted = grepl("_w$", id)) %>%
+    ggplot(aes(x=reorder(id, value), y=value,
+               fill=weighted)) +
     geom_col(alpha=0.85) +
-    geom_text(aes(label=round(value,3)), hjust=-0.1, size=3) +
+    geom_text(aes(label=sprintf("%.3f", value)), hjust=-0.1, size=2.8) +
     facet_wrap(~metric, scales="free_x") +
     coord_flip() +
-    theme_bw() +
+    scale_fill_manual(values=c("FALSE"="grey50","TRUE"="#D7191C"),
+                      labels=c("FALSE"="Unweighted","TRUE"="Weighted")) +
+    theme_bw(base_size=9) +
     labs(x=NULL, y=NULL, fill=NULL,
-         title="Single model vs ensemble — hold-out performance",
-         subtitle="Is the extra complexity of an ensemble justified?") +
+         title="Hold-out performance — all single models (weighted ▶ red, unweighted ▶ grey)") +
     theme(legend.position="bottom")
 }
 ```
@@ -1090,7 +1312,7 @@ set.seed(3888)
 B_boot_mc <- 200
 
 run_bootstrap_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
-                              B = 200, n_per_class = 25) {
+                              B = 200, n_per_class = 50) {
   y_tr  <- factor(y_tr)
   lvls  <- levels(y_tr)
   n_cl  <- length(lvls)
@@ -1169,7 +1391,7 @@ cat("Running", B_boot_mc, "bootstrap iterations (Multinomial Lasso refit)...
 ")
 boot_arr_mc <- run_bootstrap_mc(
   X_dev, y_dev, batch_dev, X_hold, batch_hold,
-  B=B_boot_mc, n_per_class=25
+  B=B_boot_mc, n_per_class=50
 )
 
 if (!is.null(boot_arr_mc)) {
@@ -1338,15 +1560,24 @@ if (exists("risk_df")) {
   cat("=== CLASSIFIER SUMMARY ===\n\n")
   cat("Best single model (LODO CV):", best_model_mc, "\n")
 
-  best_ens_k <- ens_hold %>% arrange(desc(macro_auc)) %>% slice(1)
-  cat("Best ensemble:", best_ens_k$id, "\n")
-  cat(sprintf("  Single model macro AUC: %.3f\n",
-              single_hold %>% arrange(desc(macro_auc)) %>% slice(1) %>% pull(macro_auc)))
-  cat(sprintf("  Ensemble  macro AUC:    %.3f\n", best_ens_k$macro_auc))
+  cat(sprintf("  High-confidence predictions: %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "High confidence"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "High confidence", na.rm=TRUE)))
+  cat(sprintf("  Moderate-confidence:         %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "Moderate confidence"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "Moderate confidence", na.rm=TRUE)))
+  cat(sprintf("  Low-confidence (review):     %d / %d (%.0f%%)\n",
+              sum(risk_df$risk_band == "Low confidence — review recommended"),
+              nrow(risk_df),
+              100 * mean(risk_df$risk_band == "Low confidence — review recommended", na.rm=TRUE)))
+  cat(sprintf("\n  Median predicted confidence: %.1f%%\n",
+              median(as.numeric(gsub("%","",risk_df$confidence)), na.rm=TRUE)*100))
 
   if (exists("boot_arr_mc") && !is.null(boot_arr_mc)) {
-    cat(sprintf("  Bootstrap 95%% CI (median ci_width): %.3f\n",
-                median(boot_risk_mc$ci_width_pred, na.rm=TRUE)))
+    cat(sprintf("  Bootstrap 95%% CI (median ci_width): %.1f%%\n",
+                median(boot_risk_mc$ci_width_pred, na.rm=TRUE)*100))
   }
 
   cat(sprintf("\nHigh-confidence predictions (≥0.70, low disagreement): %d / %d (%.0f%%)\n",
@@ -1396,7 +1627,7 @@ e_all_bc <- tryCatch(
 )
 
 # ── 2. OvR gene selection on full batch-corrected training set ───────────────
-panel_genes <- select_genes_ovr(e_all_bc, y=y_all, n_per_class=25)
+panel_genes <- select_genes_ovr(e_all_bc, y=y_all, n_per_class=50)
 cat("Final multiclass panel genes:", length(panel_genes), "\n")
 
 # ── 3. Preprocessing stats (imputation + z-score) from full training set ─────
@@ -1454,6 +1685,17 @@ if (!is.null(fit_multinom_final))
 
 cat("\nSaved to models/multiclass/:\n")
 cat(paste(" -", list.files("models/multiclass"), collapse="\n"), "\n")
+
+# ── Save uncertainty outputs ──────────────────────────────────────────────────
+if (exists("boot_risk_mc") && !is.null(boot_risk_mc)) {
+  saveRDS(boot_risk_mc, "models/multiclass/bootstrap_risk_scores.rds")
+  cat("Saved bootstrap risk scores:", nrow(boot_risk_mc), "patients\n")
+}
+
+if (exists("uncertainty_df") && !is.null(uncertainty_df)) {
+  saveRDS(uncertainty_df, "models/multiclass/model_disagreement.rds")
+  cat("Saved model disagreement metrics\n")
+}
 ```
 
 ## Prediction function for new samples
