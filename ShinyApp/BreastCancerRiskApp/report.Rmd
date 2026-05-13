@@ -1,6 +1,6 @@
 ---
 title: "Breast Cancer Risk Report"
-author: "Zerek Lee"
+author: "Clinician"
 date: "`r Sys.Date()`"
 output: pdf_document
 params:
@@ -9,13 +9,14 @@ params:
   risk_category: NULL
   ci_low: NULL
   ci_high: NULL
-  rf: NULL
-  ridge: NULL
-  nb: NULL
+  gene_table: NULL
+  high_genes: NULL
+  low_genes: NULL
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE)
+library(knitr)
 ```
 
 # Patient Information
@@ -40,32 +41,78 @@ knitr::opts_chunk$set(echo = FALSE)
 
 ---
 
-# Base Model Predictions
+# Clinical Interpretation
 
-| Model | Output |
-|---|---|
-| Random Forest | `r params$rf` |
-| Ridge Regression | `r params$ridge` |
-| Naive Bayes | `r params$nb` |
+`r if (params$risk_category == "High Risk") {
+  "The gene expression profile indicates a high predicted risk. Further clinical assessment and molecular subtype assessment is recommended."
+} else if (params$risk_category == "Medium Risk") {
+  "The gene expression profile indicates an intermediate predicted risk. Additional clinical review may be useful before making decisions."
+} else {
+  "The gene expression profile indicates a low predicted risk. Routine monitoring may be appropriate depending on clinical context."
+}`
 
 ---
 
-# Clinical Interpretation
+# Top Abnormal Gene Summary
 
-```{r clinical_interpretation}
-if (params$risk_category == "High Risk") {
-  cat("The gene expression profile indicates a high predicted risk.")
-} else if (params$risk_category == "Medium Risk") {
-  cat("The gene expression profile indicates an intermediate predicted risk.")
+## High Expression Genes
+
+```{r high_genes_table}
+if (!is.null(params$high_genes) && nrow(params$high_genes) > 0) {
+  kable(
+    params$high_genes,
+    row.names = FALSE,
+    align = "c"
+  )
 } else {
-  cat("The gene expression profile indicates a low predicted risk.")
+  cat("No high-expression genes detected.")
 }
 ```
+
+## Low Expression Genes
+
+```{r low_genes_table}
+if (!is.null(params$low_genes) && nrow(params$low_genes) > 0) {
+  kable(
+    params$low_genes,
+    row.names = FALSE,
+    align = "c"
+  )
+} else {
+  cat("No low-expression genes detected.")
+}
+```
+
+---
+
+# Selected Patient Gene Values
+
+```{r gene_table}
+if (!is.null(params$gene_table)) {
+  kable(
+    params$gene_table,
+    row.names = FALSE,
+    align = "c"
+  )
+}
+```
+
+---
+
+# Selected Sample Gene Expression
+
+The dashboard visualization compares the selected patient against the cohort-level distribution for each gene.
+
+- Horizontal boxplots represent cohort gene-expression distributions.
+- Red triangle markers indicate the selected patient.
+- Percentile rankings are used to identify unusually high or low expression patterns.
 
 ---
 
 # Important Notice
 
 This report is generated from a prototype clinical decision-support dashboard.
+
+Current risk predictions are demonstration outputs and will be replaced with fully trained machine-learning models in the final version.
 
 Clinical interpretation should always be combined with professional medical judgement.
