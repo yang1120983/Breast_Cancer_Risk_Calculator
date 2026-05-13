@@ -32,21 +32,21 @@ library(glmnet)
 if (requireNamespace("nnet",    quietly = TRUE)) library(nnet)
 if (requireNamespace("MASS",    quietly = TRUE)) library(MASS)      # LDA
 select <- dplyr::select   # prevent MASS from masking dplyr::select
-filter <- dplyr::filter   # prevent MASS from masking dplyr::filter
+filter <- dplyr::filter   # prevent MASS from masking dplyr::filte
 if (requireNamespace("xgboost", quietly = TRUE)) library(xgboost)   # XGBoost
 
 set.seed(3888)
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
-datasets_multiclass <- c("GSE25066", "GSE45827", "GSE65194")
+datasets_multiclass <- c("GSE25066", "GSE45827", "GSE65194","GSE21653")
 
 # ── PAM50 subtype dictionary ──────────────────────────────────────────────────
 subtype_variants <- list(
   "Luminal A"   = c("luminal a","lum a","luma","lum-a","lum_a","luminala"),
   "Luminal B"   = c("luminal b","lum b","lumb","lum-b","lum_b","luminalb"),
   "Basal"       = c("basal","basal-like","basal like","basallike","basal_like"),
-  "HER2"        = c("her2","her2+","her-2","her2-enriched","her2enriched","her2e"),
-  "Normal-like" = c("normal-like","normal like","normallike","normal_like")
+  "HER2"        = c("her2","her2+","her-2","her2-enriched","her2enriched","her2e","erbb2"),
+  "Normal-like" = c("normal-like","normal like","normallike","normal_like","molecular subtype: normal")
 )
 ```
 
@@ -174,70 +174,80 @@ infer_multiclass_label <- function(pMat) {
 # ── Full per-dataset QC pipeline ──────────────────────────────────────────────
 normalised_cache_dir <- file.path("data", "normalised")
 
+# ── GSE21653-specific: characteristics_ch1.12 has PAM50 subtype labels ────────
+# Values: "molecular subtype: Basal/ERBB2/LuminalA/LuminalB/Normal"
+# All 266 samples are tumours — no normal breast tissue in this dataset.
+# Normal-like subtype here = PAM50 Normal-like, not actual normal tissue.
+# infer_multiclass_label cannot be used for this dataset because intermediate
+# characteristics columns contain scattered subtype values that cause early exit.
+multiclass_label_overrides <- list(
+  GSE21653 = function(p) {
+    raw <- tolower(trimws(as.character(p[["characteristics_ch1.12"]])))
+    ifelse(grepl("basal",    raw), "Basal",
+    ifelse(grepl("erbb2",    raw), "HER2",
+    ifelse(grepl("luminala", raw), "Luminal A",
+    ifelse(grepl("luminalb", raw), "Luminal B",
+    ifelse(grepl("normal",   raw), "Normal-like", NA_character_)))))
+  }
+)
+
 process_dataset_qc <- function(gse_id) {
 
-  # ── Fast path: load pre-saved normalised RDS if it exists ────────────────
-  # These are produced by the within-dataset normalisation pipeline and saved
-  # as {GSE_ID}_normalised.rds in data/normalised/. Loading them avoids a
-  # full GEO download + normalisation on every run.
   rds_path <- file.path(normalised_cache_dir, paste0(gse_id, "_normalised.rds"))
 
+  # ── Helper: derive labels, respecting dataset-specific overrides ─────────
+  derive_labels <- function(p) {
+    if (gse_id %in% names(multiclass_label_overrides)) {
+      message(gse_id, ": using direct label override (characteristics_ch1.12)")
+      list(label    = factor(multiclass_label_overrides[[gse_id]](p)),
+           label_col = "characteristics_ch1.12")
+    } else {
+      infer_multiclass_label(p)
+    }
+  }
+
+  # ── Fast path: load pre-saved normalised RDS ─────────────────────────────
   if (file.exists(rds_path)) {
     message(gse_id, ": loading pre-normalised RDS from ", rds_path)
-    dat <- readRDS(rds_path)
-
-    # Expected fields: expr (genes × samples), meta (samples × cols)
-    # meta must contain a label column parseable by infer_multiclass_label
+    dat    <- readRDS(rds_path)
     e_gene <- dat$expr
     p      <- dat$meta
     p$dataset_id <- gse_id
-
-    lab <- infer_multiclass_label(p)
+    lab    <- derive_labels(p)
     p$label_mc <- as.character(lab$label)
-
     return(list(
-      id           = gse_id,
-      e_raw        = e_gene,   # already normalised — use as-is for QC plot
-      e_norm       = e_gene,
-      pMat         = p,
-      label_col    = lab$label_col
+      id        = gse_id,
+      e_raw     = e_gene,
+      e_norm    = e_gene,
+      pMat      = p,
+      label_col = lab$label_col
     ))
   }
 
-  # ── Slow path: download from GEO, normalise, and save for next time ──────
+  # ── Slow path: download from GEO, normalise, save ────────────────────────
   message(gse_id, ": no cached RDS found — downloading from GEO")
-  eset <- load_geo_eset(gse_id)
-  e    <- exprs(eset)
-
-  log2_applied <- needs_log2(e)
-  if (log2_applied) e <- safe_log2(e)
-
+  eset   <- load_geo_eset(gse_id)
+  e      <- exprs(eset)
+  if (needs_log2(e)) e <- safe_log2(e)
   e_norm <- quantile_normalise(e)
   exprs(eset) <- e_norm
-
   e_gene <- collapse_probes(eset)
-  lab    <- infer_multiclass_label(pData(eset))
-
-  p            <- pData(eset)
+  p      <- pData(eset)
   p$dataset_id <- gse_id
-  p$label_mc   <- as.character(lab$label)
+  lab    <- derive_labels(p)
+  p$label_mc <- as.character(lab$label)
 
-  # Save for future runs so GEO download is never needed again
   if (!dir.exists(normalised_cache_dir))
     dir.create(normalised_cache_dir, recursive = TRUE)
-
-  saveRDS(
-    list(expr = e_gene, meta = p),
-    rds_path
-  )
+  saveRDS(list(expr = e_gene, meta = p), rds_path)
   message(gse_id, ": saved normalised RDS to ", rds_path)
 
   list(
-    id           = gse_id,
-    e_raw        = e,
-    e_norm       = e_gene,
-    pMat         = p,
-    label_col    = lab$label_col
+    id        = gse_id,
+    e_raw     = e,
+    e_norm    = e_gene,
+    pMat      = p,
+    label_col = lab$label_col
   )
 }
 ```
@@ -765,15 +775,6 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       record("RidgeMC", lvls[max.col(pm)], pm)
     }, error=function(e) message("RidgeMC fold ", ds, ": ", conditionMessage(e)))
 
-    # Multinomial ElasticNet (unweighted, alpha=0.5)
-    tryCatch({
-      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
-                               alpha=0.5, weights=sw0, standardize=FALSE,
-                               type.multinomial="grouped")
-      pm <- glmnet_probs(fit, X_te_s, lvls)
-      record("ElasticNetMC", lvls[max.col(pm)], pm)
-    }, error=function(e) message("ElasticNetMC fold ", ds, ": ", conditionMessage(e)))
-
     # Multinomial logistic / nnet (unweighted)
     tryCatch({
       fit <- nnet::multinom(y_train~., data=data.frame(y_train, X_tr_s),
@@ -863,15 +864,6 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       pm <- glmnet_probs(fit, X_te_s, lvls)
       record("RidgeMC_w", lvls[max.col(pm)], pm)
     }, error=function(e) message("RidgeMC_w fold ", ds, ": ", conditionMessage(e)))
-
-    # Multinomial ElasticNet (weighted)
-    tryCatch({
-      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
-                               alpha=0.5, weights=sw, standardize=FALSE,
-                               type.multinomial="grouped")
-      pm <- glmnet_probs(fit, X_te_s, lvls)
-      record("ElasticNetMC_w", lvls[max.col(pm)], pm)
-    }, error=function(e) message("ElasticNetMC_w fold ", ds, ": ", conditionMessage(e)))
 
     # Multinomial logistic / nnet (weighted)
     tryCatch({
@@ -976,12 +968,9 @@ knitr::kable(scorecard,
 
 best_model_mc <- res_lodo$perf %>%
   group_by(model) %>%
-  summarise(m = mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
-  arrange(desc(m)) %>%
-  slice(1) %>%
-  pull(model)
-
-cat("\nBest model:", best_model_mc, "\n")
+  summarise(m=mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(m)) %>% slice(1) %>% pull(model)
+cat("\nBest single model:", best_model_mc, "\n")
 ```
 
 ## Performance plots
@@ -1101,14 +1090,10 @@ fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te, n_per_class=50) {
   tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="linear",cost=1,probability=TRUE)
              ps  <- predict(fit,X_es,probability=TRUE)
              out[["SVM_Linear"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
-  tryCatch({ fit <- randomForest::randomForest(X_ti,y_tr)
-             out[["RF"]] <- predict(fit,X_ei,type="prob")[,lvls,drop=FALSE] }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw0,standardize=FALSE,type.multinomial="grouped")
              out[["LassoMC"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw0,standardize=FALSE,type.multinomial="grouped")
              out[["RidgeMC"]] <- gp(fit) }, error=function(e) NULL)
-  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw0,standardize=FALSE,type.multinomial="grouped")
-             out[["ElasticNetMC"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw0,trace=FALSE,MaxNWts=100000)
              pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
              if (is.null(dim(pm))) pm <- t(as.matrix(pm))
@@ -1134,14 +1119,10 @@ fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te, n_per_class=50) {
   tryCatch({ fit <- e1071::svm(X_ts,y_tr,kernel="linear",cost=1,probability=TRUE,class.weights=cw)
              ps  <- predict(fit,X_es,probability=TRUE)
              out[["SVM_Linear_w"]] <- attr(ps,"probabilities")[,lvls,drop=FALSE] }, error=function(e) NULL)
-  tryCatch({ fit <- randomForest::randomForest(X_ti,y_tr,classwt=cw)
-             out[["RF_w"]] <- predict(fit,X_ei,type="prob")[,lvls,drop=FALSE] }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=1,weights=sw,standardize=FALSE,type.multinomial="grouped")
              out[["LassoMC_w"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw,standardize=FALSE,type.multinomial="grouped")
              out[["RidgeMC_w"]] <- gp(fit) }, error=function(e) NULL)
-  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw,standardize=FALSE,type.multinomial="grouped")
-             out[["ElasticNetMC_w"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw,trace=FALSE,MaxNWts=100000)
              pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
              if (is.null(dim(pm))) pm <- t(as.matrix(pm))
