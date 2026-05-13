@@ -12,7 +12,37 @@ editor: visual
 library(dplyr)
 library(tibble)
 
-set.seed(3888)
+seed_base <- 3888L
+set.seed(seed_base)
+
+seed_from_label <- function(label, offset = 0L) {
+  label_int <- utf8ToInt(as.character(label))
+  label_hash <- sum(seq_along(label_int) * label_int)
+  as.integer((seed_base + label_hash + offset) %% (.Machine$integer.max - 1L))
+}
+
+make_cv_fold_spec <- function(y, label, max_folds = 5L) {
+  y_chr <- as.character(y)
+  min_class_n <- min(as.integer(table(y_chr)))
+  nfolds <- min(as.integer(max_folds), min_class_n)
+  nfolds <- max(2L, nfolds)
+  shift <- seed_from_label(label, 0L) %% nfolds
+  
+  foldid <- integer(length(y_chr))
+  
+  for (cls in sort(unique(y_chr))) {
+    idx <- which(y_chr == cls)
+    idx <- idx[order(idx)]
+    cls_folds <- rep(seq_len(nfolds), length.out = length(idx))
+    cls_folds <- ((cls_folds - 1L + shift) %% nfolds) + 1L
+    foldid[idx] <- cls_folds
+  }
+  
+  list(
+    foldid = foldid,
+    nfolds = nfolds
+  )
+}
 
 #load data
 dat <- readRDS("data/normalised/merged_normalised.rds")
@@ -21,9 +51,33 @@ expr <- dat$expr          # genes x samples expression matrix
 meta <- dat$meta          # sample metadata
 all_genes <- dat$all_genes
 dataset_ids <- dat$dataset_ids
+
+# Exclude datasets that should not be used in this model-building workflow
+excluded_datasets <- c("GSE15852", "GSE25066", "GSE9574")
+external_test_ds <- "GSE29044"
+expected_train_datasets <- c(
+  "GSE10810", "GSE29431", "GSE42568", "GSE45827",
+  "GSE54002", "GSE65194", "GSE7904"
+)
+expected_retained_datasets <- c(expected_train_datasets, external_test_ds)
+
+keep_idx <- !(meta$dataset %in% excluded_datasets)
+expr <- expr[, keep_idx, drop = FALSE]
+meta <- meta[keep_idx, , drop = FALSE]
+
+# Keep dataset_ids aligned if it stores one id per sample
+if (length(dataset_ids) == length(keep_idx)) {
+  dataset_ids <- dataset_ids[keep_idx]
+}
+
 dataset <- meta$dataset
 y <- factor(meta$Status, levels = c("Normal", "Cancer"))
-dataset_list <- unique(dataset)
+dataset_list <- sort(unique(as.character(dataset)))
+
+stopifnot(
+  setequal(unique(as.character(dataset)), expected_retained_datasets)
+)
+
 # Basic checks
 dim(expr)
 head(meta)
@@ -32,24 +86,35 @@ table(meta$dataset, meta$Status)
 # Define external test dataset
 # =========================================================
 
-external_test_ds <- "GSE42568"
-
 external_idx <- dataset == external_test_ds
 train_idx_all <- dataset != external_test_ds
 
-
 expr_external <- expr[, external_idx, drop = FALSE]
-meta_external <- meta[external_idx, ]
-
-
+meta_external <- meta[external_idx, , drop = FALSE]
 expr <- expr[, train_idx_all, drop = FALSE]
-meta <- meta[train_idx_all, ]
+meta <- meta[train_idx_all, , drop = FALSE]
 
 # dataset and y
 dataset <- meta$dataset
 y <- factor(meta$Status, levels = c("Normal", "Cancer"))
 
-dataset_list <- unique(dataset)
+dataset_list <- sort(unique(as.character(dataset)))
+
+stopifnot(
+  !any(dataset %in% c(excluded_datasets, external_test_ds)),
+  !any(meta_external$dataset %in% excluded_datasets),
+  ncol(expr_external) > 0,
+  nrow(meta_external) > 0,
+  all(meta_external$dataset == external_test_ds),
+  setequal(unique(as.character(dataset)), expected_train_datasets)
+)
+
+cat("Excluded datasets:", paste(excluded_datasets, collapse = ", "), "\n")
+cat("External test dataset:", external_test_ds, "\n")
+cat("Training datasets:", paste(sort(unique(as.character(dataset))), collapse = ", "), "\n")
+cat("External dataset distribution:\n")
+print(table(meta_external$dataset, meta_external$Status))
+
 all(colnames(expr) == rownames(meta))
 ```
 ```{r}
@@ -75,6 +140,7 @@ table(meta$dataset, meta$Status)
 
 # Convert label to factor
 meta$Status <- factor(meta$Status, levels = c("Normal", "Cancer"))
+y <- factor(meta$Status, levels = c("Normal", "Cancer"))
 
 
 
@@ -89,7 +155,7 @@ library(sva)
 library(limma)
 
 top_n <- 50
-dataset_list <- unique(dataset)
+dataset_list <- sort(unique(as.character(dataset)))
 
 lodo_gene_list <- list()
 
@@ -168,6 +234,7 @@ for (m in model_cols) {
 for (test_ds in dataset_list) {
   
   cat("\nLODO test dataset:", test_ds, "\n")
+  fold_seed <- seed_from_label(test_ds, 1000L)
   
   train_idx <- dataset != test_ds
   test_idx  <- dataset == test_ds
@@ -180,16 +247,20 @@ for (test_ds in dataset_list) {
   
   y_train <- y[train_idx]
   y_train_num <- ifelse(y_train == "Cancer", 1, 0)
+  cv_spec <- make_cv_fold_spec(y_train, paste0("lodo_", test_ds))
   
   # -----------------------------
   # Ridge
   # -----------------------------
+  set.seed(fold_seed + 1L)
   fit_ridge <- cv.glmnet(
     x = as.matrix(X_train),
     y = y_train_num,
     family = "binomial",
     alpha = 0,
-    type.measure = "auc"
+    type.measure = "auc",
+    foldid = cv_spec$foldid,
+    nfolds = cv_spec$nfolds
   )
   
   lodo_pred$Ridge[test_idx] <- as.numeric(
@@ -200,6 +271,7 @@ for (test_ds in dataset_list) {
   # -----------------------------
   # Random Forest
   # -----------------------------
+  set.seed(fold_seed + 2L)
   fit_rf <- randomForest(
     x = X_train,
     y = y_train,
@@ -215,6 +287,7 @@ for (test_ds in dataset_list) {
   # -----------------------------
   # SVM Linear
   # -----------------------------
+  set.seed(fold_seed + 3L)
   fit_svm_linear <- svm(
     x = X_train,
     y = y_train,
@@ -247,12 +320,15 @@ for (test_ds in dataset_list) {
   # -----------------------------
   # Elastic Net
   # -----------------------------
+  set.seed(fold_seed + 4L)
   fit_enet <- cv.glmnet(
     x = as.matrix(X_train),
     y = y_train_num,
     family = "binomial",
     alpha = 0.5,
-    type.measure = "auc"
+    type.measure = "auc",
+    foldid = cv_spec$foldid,
+    nfolds = cv_spec$nfolds
   )
   
   lodo_pred$ElasticNet[test_idx] <- as.numeric(
@@ -263,12 +339,15 @@ for (test_ds in dataset_list) {
   # -----------------------------
   # LASSO
   # -----------------------------
+  set.seed(fold_seed + 5L)
   fit_lasso <- cv.glmnet(
     x = as.matrix(X_train),
     y = y_train_num,
     family = "binomial",
     alpha = 1,
-    type.measure = "auc"
+    type.measure = "auc",
+    foldid = cv_spec$foldid,
+    nfolds = cv_spec$nfolds
   )
   
   lodo_pred$LASSO[test_idx] <- as.numeric(
@@ -279,6 +358,7 @@ for (test_ds in dataset_list) {
   # -----------------------------
   # SVM RBF
   # -----------------------------
+  set.seed(fold_seed + 6L)
   fit_svm_rbf <- svm(
     x = X_train,
     y = y_train,
@@ -392,8 +472,20 @@ plot_tbl
 
 ggplot(plot_tbl, aes(x = mean_abs_cor, y = auc, label = model)) +
   geom_point(size = 3, color = "grey20") +
-  geom_text_repel(size = 5, max.overlaps = Inf) +
+  ggrepel::geom_text_repel(
+    size = 4.5,
+    max.overlaps = Inf,
+    box.padding = 0.45,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    segment.color = "grey60",
+    seed = 3888
+  ) +
+  coord_cartesian(clip = "off") +
   theme_minimal(base_size = 16) +
+  theme(
+    plot.margin = margin(10, 80, 10, 10)
+  ) +
   labs(
     title = "Performance vs Redundancy",
     subtitle = "Better candidates are high AUC and relatively low correlation",
@@ -406,7 +498,7 @@ ggplot(plot_tbl, aes(x = mean_abs_cor, y = auc, label = model)) +
 # Step 7: Prepare meta-model training data
 # =========================================================
 
-selected_models <- c("NaiveBayes", "RF", "Ridge")
+selected_models <- c("NaiveBayes", "ElasticNet", "SVM_RBF")
 
 meta_X <- lodo_pred[, selected_models]
 meta_y <- factor(lodo_pred$truth, levels = c("Normal", "Cancer"))
@@ -424,7 +516,7 @@ table(meta_y)
 # 1. Select final base models
 # -----------------------------
 
-selected_models <- c("NaiveBayes", "RF", "Ridge")
+selected_models <- c("NaiveBayes", "ElasticNet", "SVM_RBF")
 
 meta_train_data <- lodo_pred[, c("sample_id", "dataset", "truth", selected_models)]
 
@@ -541,7 +633,7 @@ bce_loss_smoothed <- function(
 # 6. Train attention meta model
 # -----------------------------
 
-set.seed(3888)
+set.seed(seed_from_label("attention_meta_model", 4000L))
 
 n_models <- ncol(X_meta_train_att)
 
@@ -729,6 +821,51 @@ y_full_num <- ifelse(y_full == "Cancer", 1, 0)
 # Check
 dim(X_full)
 table(y_full)
+
+# PCA of merged training set after ComBat
+gene_var <- apply(expr, 1, var, na.rm = TRUE)
+keep_genes <- gene_var > 0
+
+if (sum(keep_genes) >= 5 && ncol(expr) >= 2) {
+  top_pca_genes <- names(sort(gene_var[keep_genes], decreasing = TRUE))[
+    1:min(2000, sum(keep_genes))
+  ]
+  
+  expr_pca <- expr[top_pca_genes, , drop = FALSE]
+  
+  if (anyNA(expr_pca)) {
+    row_means <- rowMeans(expr_pca, na.rm = TRUE)
+    expr_pca[is.na(expr_pca)] <- row_means[row(expr_pca)[is.na(expr_pca)]]
+  }
+  
+  pca <- prcomp(t(expr_pca), scale. = TRUE)
+  var_exp <- pca$sdev^2 / sum(pca$sdev^2)
+  
+  pca_df <- data.frame(
+    PC1 = pca$x[, 1],
+    PC2 = pca$x[, 2],
+    dataset = meta$dataset,
+    Status = meta$Status,
+    sample_id = rownames(meta)
+  )
+  
+  ggplot2::ggplot(
+    pca_df,
+    ggplot2::aes(x = PC1, y = PC2, color = dataset, shape = Status)
+  ) +
+    ggplot2::geom_point(size = 3, alpha = 0.85) +
+    ggplot2::theme_bw(base_size = 13) +
+    ggplot2::labs(
+      title = "PCA of merged training set after ComBat",
+      subtitle = paste0("External test dataset excluded: ", external_test_ds),
+      x = paste0("PC1 (", round(var_exp[1] * 100, 1), "%)"),
+      y = paste0("PC2 (", round(var_exp[2] * 100, 1), "%)"),
+      color = "Dataset",
+      shape = "Status"
+    )
+} else {
+  message("Skipping PCA plot: insufficient genes or samples.")
+}
 ```
 # Ensemble train(base models)
 ```{r}
@@ -742,21 +879,29 @@ fit_nb_full <- naiveBayes(
   y = y_full
 )
 
-# Random Forest
-fit_rf_full <- randomForest(
-  x = X_full,
-  y = y_full,
-  ntree = 500
-)
-
-# Ridge
-fit_ridge_full <- cv.glmnet(
+# Elastic Net
+set.seed(seed_from_label("full_elasticnet", 5000L))
+full_cv_spec <- make_cv_fold_spec(y_full, "full_elasticnet")
+fit_enet_full <- cv.glmnet(
   x = as.matrix(X_full),
   y = y_full_num,
   family = "binomial",
-  alpha = 0,
-  type.measure = "auc"
+  alpha = 0.5,
+  type.measure = "auc",
+  foldid = full_cv_spec$foldid,
+  nfolds = full_cv_spec$nfolds
 )
+
+# SVM RBF
+set.seed(seed_from_label("full_svm_rbf", 5001L))
+fit_svm_rbf_full <- svm(
+  x = X_full,
+  y = y_full,
+  kernel = "radial",
+  probability = TRUE,
+  scale = TRUE
+)
+
 full_pred <- data.frame(
   NaiveBayes = predict(
     fit_nb_full,
@@ -764,32 +909,31 @@ full_pred <- data.frame(
     type = "raw"
   )[,"Cancer"],
   
-  RF = predict(
-    fit_rf_full,
-    newdata = X_full,
-    type = "prob"
-  )[,"Cancer"],
-  
-  Ridge = as.numeric(
+  ElasticNet = as.numeric(
     predict(
-      fit_ridge_full,
+      fit_enet_full,
       newx = as.matrix(X_full),
       s = "lambda.min",
       type = "response"
     )
-  )
+  ),
+  
+  SVM_RBF = attr(
+    predict(fit_svm_rbf_full, X_full, probability = TRUE),
+    "probabilities"
+  )[,"Cancer"]
 )
 head(full_pred)
 summary(full_pred)
 saveRDS(fit_nb_full, "models/nb_full.rds")
-saveRDS(fit_rf_full, "models/rf_full.rds")
-saveRDS(fit_ridge_full, "models/ridge_full.rds")
+saveRDS(fit_enet_full, "models/elasticnet_full.rds")
+saveRDS(fit_svm_rbf_full, "models/svm_rbf_full.rds")
    
 ```
 # Ensemble Testing(main model)
 ```{r}
 # =========================================================
-# External test on GSE42568
+# External test on the held-out dataset
 # =========================================================
 
 library(pROC)
@@ -803,7 +947,13 @@ y_external <- factor(meta_external$Status, levels = c("Normal", "Cancer"))
 
 dim(X_external)
 table(y_external)
-# 2. Base model predictions on GSE42568
+# 2. Base model predictions on the held-out dataset
+
+pred_svm_rbf_external <- predict(
+  fit_svm_rbf_full,
+  X_external,
+  probability = TRUE
+)
 
 external_pred <- data.frame(
   NaiveBayes = predict(
@@ -812,20 +962,16 @@ external_pred <- data.frame(
     type = "raw"
   )[,"Cancer"],
   
-  RF = predict(
-    fit_rf_full,
-    newdata = X_external,
-    type = "prob"
-  )[,"Cancer"],
-  
-  Ridge = as.numeric(
+  ElasticNet = as.numeric(
     predict(
-      fit_ridge_full,
+      fit_enet_full,
       newx = as.matrix(X_external),
       s = "lambda.min",
       type = "response"
     )
-  )
+  ),
+  
+  SVM_RBF = attr(pred_svm_rbf_external, "probabilities")[,"Cancer"]
 )
 
 head(external_pred)
@@ -901,7 +1047,7 @@ external_results
 
 plot(
   roc_obj,
-  main = paste0("External Test ROC: GSE42568, AUC = ", round(external_auc, 3))
+  main = paste0("External Test ROC: ", external_test_ds, ", AUC = ", round(external_auc, 3))
 )
 
 # 6. Risk score distribution plot
@@ -915,7 +1061,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
   geom_density(alpha = 0.45) +
   theme_minimal(base_size = 15) +
   labs(
-    title = "External Test Risk Score Distribution: GSE42568",
+    title = paste0("External Test Risk Score Distribution: ", external_test_ds),
     x = "Predicted cancer risk score",
     y = "Density",
     fill = "True label"
@@ -928,7 +1074,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
   ) +
   theme_minimal(base_size = 15) +
   labs(
-    title = "External Test Risk Score Distribution: GSE42568",
+    title = paste0("External Test Risk Score Distribution: ", external_test_ds),
     x = "Predicted risk score",
     y = "Count",
     fill = "True label"
@@ -942,49 +1088,49 @@ y_external <- factor(meta_external$Status, levels = c("Normal", "Cancer"))
 
 dim(X_external)
 table(y_external)
-ridge_pred <- as.numeric(
+enet_pred <- as.numeric(
   predict(
-    fit_ridge_full,
+    fit_enet_full,
     newx = as.matrix(X_external),
     s = "lambda.min",
     type = "response"
   )
 )
 
-head(ridge_pred)
-summary(ridge_pred)
+head(enet_pred)
+summary(enet_pred)
 eps <- 1e-6
 
-ridge_logit_score <- qlogis(
-  pmin(pmax(ridge_pred, eps), 1 - eps)
+enet_logit_score <- qlogis(
+  pmin(pmax(enet_pred, eps), 1 - eps)
 )
 
-summary(ridge_logit_score)
+summary(enet_logit_score)
 library(pROC)
 
 roc_obj <- roc(
   response = y_external,
-  predictor = ridge_pred,
+  predictor = enet_pred,
   levels = c("Normal", "Cancer"),
   direction = "<"
 )
 
-ridge_auc <- as.numeric(auc(roc_obj))
-ridge_auc
+enet_auc <- as.numeric(auc(roc_obj))
+enet_auc
 library(caret)
 
-ridge_class <- ifelse(ridge_pred >= 0.5, "Cancer", "Normal")
-ridge_class <- factor(ridge_class, levels = c("Normal", "Cancer"))
+enet_class <- ifelse(enet_pred >= 0.5, "Cancer", "Normal")
+enet_class <- factor(enet_class, levels = c("Normal", "Cancer"))
 
 cm <- confusionMatrix(
-  data = ridge_class,
+  data = enet_class,
   reference = y_external,
   positive = "Cancer"
 )
 
 cm
-ridge_results <- data.frame(
-  AUC = ridge_auc,
+enet_results <- data.frame(
+  AUC = enet_auc,
   Accuracy = cm$overall["Accuracy"],
   BalancedAccuracy = cm$byClass["Balanced Accuracy"],
   Sensitivity = cm$byClass["Sensitivity"],
@@ -993,11 +1139,11 @@ ridge_results <- data.frame(
   F1 = cm$byClass["F1"]
 )
 
-ridge_results
+enet_results
 library(ggplot2)
 
 plot_df <- data.frame(
-  risk_score = ridge_logit_score,
+  risk_score = enet_logit_score,
   truth = y_external
 )
 
@@ -1005,7 +1151,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
   geom_density(alpha = 0.45) +
   theme_minimal(base_size = 15) +
   labs(
-    title = "Ridge Risk Score Distribution (External Test)",
+    title = paste0("Elastic Net Risk Score Distribution (External Test ", external_test_ds, ")"),
     x = "Predicted risk score",
     y = "Density",
     fill = "True label"
@@ -1018,7 +1164,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
   ) +
   theme_minimal(base_size = 15) +
   labs(
-    title = "Ridge Risk Score Distribution (External Test)",
+    title = paste0("Elastic Net Risk Score Distribution (External Test ", external_test_ds, ")"),
     x = "Predicted risk score",
     y = "Count",
     fill = "True label"
@@ -1047,6 +1193,7 @@ make_bootstrap_indices <- function(dataset, y) {
 ```
 
 ```{r}
+set.seed(seed_from_label("bootstrap_preview", 6000L))
 boot_idx <- make_bootstrap_indices(dataset, y)
 
 table(dataset, y)
@@ -1069,7 +1216,9 @@ rownames(bootstrap_scores) <- colnames(expr_external)
 for (b in 1:B) {
   
   cat("Bootstrap:", b, "\n")
+  boot_seed <- seed_from_label(paste0("bootstrap_", b), 7000L)
   
+  set.seed(boot_seed)
   boot_idx <- make_bootstrap_indices(dataset, y)
   
   X_boot <- t(expr[final_top_genes, boot_idx, drop = FALSE])
@@ -1081,18 +1230,25 @@ for (b in 1:B) {
     y = y_boot
   )
   
-  fit_rf_boot <- randomForest(
-    x = X_boot,
-    y = y_boot,
-    ntree = 500
-  )
-  
-  fit_ridge_boot <- cv.glmnet(
+  set.seed(boot_seed + 1L)
+  boot_cv_spec <- make_cv_fold_spec(y_boot, paste0("bootstrap_", b, "_elasticnet"))
+  fit_enet_boot <- cv.glmnet(
     x = as.matrix(X_boot),
     y = y_boot_num,
     family = "binomial",
-    alpha = 0,
-    type.measure = "auc"
+    alpha = 0.5,
+    type.measure = "auc",
+    foldid = boot_cv_spec$foldid,
+    nfolds = boot_cv_spec$nfolds
+  )
+  
+  set.seed(boot_seed + 2L)
+  fit_svm_rbf_boot <- svm(
+    x = X_boot,
+    y = y_boot,
+    kernel = "radial",
+    probability = TRUE,
+    scale = TRUE
   )
   
   # save models
@@ -1100,21 +1256,27 @@ for (b in 1:B) {
   dir.create(boot_dir, recursive = TRUE, showWarnings = FALSE)
   
   saveRDS(fit_nb_boot, file.path(boot_dir, "nb.rds"))
-  saveRDS(fit_rf_boot, file.path(boot_dir, "rf.rds"))
-  saveRDS(fit_ridge_boot, file.path(boot_dir, "ridge.rds"))
+  saveRDS(fit_enet_boot, file.path(boot_dir, "elasticnet.rds"))
+  saveRDS(fit_svm_rbf_boot, file.path(boot_dir, "svm_rbf.rds"))
   
   # predict external test
+  pred_svm_rbf_boot <- predict(
+    fit_svm_rbf_boot,
+    X_external,
+    probability = TRUE
+  )
+  
   pred_ext_boot <- data.frame(
     NaiveBayes = predict(fit_nb_boot, X_external, type = "raw")[,"Cancer"],
-    RF = predict(fit_rf_boot, X_external, type = "prob")[,"Cancer"],
-    Ridge = as.numeric(
+    ElasticNet = as.numeric(
       predict(
-        fit_ridge_boot,
+        fit_enet_boot,
         newx = as.matrix(X_external),
         s = "lambda.min",
         type = "response"
       )
-    )
+    ),
+    SVM_RBF = attr(pred_svm_rbf_boot, "probabilities")[,"Cancer"]
   )
   
   X_prob_boot <- as.matrix(pred_ext_boot[, attention_model$selected_models])
@@ -1133,12 +1295,22 @@ for (b in 1:B) {
 ```
 
 ```{r}
+bootstrap_ci_level <- 0.80
+bootstrap_alpha <- 1 - bootstrap_ci_level
+bootstrap_ci_label <- paste0(round(bootstrap_ci_level * 100), "% bootstrap interval")
+
 bootstrap_summary <- data.frame(
   sample_id = rownames(bootstrap_scores),
   truth = y_external,
   risk_mean = rowMeans(bootstrap_scores, na.rm = TRUE),
-  risk_lower = apply(bootstrap_scores, 1, quantile, probs = 0.025, na.rm = TRUE),
-  risk_upper = apply(bootstrap_scores, 1, quantile, probs = 0.975, na.rm = TRUE)
+  risk_lower = apply(
+    bootstrap_scores, 1, quantile,
+    probs = bootstrap_alpha / 2, na.rm = TRUE
+  ),
+  risk_upper = apply(
+    bootstrap_scores, 1, quantile,
+    probs = 1 - bootstrap_alpha / 2, na.rm = TRUE
+  )
 )
 
 head(bootstrap_summary)
@@ -1167,7 +1339,7 @@ ggplot(plot_boot, aes(x = sample_order, y = risk_mean, color = truth)) +
   coord_flip() +
   theme_minimal(base_size = 14) +
   labs(
-    title = "Bootstrap Risk Score with 95% CI on GSE42568",
+    title = paste0("Bootstrap Risk Score with ", bootstrap_ci_label, " on ", external_test_ds),
     x = "External test samples",
     y = "Predicted cancer risk score",
     color = "True label"
@@ -1177,7 +1349,7 @@ ggplot(plot_boot, aes(x = risk_mean, fill = truth)) +
   geom_vline(xintercept = 0.5, linetype = "dashed") +
   theme_minimal(base_size = 15) +
   labs(
-    title = "Bootstrap Mean Risk Score Distribution on GSE42568",
+    title = paste0("Bootstrap Mean Risk Score Distribution on ", external_test_ds),
     x = "Bootstrap mean cancer risk score",
     y = "Density",
     fill = "True label"
@@ -1198,8 +1370,8 @@ main_risk <- external_risk_score[sample_idx]
 
 boot_risks <- bootstrap_scores[sample_idx, ]
 
-ci_low <- quantile(boot_risks, 0.25, na.rm = TRUE)
-ci_high <- quantile(boot_risks, 0.975, na.rm = TRUE)
+ci_low <- quantile(boot_risks, bootstrap_alpha / 2, na.rm = TRUE)
+ci_high <- quantile(boot_risks, 1 - bootstrap_alpha / 2, na.rm = TRUE)
 
 main_risk
 ci_low
@@ -1220,11 +1392,154 @@ ggplot(single_df, aes(x = risk)) +
     title = paste0("Prediction uncertainty for sample: ", sample_id_use),
     subtitle = paste0(
       "Main risk = ", round(main_risk, 3),
-      " | 95% CI = [", round(ci_low, 3), ", ", round(ci_high, 3), "]"
+      " | ", bootstrap_ci_label, " = [", round(ci_low, 3), ", ", round(ci_high, 3), "]"
     ),
     x = "Predicted cancer risk score",
     y = "Bootstrap model count"
   )
 ```
+
+# Elastic Net only bootstrap uncertainty
+```{r}
+elastic_bootstrap_scores <- matrix(
+  NA_real_,
+  nrow = nrow(X_external),
+  ncol = B
+)
+
+rownames(elastic_bootstrap_scores) <- rownames(X_external)
+
+for (b in 1:B) {
+  enet_file <- file.path(
+    "models",
+    sprintf("bootstrap_%03d", b),
+    "elasticnet.rds"
+  )
+  
+  stopifnot(file.exists(enet_file))
+  
+  fit_enet_boot <- readRDS(enet_file)
+  
+  elastic_bootstrap_scores[, b] <- as.numeric(
+    predict(
+      fit_enet_boot,
+      newx = as.matrix(X_external),
+      s = "lambda.min",
+      type = "response"
+    )
+  )
+}
+
+dim(elastic_bootstrap_scores)
+head(elastic_bootstrap_scores[, 1:min(5, ncol(elastic_bootstrap_scores)), drop = FALSE])
+```
+
+```{r}
+elastic_bootstrap_summary <- data.frame(
+  sample_id = rownames(elastic_bootstrap_scores),
+  truth = y_external,
+  risk_mean = rowMeans(elastic_bootstrap_scores, na.rm = TRUE),
+  risk_lower = apply(
+    elastic_bootstrap_scores, 1, quantile,
+    probs = bootstrap_alpha / 2, na.rm = TRUE
+  ),
+  risk_upper = apply(
+    elastic_bootstrap_scores, 1, quantile,
+    probs = 1 - bootstrap_alpha / 2, na.rm = TRUE
+  )
+)
+
+head(elastic_bootstrap_summary)
+```
+
+```{r}
+plot_elastic_boot <- elastic_bootstrap_summary %>%
+  mutate(
+    sample_order = reorder(sample_id, risk_mean),
+    truth = factor(truth, levels = c("Normal", "Cancer"))
+  )
+
+ggplot(plot_elastic_boot, aes(x = sample_order, y = risk_mean, color = truth)) +
+  geom_point(size = 2.2) +
+  geom_errorbar(
+    aes(ymin = risk_lower, ymax = risk_upper),
+    width = 0.25,
+    alpha = 0.7
+  ) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste0(
+      "Elastic Net Bootstrap Risk Score with ",
+      bootstrap_ci_label,
+      " on ",
+      external_test_ds
+    ),
+    x = "External test samples",
+    y = "Predicted cancer risk score",
+    color = "True label"
+  )
+
+ggplot(plot_elastic_boot, aes(x = risk_mean, fill = truth)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0.5, linetype = "dashed") +
+  theme_minimal(base_size = 15) +
+  labs(
+    title = paste0("Elastic Net Bootstrap Mean Risk Score Distribution on ", external_test_ds),
+    x = "Bootstrap mean cancer risk score",
+    y = "Density",
+    fill = "True label"
+  )
+```
+
+```{r}
+elastic_uncertain_samples <- elastic_bootstrap_summary %>%
+  mutate(distance_to_05 = abs(risk_mean - 0.5)) %>%
+  arrange(distance_to_05)
+
+head(elastic_uncertain_samples, 10)
+elastic_sample_id_use <- elastic_uncertain_samples$sample_id[1]
+elastic_sample_idx <- which(rownames(elastic_bootstrap_scores) == elastic_sample_id_use)
+
+elastic_main_risk <- enet_pred[elastic_sample_idx]
+elastic_boot_risks <- elastic_bootstrap_scores[elastic_sample_idx, ]
+
+elastic_ci_low <- quantile(elastic_boot_risks, bootstrap_alpha / 2, na.rm = TRUE)
+elastic_ci_high <- quantile(elastic_boot_risks, 1 - bootstrap_alpha / 2, na.rm = TRUE)
+
+elastic_single_df <- data.frame(
+  risk = as.numeric(elastic_boot_risks)
+)
+
+ggplot(elastic_single_df, aes(x = risk)) +
+  geom_histogram(bins = 25, alpha = 0.7) +
+  geom_vline(xintercept = elastic_main_risk, linewidth = 1.2) +
+  geom_vline(xintercept = elastic_ci_low, linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = elastic_ci_high, linetype = "dashed", linewidth = 1) +
+  theme_minimal(base_size = 15) +
+  labs(
+    title = paste0("Elastic Net prediction uncertainty for sample: ", elastic_sample_id_use),
+    subtitle = paste0(
+      "Main risk = ", round(elastic_main_risk, 3),
+      " | ", bootstrap_ci_label, " = [",
+      round(elastic_ci_low, 3), ", ", round(elastic_ci_high, 3), "]"
+    ),
+    x = "Predicted cancer risk score",
+    y = "Bootstrap model count"
+  )
+```
+
+
+
+
+
+
+
+
+
 
 
