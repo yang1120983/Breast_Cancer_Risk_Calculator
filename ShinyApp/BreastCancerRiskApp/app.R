@@ -348,7 +348,7 @@ ui <- fluidPage(
               div(
                 h3("Selected Sample Gene Expression"),
                 div(class = "sample-subtitle",
-                    "Horizontal boxplots show cohort-level expression distribution. Red triangles indicate the selected patient. Exact values and abnormal gene summaries are shown below.")
+                    "Genes shown include the highest- and lowest-expression genes for the selected patient. Genes are ordered from highest to lowest patient expression. Horizontal boxplots show cohort-level distribution, and red triangles indicate the selected patient.")
               )
           ),
           uiOutput("gene_expression_plot_ui"),
@@ -390,11 +390,24 @@ server <- function(input, output, session) {
     
     gene_data <- gene_data[, available_genes, drop = FALSE]
     
-    gene_vars <- apply(gene_data, 2, var, na.rm = TRUE)
-    gene_count <- as.numeric(input$plot_gene_count)
-    top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:min(gene_count, length(gene_vars))]
-    
     selected_index <- which(data[[1]] == input$selected_sample)[1]
+    
+    all_patient_values <- as.numeric(gene_data[selected_index, available_genes])
+    names(all_patient_values) <- available_genes
+    
+    gene_count <- as.numeric(input$plot_gene_count)
+    
+    ordered_high <- names(sort(all_patient_values, decreasing = TRUE, na.last = NA))
+    ordered_low  <- names(sort(all_patient_values, decreasing = FALSE, na.last = NA))
+    
+    n_high <- ceiling(gene_count / 2)
+    n_low  <- floor(gene_count / 2)
+    
+    high_genes <- ordered_high[1:min(n_high, length(ordered_high))]
+    low_genes  <- ordered_low[1:min(n_low, length(ordered_low))]
+    
+    top_genes <- unique(c(high_genes, low_genes))
+    
     selected_values <- as.numeric(gene_data[selected_index, top_genes])
     
     cohort_median <- apply(gene_data[, top_genes, drop = FALSE], 2, median, na.rm = TRUE)
@@ -520,9 +533,13 @@ server <- function(input, output, session) {
   output$gene_expression_plot <- renderPlot({
     gs <- gene_summary()
     
-    top_genes <- rev(gs$top_genes)
-    plot_data <- gs$gene_data[, top_genes, drop = FALSE]
-    selected_values <- rev(gs$selected_values)
+    ordered_index <- order(gs$selected_values, decreasing = TRUE)
+    
+    top_genes <- gs$top_genes[ordered_index]
+    selected_values <- gs$selected_values[ordered_index]
+    
+    plot_data <- gs$gene_data[, rev(top_genes), drop = FALSE]
+    selected_values <- rev(selected_values)
     
     par(mar = c(5, 8, 4, 2))
     
@@ -535,7 +552,7 @@ server <- function(input, output, session) {
       lwd = 1.6,
       las = 1,
       xlab = "Gene Expression",
-      main = "Patient Gene Expression Relative to Cohort Distribution",
+      main = "Patient Gene Expression Ordered from High to Low",
       cex.axis = 0.9,
       cex.lab = 1.1,
       cex.main = 1.2
@@ -570,11 +587,11 @@ server <- function(input, output, session) {
     )
     
     high_genes <- summary_df[summary_df$Status == "High", ]
-    high_genes <- high_genes[order(-high_genes$Percentile), ]
+    high_genes <- high_genes[order(-high_genes$PatientValue), ]
     high_genes <- head(high_genes, 3)
     
     low_genes <- summary_df[summary_df$Status == "Low", ]
-    low_genes <- low_genes[order(low_genes$Percentile), ]
+    low_genes <- low_genes[order(low_genes$PatientValue), ]
     low_genes <- head(low_genes, 3)
     
     high_items <- if (nrow(high_genes) == 0) {
@@ -793,7 +810,7 @@ server <- function(input, output, session) {
         ",
         h2("⚠️ HIGH RISK", style = "color:#ff3b30; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"),
         p("The gene expression profile indicates a high predicted risk.", style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"),
-        p("Further clinical assessment and molecular subtyping are recommended.", style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;")
+        p("Further clinical assessment and molecular subtype assessment is recommended.", style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;")
       )
     } else if (risk >= 0.4) {
       div(
