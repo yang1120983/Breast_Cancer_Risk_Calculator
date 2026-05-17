@@ -256,32 +256,17 @@ ui <- fluidPage(
         accept = c(".csv", ".txt")
       ),
       
-      actionButton("load_demo", "Load Demo Dataset"),
+      actionButton("load_demo", "Reload Demo Dataset"),
       
       hr(),
       
       uiOutput("sample_selector"),
       
       selectInput(
-        "gene_panel",
-        "Gene panel size",
-        choices = c(
-          "50 genes" = 50,
-          "100 genes" = 100,
-          "200 genes" = 200,
-          "500 genes" = 500,
-          "700 genes" = 700
-        ),
-        selected = 50
-      ),
-      
-      selectInput(
         "plot_gene_count",
         "Number of genes shown in plot",
         choices = c(
-          "5 genes" = 5,
           "10 genes" = 10,
-          "15 genes" = 15,
           "20 genes" = 20
         ),
         selected = 10
@@ -296,11 +281,7 @@ ui <- fluidPage(
       
       hr(),
       
-      downloadButton(
-        "download_report",
-        "Download Patient Report",
-        class = "btn-primary"
-      )
+      uiOutput("download_ui")
     ),
     
     mainPanel(
@@ -369,8 +350,54 @@ server <- function(input, output, session) {
   
   final_top_genes <- paste0("Gene", 1:50)
   
-  dataset <- reactiveVal(NULL)
+  make_demo_data <- function() {
+    set.seed(3888)
+    
+    data.frame(
+      sample_id = paste0("Patient_", 1:100),
+      matrix(
+        rnorm(100 * 50),
+        nrow = 100,
+        ncol = 50,
+        dimnames = list(NULL, final_top_genes)
+      )
+    )
+  }
+  
+  dataset <- reactiveVal(make_demo_data())
   prediction_values <- reactiveVal(NULL)
+  
+  observeEvent(input$load_demo, {
+    dataset(make_demo_data())
+    prediction_values(NULL)
+  })
+  
+  observeEvent(input$demo_file, {
+    req(input$demo_file)
+    
+    data <- read.csv(input$demo_file$datapath, check.names = FALSE)
+    
+    data$PatientID <- paste0(
+      "Patient_",
+      sprintf("%03d", 1:nrow(data))
+    )
+    
+    data <- data[, c(ncol(data), 1:(ncol(data) - 1))]
+    dataset(data)
+    prediction_values(NULL)
+  })
+  
+  output$sample_selector <- renderUI({
+    req(dataset())
+    data <- dataset()
+    
+    selectInput(
+      "selected_sample",
+      "Select sample / patient",
+      choices = data[[1]],
+      selected = data[[1]][1]
+    )
+  })
   
   gene_summary <- reactive({
     req(dataset())
@@ -409,6 +436,11 @@ server <- function(input, output, session) {
     top_genes <- unique(c(high_genes, low_genes))
     
     selected_values <- as.numeric(gene_data[selected_index, top_genes])
+    
+    ordering <- order(selected_values, decreasing = TRUE)
+    
+    top_genes <- top_genes[ordering]
+    selected_values <- selected_values[ordering]
     
     cohort_median <- apply(gene_data[, top_genes, drop = FALSE], 2, median, na.rm = TRUE)
     
@@ -517,8 +549,13 @@ server <- function(input, output, session) {
     angle <- pi * (1 - risk)
     needle_length <- 0.78
     
-    segments(0, 0, needle_length * cos(angle), needle_length * sin(angle),
-             lwd = 5, col = "#1d1d1f")
+    segments(
+      0, 0,
+      needle_length * cos(angle),
+      needle_length * sin(angle),
+      lwd = 5,
+      col = "#1d1d1f"
+    )
     
     points(0, 0, pch = 19, cex = 2.2, col = "#1d1d1f")
     
@@ -526,17 +563,21 @@ server <- function(input, output, session) {
     text(1.03, -0.08, "1", cex = 1.15, font = 2, col = "#1d1d1f")
     text(0, -0.27, risk, cex = 2.5, font = 2, col = "#ff3b30")
     text(0, -0.47, "Risk Score", cex = 0.95, font = 2, col = "#6e6e73")
-    text(0, -0.6, "Range: 0 (Low Risk) – 1 (High Risk)",
-         cex = 0.95, font = 2, col = "#6e6e73")
+    text(
+      0,
+      -0.6,
+      "Range: 0 (Low Risk) – 1 (High Risk)",
+      cex = 0.95,
+      font = 2,
+      col = "#6e6e73"
+    )
   })
   
   output$gene_expression_plot <- renderPlot({
     gs <- gene_summary()
     
-    ordered_index <- order(gs$selected_values, decreasing = TRUE)
-    
-    top_genes <- gs$top_genes[ordered_index]
-    selected_values <- gs$selected_values[ordered_index]
+    top_genes <- gs$top_genes
+    selected_values <- gs$selected_values
     
     plot_data <- gs$gene_data[, rev(top_genes), drop = FALSE]
     selected_values <- rev(selected_values)
@@ -601,9 +642,16 @@ server <- function(input, output, session) {
         div(
           class = "abnormal-item",
           span(class = "abnormal-gene", high_genes$Gene[i]),
-          span(class = "abnormal-high",
-               paste0("▲ ", round(high_genes$PatientValue[i], 4),
-                      " (", high_genes$Percentile[i], "%)"))
+          span(
+            class = "abnormal-high",
+            paste0(
+              "▲ ",
+              round(high_genes$PatientValue[i], 4),
+              " (",
+              high_genes$Percentile[i],
+              "%)"
+            )
+          )
         )
       })
     }
@@ -615,9 +663,16 @@ server <- function(input, output, session) {
         div(
           class = "abnormal-item",
           span(class = "abnormal-gene", low_genes$Gene[i]),
-          span(class = "abnormal-low",
-               paste0("▼ ", round(low_genes$PatientValue[i], 4),
-                      " (", low_genes$Percentile[i], "%)"))
+          span(
+            class = "abnormal-low",
+            paste0(
+              "▼ ",
+              round(low_genes$PatientValue[i], 4),
+              " (",
+              low_genes$Percentile[i],
+              "%)"
+            )
+          )
         )
       })
     }
@@ -665,7 +720,7 @@ server <- function(input, output, session) {
       rownames = FALSE,
       options = list(
         pageLength = min(as.numeric(input$plot_gene_count), 10),
-        lengthMenu = c(5, 10, 15, 20),
+        lengthMenu = c(10, 20),
         dom = "tip",
         ordering = FALSE,
         autoWidth = TRUE
@@ -676,47 +731,6 @@ server <- function(input, output, session) {
     dt <- formatStyle(dt, "Patient Value", fontWeight = "700")
     
     dt
-  })
-  
-  observeEvent(input$demo_file, {
-    req(input$demo_file)
-    
-    data <- read.csv(input$demo_file$datapath, check.names = FALSE)
-    
-    data$PatientID <- paste0(
-      "Patient_",
-      sprintf("%03d", 1:nrow(data))
-    )
-    
-    data <- data[, c(ncol(data), 1:(ncol(data) - 1))]
-    dataset(data)
-  })
-  
-  observeEvent(input$load_demo, {
-    set.seed(3888)
-    
-    demo_data <- data.frame(
-      sample_id = paste0("Patient_", 1:100),
-      matrix(
-        rnorm(100 * 50),
-        nrow = 100,
-        ncol = 50,
-        dimnames = list(NULL, final_top_genes)
-      )
-    )
-    
-    dataset(demo_data)
-  })
-  
-  output$sample_selector <- renderUI({
-    req(dataset())
-    data <- dataset()
-    
-    selectInput(
-      "selected_sample",
-      "Select sample / patient",
-      choices = data[[1]]
-    )
   })
   
   output$gene_check <- renderText({
@@ -740,6 +754,9 @@ server <- function(input, output, session) {
   observeEvent(input$run_prediction, {
     req(dataset())
     req(input$selected_sample)
+    
+    patient_seed <- sum(utf8ToInt(input$selected_sample))
+    set.seed(patient_seed)
     
     rf_pred <- round(runif(1, 0.65, 0.90), 3)
     ridge_pred <- round(runif(1, 0.60, 0.88), 3)
@@ -765,23 +782,40 @@ server <- function(input, output, session) {
     
     risk <- prediction_values()$meta
     
-    low_class <- if (risk < 0.4) "risk-level-card risk-level-low risk-level-active" else "risk-level-card risk-level-low"
-    medium_class <- if (risk >= 0.4 && risk < 0.7) "risk-level-card risk-level-medium risk-level-active" else "risk-level-card risk-level-medium"
-    high_class <- if (risk >= 0.7) "risk-level-card risk-level-high risk-level-active" else "risk-level-card risk-level-high"
+    low_class <- if (risk < 0.4) {
+      "risk-level-card risk-level-low risk-level-active"
+    } else {
+      "risk-level-card risk-level-low"
+    }
+    
+    medium_class <- if (risk >= 0.4 && risk < 0.7) {
+      "risk-level-card risk-level-medium risk-level-active"
+    } else {
+      "risk-level-card risk-level-medium"
+    }
+    
+    high_class <- if (risk >= 0.7) {
+      "risk-level-card risk-level-high risk-level-active"
+    } else {
+      "risk-level-card risk-level-high"
+    }
     
     div(
       class = "risk-level-list",
-      div(class = low_class,
-          div(class = "risk-level-title", "Low"),
-          div(class = "risk-level-range", "0.0 – 0.4")
+      div(
+        class = low_class,
+        div(class = "risk-level-title", "Low"),
+        div(class = "risk-level-range", "0.0 – 0.4")
       ),
-      div(class = medium_class,
-          div(class = "risk-level-title", "Medium"),
-          div(class = "risk-level-range", "0.4 – 0.7")
+      div(
+        class = medium_class,
+        div(class = "risk-level-title", "Medium"),
+        div(class = "risk-level-range", "0.4 – 0.7")
       ),
-      div(class = high_class,
-          div(class = "risk-level-title", "High"),
-          div(class = "risk-level-range", "0.7 – 1.0")
+      div(
+        class = high_class,
+        div(class = "risk-level-title", "High"),
+        div(class = "risk-level-range", "0.7 – 1.0")
       )
     )
   })
@@ -808,9 +842,18 @@ server <- function(input, output, session) {
           border-radius: 22px;
           padding: 18px 26px 20px 26px;
         ",
-        h2("⚠️ HIGH RISK", style = "color:#ff3b30; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"),
-        p("The gene expression profile indicates a high predicted risk.", style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"),
-        p("Further clinical assessment and molecular subtype assessment is recommended.", style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;")
+        h2(
+          "⚠️ HIGH RISK",
+          style = "color:#ff3b30; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"
+        ),
+        p(
+          "The gene expression profile indicates a high predicted risk.",
+          style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"
+        ),
+        p(
+          "Further clinical assessment and molecular subtype assessment is recommended.",
+          style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;"
+        )
       )
     } else if (risk >= 0.4) {
       div(
@@ -820,9 +863,18 @@ server <- function(input, output, session) {
           border-radius: 22px;
           padding: 18px 26px 20px 26px;
         ",
-        h2("⚠️ MEDIUM RISK", style = "color:#ff9500; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"),
-        p("The gene expression profile indicates an intermediate predicted risk.", style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"),
-        p("Additional clinical review may be useful before making decisions.", style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;")
+        h2(
+          "⚠️ MEDIUM RISK",
+          style = "color:#ff9500; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"
+        ),
+        p(
+          "The gene expression profile indicates an intermediate predicted risk.",
+          style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"
+        ),
+        p(
+          "Additional clinical review may be useful before making decisions.",
+          style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;"
+        )
       )
     } else {
       div(
@@ -832,9 +884,18 @@ server <- function(input, output, session) {
           border-radius: 22px;
           padding: 18px 26px 20px 26px;
         ",
-        h2("✅ LOW RISK", style = "color:#34c759; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"),
-        p("The gene expression profile indicates a low predicted risk.", style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"),
-        p("Routine monitoring may be appropriate depending on clinical context.", style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;")
+        h2(
+          "✅ LOW RISK",
+          style = "color:#34c759; font-weight:850; font-size:52px; margin-top:0px; margin-bottom:18px;"
+        ),
+        p(
+          "The gene expression profile indicates a low predicted risk.",
+          style = "font-size:22px; font-weight:500; margin-bottom:12px; line-height:1.45;"
+        ),
+        p(
+          "Routine monitoring may be appropriate depending on clinical context.",
+          style = "font-size:22px; font-weight:500; line-height:1.45; margin-bottom:0px;"
+        )
       )
     }
   })
@@ -843,10 +904,20 @@ server <- function(input, output, session) {
     paste(
       "This is currently a front-end demonstration module.",
       "The final version will replace placeholder values with trained RF, Ridge, NB, and attention meta-model outputs.",
-      "The uploaded dataset must contain the required final top genes.",
+      "The uploaded dataset must contain the required final top 50 genes.",
       "Prediction uncertainty will be estimated using bootstrap models.",
       "Clinical interpretation should be cautious if genes are missing or if the demo dataset differs from the training datasets.",
       sep = "\n"
+    )
+  })
+  
+  output$download_ui <- renderUI({
+    req(prediction_values())
+    
+    downloadButton(
+      "download_report",
+      "Download Patient Report",
+      class = "btn-primary"
     )
   })
   
