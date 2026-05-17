@@ -838,7 +838,7 @@ if (sum(keep_genes) >= 5 && ncol(expr) >= 2) {
     expr_pca[is.na(expr_pca)] <- row_means[row(expr_pca)[is.na(expr_pca)]]
   }
   
-  pca <- prcomp(t(expr_pca), scale. = TRUE)
+  pca <- prcomp(t(expr_pca), scale. = FALSE)
   var_exp <- pca$sdev^2 / sum(pca$sdev^2)
   
   pca_df <- data.frame(
@@ -1173,20 +1173,46 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
 
 # BOOTSTRAP
 ```{r}
-make_bootstrap_indices <- function(dataset, y) {
+allocate_bootstrap_counts <- function(weights, total_n) {
+  weight_names <- names(weights)
+  weights_num <- as.numeric(weights)
+  weights_num <- weights_num / sum(weights_num)
   
-  boot_idx <- unlist(lapply(unique(dataset), function(ds) {
+  raw_counts <- weights_num * total_n
+  counts <- floor(raw_counts)
+  remainder <- total_n - sum(counts)
+  
+  if (remainder > 0L) {
+    add_idx <- order(raw_counts - counts, decreasing = TRUE)[seq_len(remainder)]
+    counts[add_idx] <- counts[add_idx] + 1L
+  }
+  
+  stats::setNames(as.integer(counts), weight_names)
+}
+
+make_bootstrap_indices <- function(dataset, y) {
+  dataset_chr <- as.character(dataset)
+  y_chr <- as.character(y)
+  dataset_counts <- table(dataset_chr)
+  
+  total_boot_n <- 2L * floor(length(y_chr) / 2L)
+  n_per_class <- total_boot_n / 2L
+  dataset_target_per_class <- allocate_bootstrap_counts(dataset_counts, n_per_class)
+  
+  boot_idx <- unlist(lapply(names(dataset_target_per_class), function(ds) {
+    ds_target_n <- dataset_target_per_class[[ds]]
+    cancer_idx <- which(dataset_chr == ds & y_chr == "Cancer")
+    normal_idx <- which(dataset_chr == ds & y_chr == "Normal")
     
-    ds_idx <- which(dataset == ds)
-    
-    cancer_idx <- ds_idx[y[ds_idx] == "Cancer"]
-    normal_idx <- ds_idx[y[ds_idx] == "Normal"]
+    if (length(cancer_idx) == 0L || length(normal_idx) == 0L) {
+      stop("Balanced bootstrap requires both classes in dataset: ", ds)
+    }
     
     c(
-      sample(cancer_idx, length(cancer_idx), replace = TRUE),
-      sample(normal_idx, length(normal_idx), replace = TRUE)
+      sample(cancer_idx, ds_target_n, replace = TRUE),
+      sample(normal_idx, ds_target_n, replace = TRUE)
     )
-  }))
+  }), use.names = FALSE)
   
   boot_idx
 }
@@ -1530,6 +1556,240 @@ ggplot(elastic_single_df, aes(x = risk)) +
     ),
     x = "Predicted cancer risk score",
     y = "Bootstrap model count"
+  )
+```
+
+# Uncertainty for Metrics
+
+The section below keeps the final Elastic Net model fixed and quantifies how uncertain its external-test performance metrics are under 100 class-stratified bootstrap resamples of the held-out dataset.
+
+```{r}
+make_external_metric_boot_idx <- function(y) {
+  y_chr <- as.character(y)
+  
+  unlist(lapply(levels(y), function(cls) {
+    cls_idx <- which(y_chr == cls)
+    sample(cls_idx, length(cls_idx), replace = TRUE)
+  }), use.names = FALSE)
+}
+
+safe_divide <- function(num, den) {
+  if (den == 0) {
+    return(NA_real_)
+  }
+  
+  num / den
+}
+
+calc_binary_metric_set <- function(truth, score, threshold = 0.5, eps = 1e-6) {
+  truth <- factor(truth, levels = c("Normal", "Cancer"))
+  truth_chr <- as.character(truth)
+  truth_num <- ifelse(truth_chr == "Cancer", 1, 0)
+  score_clip <- pmin(pmax(score, eps), 1 - eps)
+  
+  pred_chr <- ifelse(score >= threshold, "Cancer", "Normal")
+  
+  tp <- sum(pred_chr == "Cancer" & truth_chr == "Cancer")
+  tn <- sum(pred_chr == "Normal" & truth_chr == "Normal")
+  fp <- sum(pred_chr == "Cancer" & truth_chr == "Normal")
+  fn <- sum(pred_chr == "Normal" & truth_chr == "Cancer")
+  
+  sensitivity <- safe_divide(tp, tp + fn)
+  specificity <- safe_divide(tn, tn + fp)
+  precision <- safe_divide(tp, tp + fp)
+  npv <- safe_divide(tn, tn + fn)
+  
+  f1 <- if (is.na(precision) || is.na(sensitivity) || (precision + sensitivity) == 0) {
+    NA_real_
+  } else {
+    2 * precision * sensitivity / (precision + sensitivity)
+  }
+  
+  mcc_denom <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  
+  auc_value <- tryCatch(
+    as.numeric(
+      pROC::auc(
+        pROC::roc(
+          response = truth,
+          predictor = score,
+          levels = c("Normal", "Cancer"),
+          direction = "<",
+          quiet = TRUE
+        )
+      )
+    ),
+    error = function(e) NA_real_
+  )
+  
+  c(
+    AUC = auc_value,
+    Accuracy = (tp + tn) / length(truth_chr),
+    BalancedAccuracy = mean(c(sensitivity, specificity), na.rm = TRUE),
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Precision = precision,
+    NPV = npv,
+    F1 = f1,
+    MCC = safe_divide((tp * tn) - (fp * fn), mcc_denom),
+    BrierScore = mean((score - truth_num) ^ 2)
+  )
+}
+```
+
+```{r}
+metric_boot_ci_level <- 0.95
+metric_boot_alpha <- 1 - metric_boot_ci_level
+metric_boot_ci_label <- paste0(round(metric_boot_ci_level * 100), "% percentile interval")
+metric_display_order <- c(
+  "AUC", "Accuracy", "BalancedAccuracy", "Sensitivity", "Specificity",
+  "Precision", "NPV", "F1", "MCC", "BrierScore"
+)
+metric_labels <- c(
+  AUC = "AUC",
+  Accuracy = "Accuracy",
+  BalancedAccuracy = "Balanced accuracy",
+  Sensitivity = "Sensitivity",
+  Specificity = "Specificity",
+  Precision = "Precision",
+  NPV = "NPV",
+  F1 = "F1 score",
+  MCC = "MCC",
+  BrierScore = "Brier score"
+)
+metric_direction <- c(
+  AUC = "Higher is better",
+  Accuracy = "Higher is better",
+  BalancedAccuracy = "Higher is better",
+  Sensitivity = "Higher is better",
+  Specificity = "Higher is better",
+  Precision = "Higher is better",
+  NPV = "Higher is better",
+  F1 = "Higher is better",
+  MCC = "Higher is better",
+  BrierScore = "Lower is better"
+)
+
+elastic_metric_point <- calc_binary_metric_set(
+  truth = y_external,
+  score = enet_pred,
+  threshold = 0.5
+)
+
+elastic_metric_boot <- do.call(
+  rbind,
+  lapply(seq_len(B), function(b) {
+    set.seed(seed_from_label(paste0("external_metric_bootstrap_", b), 9000L))
+    boot_idx <- make_external_metric_boot_idx(y_external)
+    
+    calc_binary_metric_set(
+      truth = y_external[boot_idx],
+      score = enet_pred[boot_idx],
+      threshold = 0.5
+    )
+  })
+)
+
+elastic_metric_boot <- as.data.frame(elastic_metric_boot)
+
+elastic_metric_summary <- bind_rows(lapply(metric_display_order, function(metric_name) {
+  metric_values <- elastic_metric_boot[[metric_name]]
+  
+  data.frame(
+    metric = metric_name,
+    metric_label = unname(metric_labels[metric_name]),
+    direction = unname(metric_direction[metric_name]),
+    point_estimate = as.numeric(elastic_metric_point[metric_name]),
+    bootstrap_mean = mean(metric_values, na.rm = TRUE),
+    bootstrap_sd = stats::sd(metric_values, na.rm = TRUE),
+    ci_lower = as.numeric(
+      stats::quantile(metric_values, probs = metric_boot_alpha / 2, na.rm = TRUE)
+    ),
+    ci_upper = as.numeric(
+      stats::quantile(metric_values, probs = 1 - metric_boot_alpha / 2, na.rm = TRUE)
+    )
+  )
+})) %>%
+  mutate(
+    metric_label = factor(
+      metric_label,
+      levels = unname(metric_labels[metric_display_order])
+    )
+  )
+
+elastic_metric_summary
+
+dir.create("results", showWarnings = FALSE)
+elastic_metric_summary_rds <- file.path(
+  "results",
+  paste0("elastic_metric_summary_", external_test_ds, ".rds")
+)
+
+saveRDS(
+  elastic_metric_summary,
+  file = elastic_metric_summary_rds
+)
+
+message("Saved Elastic Net metric summary to: ", elastic_metric_summary_rds)
+```
+
+```{r}
+elastic_metric_boot_long <- stack(elastic_metric_boot[, metric_display_order, drop = FALSE])
+colnames(elastic_metric_boot_long) <- c("value", "metric")
+
+elastic_metric_boot_long <- elastic_metric_boot_long %>%
+  mutate(
+    metric = as.character(metric),
+    metric_label = factor(
+      unname(metric_labels[metric]),
+      levels = unname(metric_labels[metric_display_order])
+    )
+  ) %>%
+  left_join(
+    elastic_metric_summary %>%
+      mutate(metric = as.character(metric)) %>%
+      select(metric, point_estimate),
+    by = "metric"
+  )
+
+ggplot(elastic_metric_summary, aes(x = metric_label, y = point_estimate)) +
+  geom_linerange(
+    aes(ymin = ci_lower, ymax = ci_upper),
+    linewidth = 1.1,
+    color = "#4C78A8"
+  ) +
+  geom_point(size = 2.8, color = "#E45756") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste0("Elastic Net Metric Uncertainty on ", external_test_ds),
+    subtitle = paste0(
+      B, " class-stratified bootstrap resamples of the external test dataset (",
+      metric_boot_ci_label, ")"
+    ),
+    x = NULL,
+    y = "Metric value"
+  )
+
+ggplot(elastic_metric_boot_long, aes(x = value)) +
+  geom_histogram(
+    bins = 18,
+    fill = "#72B7B2",
+    color = "white",
+    alpha = 0.9
+  ) +
+  geom_vline(
+    aes(xintercept = point_estimate),
+    color = "#E45756",
+    linewidth = 0.9
+  ) +
+  facet_wrap(~ metric_label, scales = "free", ncol = 3) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = paste0("Bootstrap Distributions of Elastic Net Metrics on ", external_test_ds),
+    subtitle = "Red vertical line shows the observed metric on the full external dataset",
+    x = "Metric value",
+    y = "Bootstrap count"
   )
 ```
 
