@@ -527,6 +527,14 @@ cat("\nSamples per dataset:\n");  print(table(batch_mc))
 
 ## Modelling helper functions
 
+```{r}
+p_merged_mc %>%
+  filter(!is.na(label_mc) & label_mc != "") %>%
+  count(dataset_id, label_mc) %>%
+  pivot_wider(names_from = label_mc, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Subtype counts per dataset")
+```
+
 ```{r helpers-model}
 #| message: false
 #| warning: false
@@ -757,6 +765,7 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       record("SVM_Linear", as.character(ps), pm)
     }, error=function(e) message("SVM_Linear fold ", ds, ": ", conditionMessage(e)))
 
+
     # Multinomial Lasso (unweighted, alpha=1)
     tryCatch({
       fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
@@ -774,6 +783,15 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       pm <- glmnet_probs(fit, X_te_s, lvls)
       record("RidgeMC", lvls[max.col(pm)], pm)
     }, error=function(e) message("RidgeMC fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial ElasticNet (unweighted, alpha=0.5)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0.5, weights=sw0, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("ElasticNetMC", lvls[max.col(pm)], pm)
+    }, error=function(e) message("ElasticNetMC fold ", ds, ": ", conditionMessage(e)))
 
     # Multinomial logistic / nnet (unweighted)
     tryCatch({
@@ -847,6 +865,7 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       record("SVM_Linear_w", as.character(ps), pm)
     }, error=function(e) message("SVM_Linear_w fold ", ds, ": ", conditionMessage(e)))
 
+
     # Multinomial Lasso (weighted)
     tryCatch({
       fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
@@ -864,6 +883,15 @@ run_lodo_multiclass <- function(X, y, batch, n_per_class=50, use_weights=TRUE) {
       pm <- glmnet_probs(fit, X_te_s, lvls)
       record("RidgeMC_w", lvls[max.col(pm)], pm)
     }, error=function(e) message("RidgeMC_w fold ", ds, ": ", conditionMessage(e)))
+
+    # Multinomial ElasticNet (weighted)
+    tryCatch({
+      fit <- glmnet::cv.glmnet(as.matrix(X_tr_s), y_train, family="multinomial",
+                               alpha=0.5, weights=sw, standardize=FALSE,
+                               type.multinomial="grouped")
+      pm <- glmnet_probs(fit, X_te_s, lvls)
+      record("ElasticNetMC_w", lvls[max.col(pm)], pm)
+    }, error=function(e) message("ElasticNetMC_w fold ", ds, ": ", conditionMessage(e)))
 
     # Multinomial logistic / nnet (weighted)
     tryCatch({
@@ -943,34 +971,177 @@ cat("Folds completed:", paste(unique(res_lodo$perf$fold), collapse=", "), "\n")
 ```{r scorecard}
 #| message: false
 #| warning: false
+
+# ── Per-class metric helpers ───────────────────────────────────────────────────
+balanced_accuracy <- function(truth, pred) {
+  truth <- factor(truth); pred <- factor(pred, levels=levels(truth))
+  lvls  <- levels(truth)
+  recalls <- vapply(lvls, function(k) {
+    tp <- sum(pred==k & truth==k, na.rm=TRUE)
+    fn <- sum(pred!=k & truth==k, na.rm=TRUE)
+    if ((tp+fn)==0) NA_real_ else tp/(tp+fn)
+  }, numeric(1))
+  mean(recalls, na.rm=TRUE)
+}
+
+per_class_sens_spec <- function(truth, pred) {
+  lvls <- levels(truth)   # use whatever levels were passed in
+  bind_rows(lapply(lvls, function(k) {
+    tp <- sum(pred==k & truth==k, na.rm=TRUE)
+    fn <- sum(pred!=k & truth==k, na.rm=TRUE)
+    fp <- sum(pred==k & truth!=k, na.rm=TRUE)
+    tn <- sum(pred!=k & truth!=k, na.rm=TRUE)
+    tibble::tibble(
+      subtype     = k,
+      sensitivity = if ((tp+fn)==0) NA_real_ else round(tp/(tp+fn), 3),
+      specificity = if ((tn+fp)==0) NA_real_ else round(tn/(tn+fp), 3),
+      n_true      = tp+fn,
+      n_pred_pos  = tp+fp
+    )
+  }))
+}
+
+# ── Compute balanced accuracy per model per fold ──────────────────────────────
+# We need the predicted class (argmax of probs) per fold per model
+ba_per_fold <- res_lodo$probs %>%
+  group_by(fold, model) %>%
+  group_modify(function(df, keys) {
+    prob_cols <- setdiff(colnames(df), c("fold","model","truth"))
+    lv        <- prob_cols[prob_cols %in% levels(factor(df$truth))]
+    if (length(lv) < 2) return(tibble::tibble(balanced_acc = NA_real_))
+    pred_chr  <- lv[max.col(df[, lv, drop=FALSE])]
+    tibble::tibble(balanced_acc = balanced_accuracy(df$truth, pred_chr))
+  }) %>%
+  ungroup()
+
+ba_summary <- ba_per_fold %>%
+  group_by(model) %>%
+  summarise(
+    ba_median = median(balanced_acc, na.rm=TRUE),
+    ba_mean   = mean(balanced_acc,   na.rm=TRUE),
+    ba_sd     = sd(balanced_acc,     na.rm=TRUE),
+    .groups   = "drop"
+  )
+
+# ── Main scorecard ────────────────────────────────────────────────────────────
 scorecard <- res_lodo$perf %>%
   group_by(model) %>%
   summarise(
-    macro_auc_mean = mean(macro_auc, na.rm=TRUE),
-    macro_auc_sd   = sd(macro_auc,   na.rm=TRUE),
-    macro_f1_mean  = mean(macro_f1,  na.rm=TRUE),
-    macro_f1_sd    = sd(macro_f1,    na.rm=TRUE),
-    accuracy_mean  = mean(accuracy,  na.rm=TRUE),
-    accuracy_sd    = sd(accuracy,    na.rm=TRUE),
+    macro_auc_median = median(macro_auc, na.rm=TRUE),
+    macro_auc_mean   = mean(macro_auc,   na.rm=TRUE),
+    macro_auc_sd     = sd(macro_auc,     na.rm=TRUE),
+    macro_f1_median  = median(macro_f1,  na.rm=TRUE),
+    macro_f1_mean    = mean(macro_f1,    na.rm=TRUE),
+    macro_f1_sd      = sd(macro_f1,      na.rm=TRUE),
+    accuracy_median  = median(accuracy,  na.rm=TRUE),
+    accuracy_mean    = mean(accuracy,    na.rm=TRUE),
+    accuracy_sd      = sd(accuracy,      na.rm=TRUE),
     .groups="drop"
   ) %>%
-  arrange(desc(macro_auc_mean), desc(macro_f1_mean)) %>%
+  left_join(ba_summary, by="model") %>%
+  arrange(desc(macro_auc_median), desc(macro_f1_median)) %>%
   mutate(
-    rank      = row_number(),
-    macro_auc = sprintf("%.3f ± %.3f", macro_auc_mean, macro_auc_sd),
-    macro_f1  = sprintf("%.3f ± %.3f", macro_f1_mean,  macro_f1_sd),
-    accuracy  = sprintf("%.3f ± %.3f", accuracy_mean,  accuracy_sd)
+    rank             = row_number(),
+    macro_auc        = sprintf("%.3f ± %.3f", macro_auc_median, macro_auc_sd),
+    macro_f1         = sprintf("%.3f ± %.3f", macro_f1_median,  macro_f1_sd),
+    accuracy         = sprintf("%.3f ± %.3f", accuracy_median,  accuracy_sd),
+    balanced_acc     = sprintf("%.3f ± %.3f", ba_median,        ba_sd)
   ) %>%
-  select(rank, model, macro_auc, macro_f1, accuracy)
+  dplyr::select(rank, model, macro_auc, macro_f1, accuracy, balanced_acc)
 
 knitr::kable(scorecard,
-  caption="Model scorecard — LODO CV (ranked by macro OvR AUC → macro F1 → accuracy)")
+  caption="Model scorecard — LODO CV. Format: median ± SD across folds.",
+  col.names = c("Rank","Model","Macro OvR AUC","Macro F1","Accuracy","Balanced Accuracy"))
 
+# ── Per-class sensitivity & specificity for best model ───────────────────────
 best_model_mc <- res_lodo$perf %>%
   group_by(model) %>%
-  summarise(m=mean(macro_auc, na.rm=TRUE), .groups="drop") %>%
-  arrange(desc(m)) %>% slice(1) %>% pull(model)
-cat("\nBest single model:", best_model_mc, "\n")
+  summarise(m = median(macro_auc, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(m)) %>%
+  slice(1) %>%
+  pull(model)
+
+cat("\nBest model (by median macro AUC):", best_model_mc, "\n")
+
+preds_best <- res_lodo$probs %>%
+  filter(model == best_model_mc) %>%
+  group_modify(function(df, ...) {
+    prob_cols <- setdiff(colnames(df), c("fold","model","truth"))
+    lv        <- prob_cols[prob_cols %in% unique(df$truth)]
+    df$pred   <- lv[max.col(df[, lv, drop=FALSE])]
+    df
+  }) %>%
+  ungroup()
+
+all_lvls <- levels(y_mc)  # includes Normal-like
+sens_spec_tbl <- per_class_sens_spec(
+  factor(preds_best$truth, levels = all_lvls),
+  factor(preds_best$pred,  levels = all_lvls)
+)
+
+cat("\nPer-class sensitivity & specificity —", best_model_mc, "(pooled LODO):\n")
+knitr::kable(sens_spec_tbl,
+  caption=paste0("Per-class sensitivity & specificity — ", best_model_mc,
+                 " (pooled LODO predictions)"),
+  col.names = c("Subtype","Sensitivity","Specificity","N true","N predicted positive"))
+
+# ── Top 50 genes per class (OvR limma on full batch-corrected dataset) ────────
+cat("\nRunning OvR gene selection on full batch-corrected dataset...\n")
+
+# Use removeBatchEffect directly for gene selection visualisation.
+# ComBat fails here due to empty batch × subtype cells (Normal-like n=24,
+# all from one dataset). removeBatchEffect is more robust for this purpose.
+mod_viz  <- model.matrix(~ y_mc)
+e_mc_bc  <- tryCatch(
+  sva::ComBat(dat=e_mc, batch=batch_mc, mod=mod_viz,
+              par.prior=TRUE, mean.only=FALSE),
+  error=function(e) limma::removeBatchEffect(e_mc, batch=batch_mc, design=mod_viz)
+)
+
+lvls_mc  <- levels(y_mc)
+design_g <- model.matrix(~0 + y_mc)
+colnames(design_g) <- make.names(lvls_mc)
+fit_g    <- lmFit(e_mc_bc, design_g)
+
+gene_tables <- bind_rows(lapply(lvls_mc, function(k) {
+  others   <- make.names(setdiff(lvls_mc, k))
+  cont_str <- paste0(make.names(k), " - (",
+                     paste(others, collapse="+"), ")/", length(others))
+  cont <- makeContrasts(contrasts=cont_str, levels=design_g)
+  fit2 <- eBayes(contrasts.fit(fit_g, cont))
+  topTable(fit2, n=50, sort.by="P") %>%
+    tibble::rownames_to_column("gene") %>%
+    mutate(subtype=k, rank=row_number()) %>%
+    dplyr::select(subtype, rank, gene, logFC, AveExpr, P.Value, adj.P.Val)
+}))
+
+for (k in lvls_mc) {
+  knitr::kable(
+    gene_tables %>%
+      filter(subtype==k) %>%
+      mutate(across(c(logFC, AveExpr), round, 3),
+             P.Value   = formatC(P.Value,   format="e", digits=2),
+             adj.P.Val = formatC(adj.P.Val, format="e", digits=2)) %>%
+      dplyr::select(-subtype),
+    caption=paste0("Top 50 OvR genes — ", k)
+  ) %>% print()
+}
+
+# ── Gene overlap between subtypes ─────────────────────────────────────────────
+gene_lists  <- setNames(
+  lapply(lvls_mc, function(k) gene_tables %>% filter(subtype==k) %>% pull(gene)),
+  lvls_mc
+)
+overlap_mat <- outer(lvls_mc, lvls_mc,
+  Vectorize(function(a,b) length(intersect(gene_lists[[a]], gene_lists[[b]]))))
+rownames(overlap_mat) <- colnames(overlap_mat) <- lvls_mc
+
+cat("\nGene overlap between subtype panels (shared genes in top 50):\n")
+knitr::kable(as.data.frame(overlap_mat),
+  caption="Number of shared genes between subtype top-50 panels. Diagonal = 50 (self). Off-diagonal = overlap — shared genes count once on a NanoString panel.")
+
+cat("\nTotal unique genes across all subtype panels:",
+    length(unique(gene_tables$gene)), "\n")
 ```
 
 ## Performance plots
@@ -992,31 +1163,6 @@ res_lodo$perf %>%
   theme_bw() +
   labs(x=NULL, y=NULL, title="LODO CV: model comparison") +
   theme(legend.position="none")
-```
-
-## Confusion matrix (best model)
-
-```{r confusion-best}
-#| message: false
-#| warning: false
-preds_best <- res_lodo$probs %>%
-  filter(model==best_model_mc) %>%
-  mutate(pred = {
-    prob_cols <- setdiff(colnames(.), c("fold","model","truth"))
-    lvls_here <- prob_cols[prob_cols %in% levels(y_mc)]
-    lvls_here[max.col(.[ , lvls_here, drop=FALSE])]
-  })
-
-tab_best <- table(truth=preds_best$truth, pred=preds_best$pred)
-as.data.frame(tab_best) %>%
-  ggplot(aes(x=pred, y=truth, fill=Freq)) +
-  geom_tile(colour="white") +
-  geom_text(aes(label=Freq), size=4) +
-  scale_fill_gradient(low="white", high="#2C7FB8") +
-  theme_bw() +
-  labs(x="Predicted", y="True",
-       title=paste0("Confusion matrix — ", best_model_mc, " (pooled LODO)")) +
-  theme(axis.text.x=element_text(angle=40, hjust=1))
 ```
 
 ------------------------------------------------------------------------
@@ -1094,6 +1240,8 @@ fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te, n_per_class=50) {
              out[["LassoMC"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw0,standardize=FALSE,type.multinomial="grouped")
              out[["RidgeMC"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw0,standardize=FALSE,type.multinomial="grouped")
+             out[["ElasticNetMC"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw0,trace=FALSE,MaxNWts=100000)
              pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
              if (is.null(dim(pm))) pm <- t(as.matrix(pm))
@@ -1123,6 +1271,8 @@ fit_once_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te, n_per_class=50) {
              out[["LassoMC_w"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0,weights=sw,standardize=FALSE,type.multinomial="grouped")
              out[["RidgeMC_w"]] <- gp(fit) }, error=function(e) NULL)
+  tryCatch({ fit <- glmnet::cv.glmnet(as.matrix(X_ts),y_tr,family="multinomial",alpha=0.5,weights=sw,standardize=FALSE,type.multinomial="grouped")
+             out[["ElasticNetMC_w"]] <- gp(fit) }, error=function(e) NULL)
   tryCatch({ fit <- nnet::multinom(y_tr~.,data=data.frame(y_tr,X_ts),weights=sw,trace=FALSE,MaxNWts=100000)
              pm  <- predict(fit,newdata=data.frame(X_es),type="probs")
              if (is.null(dim(pm))) pm <- t(as.matrix(pm))
@@ -1292,8 +1442,18 @@ if (!is.null(hold_probs) && length(hold_probs) >= 2) {
 set.seed(3888)
 B_boot_mc <- 200
 
+# Determine alpha from best_model_mc name
+boot_model_name <- best_model_mc
+boot_alpha <- if (grepl("Lasso",      boot_model_name)) 1   else
+              if (grepl("Ridge",      boot_model_name)) 0   else
+              if (grepl("ElasticNet", boot_model_name)) 0.5 else NA
+
+cat("Bootstrap will refit:", boot_model_name, "\n")
+if (!is.na(boot_alpha)) cat("  glmnet alpha:", boot_alpha, "\n")
+
 run_bootstrap_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
-                              B = 200, n_per_class = 50) {
+                              B = 200, n_per_class = 50,
+                              model_name = "LassoMC_w", alpha = 1) {
   y_tr  <- factor(y_tr)
   lvls  <- levels(y_tr)
   n_cl  <- length(lvls)
@@ -1316,63 +1476,96 @@ run_bootstrap_mc <- function(X_tr, y_tr, batch_tr, X_te, batch_te,
   sc   <- std_fit(X_ti)
   X_ts <- std_apply(X_ti,sc);    X_es <- std_apply(X_ei,sc)
 
-  n_tr <- nrow(X_ts)
+  n_tr   <- nrow(X_ts)
   tab_tr <- table(y_tr); n_tot <- sum(tab_tr)
-  cw <- setNames(vapply(lvls,function(k) n_tot/(n_cl*max(1,tab_tr[k])),numeric(1)),lvls)
-  sw_full <- cw[as.character(y_tr)]
-
-  # Find best lambda ONCE on full training set — reuse in every bootstrap iteration
-  # This avoids 10-fold inner CV per iteration (~10x speedup)
-  cv_once <- tryCatch(
-    glmnet::cv.glmnet(as.matrix(X_ts), y_tr, family="multinomial",
-                      alpha=1, weights=sw_full, standardize=FALSE,
-                      type.multinomial="grouped"),
-    error=function(e) NULL
-  )
-  if (is.null(cv_once)) { message("cv.glmnet setup failed"); return(NULL) }
-  lambda_fixed_mc <- cv_once$lambda.min
-  cat(sprintf("  Fixed lambda: %.5f\n", lambda_fixed_mc))
+  use_w  <- grepl("_w$", model_name)
+  cw     <- setNames(vapply(lvls, function(k) n_tot/(n_cl*max(1,tab_tr[k])), numeric(1)), lvls)
+  sw_full <- if (use_w) cw[as.character(y_tr)] else rep(1, n_tr)
 
   # Boot array: samples × subtypes × iterations
   boot_arr <- array(NA_real_, dim=c(n_te, n_cl, B),
                     dimnames=list(NULL, lvls, NULL))
 
-  for (b in seq_len(B)) {
-    idx_b  <- sample(n_tr, n_tr, replace=TRUE)
-    y_b    <- droplevels(y_tr[idx_b])
-    X_b    <- X_ts[idx_b,,drop=FALSE]
-    if (nlevels(y_b) < 2) next
-
-    tab_b <- table(y_b); n_tot_b <- sum(tab_b)
-    lvls_b <- levels(y_b)
-    sw_b   <- setNames(vapply(lvls_b,function(k) n_tot_b/(length(lvls_b)*max(1,tab_b[k])),
-                              numeric(1)), lvls_b)[as.character(y_b)]
-
-    # Plain glmnet with fixed lambda — no inner CV per iteration
-    lf <- tryCatch(
-      glmnet::glmnet(as.matrix(X_b), y_b, family="multinomial",
-                     alpha=1, weights=sw_b, standardize=FALSE,
-                     lambda=lambda_fixed_mc,
-                     type.multinomial="grouped"),
+  # ── glmnet path ────────────────────────────────────────────────────────────
+  if (!is.na(alpha)) {
+    # Find best lambda ONCE — reuse in every iteration (10x speedup)
+    cv_once <- tryCatch(
+      glmnet::cv.glmnet(as.matrix(X_ts), y_tr, family="multinomial",
+                        alpha=alpha, weights=sw_full, standardize=FALSE,
+                        type.multinomial="grouped"),
       error=function(e) NULL
     )
-    if (is.null(lf)) next
+    if (is.null(cv_once)) { message("cv.glmnet setup failed"); return(NULL) }
+    lambda_fixed_mc <- cv_once$lambda.min
+    cat(sprintf("  Fixed lambda: %.5f\n", lambda_fixed_mc))
 
-    pr <- predict(lf, as.matrix(X_es), type="response",
-                  s=lambda_fixed_mc)[,,1]
-    if (is.null(dim(pr))) pr <- t(as.matrix(pr))
-    lv_common <- intersect(lvls, colnames(pr))
-    boot_arr[, lv_common, b] <- pr[, lv_common]
+    for (b in seq_len(B)) {
+      idx_b <- sample(n_tr, n_tr, replace=TRUE)
+      y_b   <- droplevels(y_tr[idx_b])
+      X_b   <- X_ts[idx_b,,drop=FALSE]
+      if (nlevels(y_b) < 2) next
+
+      tab_b  <- table(y_b); n_tot_b <- sum(tab_b); lvls_b <- levels(y_b)
+      sw_b   <- if (use_w)
+        setNames(vapply(lvls_b, function(k) n_tot_b/(length(lvls_b)*max(1,tab_b[k])),
+                        numeric(1)), lvls_b)[as.character(y_b)]
+      else rep(1, length(y_b))
+
+      lf <- tryCatch(
+        glmnet::glmnet(as.matrix(X_b), y_b, family="multinomial",
+                       alpha=alpha, weights=sw_b, standardize=FALSE,
+                       lambda=lambda_fixed_mc, type.multinomial="grouped"),
+        error=function(e) NULL
+      )
+      if (is.null(lf)) next
+      pr <- predict(lf, as.matrix(X_es), type="response", s=lambda_fixed_mc)[,,1]
+      if (is.null(dim(pr))) pr <- t(as.matrix(pr))
+      lv_common <- intersect(lvls, colnames(pr))
+      boot_arr[, lv_common, b] <- pr[, lv_common]
+    }
+
+  # ── Multinom (nnet) path ───────────────────────────────────────────────────
+  } else if (grepl("Multinom", model_name)) {
+    for (b in seq_len(B)) {
+      idx_b <- sample(n_tr, n_tr, replace=TRUE)
+      y_b   <- droplevels(y_tr[idx_b])
+      X_b   <- X_ts[idx_b,,drop=FALSE]
+      if (nlevels(y_b) < 2) next
+
+      tab_b  <- table(y_b); n_tot_b <- sum(tab_b); lvls_b <- levels(y_b)
+      sw_b   <- if (use_w)
+        setNames(vapply(lvls_b, function(k) n_tot_b/(length(lvls_b)*max(1,tab_b[k])),
+                        numeric(1)), lvls_b)[as.character(y_b)]
+      else rep(1, length(y_b))
+
+      mn <- tryCatch(
+        nnet::multinom(y_b~., data=data.frame(y_b, X_b),
+                       weights=sw_b, trace=FALSE, MaxNWts=100000),
+        error=function(e) NULL
+      )
+      if (is.null(mn)) next
+      pm <- predict(mn, newdata=data.frame(X_es), type="probs")
+      if (is.null(dim(pm))) pm <- t(as.matrix(pm))
+      lv_common <- intersect(lvls, colnames(pm))
+      boot_arr[, lv_common, b] <- pm[, lv_common]
+    }
+
+  } else {
+    message("Bootstrap not implemented for model: ", model_name,
+            ". Returning NULL.")
+    return(NULL)
   }
 
   boot_arr
 }
 
-cat("Running", B_boot_mc, "bootstrap iterations (Multinomial Lasso refit)...
-")
+cat("Running", B_boot_mc, "bootstrap iterations using best model:", boot_model_name, "\n")
 boot_arr_mc <- run_bootstrap_mc(
   X_dev, y_dev, batch_dev, X_hold, batch_hold,
-  B=B_boot_mc, n_per_class=50
+  B          = B_boot_mc,
+  n_per_class = 50,
+  model_name = boot_model_name,
+  alpha      = boot_alpha
 )
 
 if (!is.null(boot_arr_mc)) {
@@ -1540,7 +1733,6 @@ if (!is.null(hold_probs) && exists("uncertainty_df")) {
 if (exists("risk_df")) {
   cat("=== CLASSIFIER SUMMARY ===\n\n")
   cat("Best single model (LODO CV):", best_model_mc, "\n")
-
   cat(sprintf("  High-confidence predictions: %d / %d (%.0f%%)\n",
               sum(risk_df$risk_band == "High confidence"),
               nrow(risk_df),
@@ -1555,12 +1747,10 @@ if (exists("risk_df")) {
               100 * mean(risk_df$risk_band == "Low confidence — review recommended", na.rm=TRUE)))
   cat(sprintf("\n  Median predicted confidence: %.1f%%\n",
               median(as.numeric(gsub("%","",risk_df$confidence)), na.rm=TRUE)*100))
-
   if (exists("boot_arr_mc") && !is.null(boot_arr_mc)) {
     cat(sprintf("  Bootstrap 95%% CI (median ci_width): %.1f%%\n",
                 median(boot_risk_mc$ci_width_pred, na.rm=TRUE)*100))
   }
-
   cat(sprintf("\nHigh-confidence predictions (≥0.70, low disagreement): %d / %d (%.0f%%)\n",
               sum(risk_df$risk_band=="High confidence"),
               nrow(risk_df),
@@ -1629,9 +1819,6 @@ sw_all    <- cw_all[as.character(y_all)]
 # kNN (stored as training data + labels — kNN has no compact fit object)
 fit_knn_final <- list(X_train = X_all_s, y_train = y_all, k = 7)
 
-# RF
-fit_rf_final <- randomForest::randomForest(X_all_i, y_all, classwt=cw_all)
-
 # Multinomial Lasso
 fit_lasso_final <- glmnet::cv.glmnet(
   as.matrix(X_all_s), y_all, family="multinomial",
@@ -1659,7 +1846,6 @@ saveRDS(list(
 saveRDS(imp_final,      "models/multiclass/imputation_params.rds")
 saveRDS(sc_final,       "models/multiclass/scale_params.rds")
 saveRDS(fit_knn_final,  "models/multiclass/fit_knn.rds")
-saveRDS(fit_rf_final,   "models/multiclass/fit_rf.rds")
 saveRDS(fit_lasso_final,"models/multiclass/fit_lasso.rds")
 if (!is.null(fit_multinom_final))
   saveRDS(fit_multinom_final, "models/multiclass/fit_multinom.rds")
@@ -1688,10 +1874,10 @@ if (exists("uncertainty_df") && !is.null(uncertainty_df)) {
 # ── Load all saved components ─────────────────────────────────────────────────
 predict_pam50_subtype <- function(expr_new,
                                    model_dir  = "models/multiclass",
-                                   model_name = "RF",
+                                   model_name = "LassoMC",
                                    new_dataset = NULL) {
   # expr_new : genes × samples matrix (raw, quantile-normalised per dataset)
-  # model_name: one of "RF", "LassoMC", "Multinom", "kNN"
+  # model_name: one of "LassoMC", "Multinom", "kNN"
   # new_dataset: optional string — dataset name if known, NULL for novel data
 
   panel_genes  <- readRDS(file.path(model_dir, "panel_genes.rds"))
@@ -1734,11 +1920,7 @@ predict_pam50_subtype <- function(expr_new,
   X_new_s <- std_apply(X_new_i, sc_sub)
 
   # ── Step 3: predict ───────────────────────────────────────────────────────────
-  prob_mat <- if (model_name == "RF") {
-    fit <- readRDS(file.path(model_dir, "fit_rf.rds"))
-    predict(fit, X_new_i, type="prob")
-
-  } else if (model_name == "LassoMC") {
+  prob_mat <- if (model_name == "LassoMC") {
     fit <- readRDS(file.path(model_dir, "fit_lasso.rds"))
     pr  <- predict(fit, as.matrix(X_new_s), type="response",
                    s="lambda.min")[,,1]
@@ -1792,7 +1974,7 @@ if (exists("X_mc_hold") && nrow(X_mc_hold) > 0) {
   e_hold_raw <- t(X_mc_hold)  # back to genes × samples
 
   test_result <- tryCatch(
-    predict_pam50_subtype(e_hold_raw, model_name="RF", new_dataset=NULL),
+    predict_pam50_subtype(e_hold_raw, model_name="LassoMC", new_dataset=NULL),
     error = function(e) { message("Prediction test failed: ", conditionMessage(e)); NULL }
   )
 
@@ -1800,7 +1982,7 @@ if (exists("X_mc_hold") && nrow(X_mc_hold) > 0) {
     test_result$true_subtype <- as.character(y_mc_hold)
     test_result$correct      <- test_result$predicted_subtype == test_result$true_subtype
 
-    cat(sprintf("Sanity check — hold-out accuracy (RF): %.1f%%\n",
+    cat(sprintf("Sanity check — hold-out accuracy (LassoMC): %.1f%%\n",
                 100 * mean(test_result$correct, na.rm=TRUE)))
     knitr::kable(
       head(test_result %>%
