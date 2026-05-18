@@ -632,9 +632,9 @@ audit_results <- function(pieces, dataset_ids, overrides) {
 # MAIN LOOP
 # =========================================================
 dataset_ids <- c(
-  "GSE10810", "GSE15852", "GSE25066", "GSE29044",
+  "GSE10810", "GSE29044",
   "GSE29431", "GSE42568", "GSE45827", "GSE54002",
-  "GSE65194", "GSE7904",  "GSE9574"
+  "GSE65194", "GSE7904"
 )
 
 pieces <- list()
@@ -748,7 +748,6 @@ for (id in names(pieces)) {
   )
 }
 ```
-
 ```{r}
 # =========================================================
 # SAVE QUANTILE-NORMALISED DATASETS
@@ -772,7 +771,8 @@ for (id in names(pieces)) {
   # Save individually so each dataset can be loaded without loading all
   saveRDS(
     normalised_pieces[[id]],
-    file = file.path("data/normalised", paste0(id, "_normalised.rds"))
+    file = file.path("data/normalised", paste0(id, "_normalised.rds")),
+    , compress = "xz"
   )
   
   message("Saved: ", id, 
@@ -794,11 +794,10 @@ saveRDS(
     all_genes   = all_genes,
     dataset_ids = names(normalised_pieces)
   ),
-  file = "data/normalised/merged_normalised.rds"
+  file = "data/normalised/merged_normalised.rds",
+  , compress = "xz"
 )
 
 message("\nAll saved. Merged matrix: ", 
         nrow(merged_expr_q), " genes x ", ncol(merged_expr_q), " samples")
 ```
-
-
