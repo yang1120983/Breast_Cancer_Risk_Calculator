@@ -58,7 +58,7 @@ find_normalised_data_file <- function() {
   existing[1]
 }
 
-load_normal_reference <- function(reference_genes) {
+load_normal_reference <- function(reference_genes, excluded_datasets = "GSE29044") {
   data_file <- find_normalised_data_file()
   if (is.null(data_file)) {
     return(list(
@@ -75,11 +75,14 @@ load_normal_reference <- function(reference_genes) {
     ))
   }
   
-  normal_idx <- which(as.character(dat$meta$Status) == "Normal")
+  normal_idx <- which(
+    as.character(dat$meta$Status) == "Normal" &
+      !(as.character(dat$meta$dataset) %in% excluded_datasets)
+  )
   if (length(normal_idx) == 0) {
     return(list(
       available = FALSE,
-      message = "No normal samples found in merged_normalised.rds."
+      message = "No eligible normal samples found in merged_normalised.rds after excluding external demo datasets."
     ))
   }
   
@@ -107,7 +110,8 @@ load_normal_reference <- function(reference_genes) {
     sample_ids = normal_sample_ids,
     median = normal_median,
     sd = normal_sd,
-    n_samples = length(normal_sample_ids)
+    n_samples = length(normal_sample_ids),
+    excluded_datasets = excluded_datasets
   )
 }
 
@@ -943,7 +947,7 @@ ui <- fluidPage(
               div(
                 h3("Selected Sample Gene Expression"),
                 div(class = "sample-subtitle",
-                    "This section compares the selected patient with normal reference samples from the training data. The first half of genes are shifted furthest above the normal reference, and the second half are shifted furthest below it. Boxplots show normal-reference expression; red triangles mark the selected patient.")
+                    "This section compares the selected patient with normal reference samples from the training data. GSE29044 is excluded from this reference because it is reserved as the external demo dataset. Boxplots show normal-reference expression; red triangles mark the selected patient.")
               )
           ),
           uiOutput("gene_expression_plot_ui"),
@@ -1089,8 +1093,11 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   gene_summary <- reactive({
+    vals <- prediction_values()
+    req(vals)
     req(dataset())
-    validate(need(nzchar(input$selected_sample), "Choose a patient to view their gene expression profile."))
+    calculated_sample <- vals$sample_id
+    validate(need(nzchar(calculated_sample), "Calculate risk to view the selected patient's gene expression profile."))
     req(input$plot_gene_count)
     
     data <- dataset()
@@ -1114,7 +1121,7 @@ server <- function(input, output, session) {
     gene_data <- gene_data[, available_genes, drop = FALSE]
     normal_expr <- normal_reference$expr[available_genes, , drop = FALSE]
     
-    selected_index <- which(data[[1]] == input$selected_sample)[1]
+    selected_index <- which(data[[1]] == calculated_sample)[1]
     
     all_patient_values <- as.numeric(gene_data[selected_index, available_genes])
     names(all_patient_values) <- available_genes
@@ -1180,7 +1187,8 @@ server <- function(input, output, session) {
       n_low = length(low_genes),
       genes_available = length(available_genes),
       genes_required = length(final_top_genes),
-      reference_n = normal_reference$n_samples
+      reference_n = normal_reference$n_samples,
+      reference_excluded = paste(normal_reference$excluded_datasets, collapse = ", ")
     )
   })
   
@@ -1228,18 +1236,13 @@ server <- function(input, output, session) {
   })
   
   multiclass_prediction <- reactive({
-    req(prediction_values())
+    vals <- prediction_values()
+    req(vals)
     req(dataset())
-    if (is.null(input$selected_sample) || !nzchar(input$selected_sample)) {
-      showNotification(
-        "Please choose a patient before running the calculator.",
-        type = "warning",
-        duration = 6
-      )
-      return()
-    }
+    calculated_sample <- vals$sample_id
+    req(calculated_sample)
     
-    risk <- prediction_values()$meta
+    risk <- vals$meta
     if (risk < 0.4) {
       return(list(show = FALSE))
     }
@@ -1253,7 +1256,7 @@ server <- function(input, output, session) {
     }
     
     data <- dataset()
-    selected_index <- which(data[[1]] == input$selected_sample)[1]
+    selected_index <- which(data[[1]] == calculated_sample)[1]
     if (is.na(selected_index)) {
       return(list(
         show = TRUE,
@@ -1552,10 +1555,9 @@ server <- function(input, output, session) {
     text(-1.03, -0.08, "0", cex = 1.15, font = 2, col = "#1d1d1f")
     text(1.03, -0.08, "1", cex = 1.15, font = 2, col = "#1d1d1f")
     text(0, -0.27, format_risk_score(risk), cex = 2.5, font = 2, col = "#ff3b30")
-    text(0, -0.47, "Risk Score", cex = 0.95, font = 2, col = "#6e6e73")
     text(
       0,
-      -0.6,
+      -0.47,
       "Range: 0 (Low Risk) – 1 (High Risk)",
       cex = 0.95,
       font = 2,
@@ -1775,6 +1777,7 @@ server <- function(input, output, session) {
       "\nFound active model genes:", length(found_nonzero_genes),
       "\nMissing active model genes:", length(missing_nonzero_genes),
       "\nNormal reference samples:", ifelse(isTRUE(normal_reference$available), normal_reference$n_samples, "not available"),
+      "\nExcluded from normal reference:", ifelse(isTRUE(normal_reference$available), paste(normal_reference$excluded_datasets, collapse = ", "), "not available"),
       "\nDiagnostic genes available in normal reference and upload:", length(found_reference_genes),
       "\n\nMissing gene list:",
       ifelse(length(missing_nonzero_genes) == 0, "None", paste(missing_nonzero_genes, collapse = ", "))
@@ -1817,6 +1820,7 @@ server <- function(input, output, session) {
     
     prediction_values(list(
       model = "Elastic Net",
+      sample_id = input$selected_sample,
       meta = meta_risk,
       ci_low = ci_low,
       ci_high = ci_high,
@@ -1964,7 +1968,7 @@ server <- function(input, output, session) {
     paste(
       "This dashboard estimates breast cancer likelihood from the uploaded gene-expression profile.",
       "The uploaded file should contain patient/sample IDs and the diagnostic gene panel used by the model.",
-      "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset, not with the uploaded cohort.",
+      "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset, excluding GSE29044 because it is reserved as the external demo dataset.",
       "The uncertainty range shows how much the risk estimate varies across saved bootstrap versions of the model.",
       paste0(
         "Internal validation summary loaded from: ",
@@ -1989,15 +1993,17 @@ server <- function(input, output, session) {
   
   output$download_report <- downloadHandler(
     filename = function() {
-      paste0(input$selected_sample, "_risk_report_", Sys.Date(), ".pdf")
+      vals <- prediction_values()
+      req(vals$sample_id)
+      paste0(vals$sample_id, "_risk_report_", Sys.Date(), ".pdf")
     },
     
     content = function(file) {
-      req(prediction_values())
-      req(input$selected_sample)
+      vals <- prediction_values()
+      req(vals)
+      req(vals$sample_id)
       req(gene_summary())
       
-      vals <- prediction_values()
       report_tables <- report_gene_tables()
       
       risk_category <- ifelse(
@@ -2015,7 +2021,7 @@ server <- function(input, output, session) {
         output_file = "patient_risk_report.pdf",
         output_dir = tempdir(),
         params = list(
-          patient_id = input$selected_sample,
+          patient_id = vals$sample_id,
           risk_score = vals$meta,
           risk_category = risk_category,
           ci_low = vals$ci_low,
