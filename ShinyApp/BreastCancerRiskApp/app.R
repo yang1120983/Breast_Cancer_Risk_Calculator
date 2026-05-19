@@ -22,6 +22,152 @@ find_multiclass_model_dir <- function() {
   existing[1]
 }
 
+find_risk_model_dir <- function() {
+  candidates <- c(
+    file.path("Pre-processing", "models"),
+    file.path("..", "Pre-processing", "models"),
+    file.path("..", "..", "Pre-processing", "models")
+  )
+  existing <- candidates[dir.exists(candidates)]
+  if (length(existing) == 0) return(NULL)
+  existing[1]
+}
+
+find_risk_results_dir <- function() {
+  candidates <- c(
+    file.path("Pre-processing", "results"),
+    file.path("..", "Pre-processing", "results"),
+    file.path("..", "..", "Pre-processing", "results"),
+    file.path("Pre-processing", "result"),
+    file.path("..", "Pre-processing", "result"),
+    file.path("..", "..", "Pre-processing", "result")
+  )
+  existing <- candidates[dir.exists(candidates)]
+  if (length(existing) == 0) return(NULL)
+  existing[1]
+}
+
+find_normalised_data_file <- function() {
+  candidates <- c(
+    file.path("Pre-processing", "data", "normalised", "merged_normalised.rds"),
+    file.path("..", "Pre-processing", "data", "normalised", "merged_normalised.rds"),
+    file.path("..", "..", "Pre-processing", "data", "normalised", "merged_normalised.rds")
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) return(NULL)
+  existing[1]
+}
+
+load_normal_reference <- function(reference_genes) {
+  data_file <- find_normalised_data_file()
+  if (is.null(data_file)) {
+    return(list(
+      available = FALSE,
+      message = "Could not find Pre-processing/data/normalised/merged_normalised.rds."
+    ))
+  }
+  
+  dat <- readRDS(data_file)
+  if (!all(c("expr", "meta") %in% names(dat))) {
+    return(list(
+      available = FALSE,
+      message = "merged_normalised.rds must contain expr and meta objects."
+    ))
+  }
+  
+  normal_idx <- which(as.character(dat$meta$Status) == "Normal")
+  if (length(normal_idx) == 0) {
+    return(list(
+      available = FALSE,
+      message = "No normal samples found in merged_normalised.rds."
+    ))
+  }
+  
+  normal_sample_ids <- rownames(dat$meta)[normal_idx]
+  normal_sample_ids <- intersect(normal_sample_ids, colnames(dat$expr))
+  available_genes <- intersect(reference_genes, rownames(dat$expr))
+  
+  if (length(available_genes) < 2 || length(normal_sample_ids) < 2) {
+    return(list(
+      available = FALSE,
+      message = "Normal reference does not contain enough diagnostic genes or normal samples."
+    ))
+  }
+  
+  expr_normal <- dat$expr[available_genes, normal_sample_ids, drop = FALSE]
+  normal_median <- apply(expr_normal, 1, median, na.rm = TRUE)
+  normal_sd <- apply(expr_normal, 1, stats::sd, na.rm = TRUE)
+  normal_sd[!is.finite(normal_sd) | normal_sd == 0] <- 1
+  
+  list(
+    available = TRUE,
+    data_file = normalizePath(data_file),
+    expr = expr_normal,
+    genes = available_genes,
+    sample_ids = normal_sample_ids,
+    median = normal_median,
+    sd = normal_sd,
+    n_samples = length(normal_sample_ids)
+  )
+}
+
+load_risk_model <- function() {
+  model_dir <- find_risk_model_dir()
+  if (is.null(model_dir)) {
+    return(list(available = FALSE, message = "Could not find Pre-processing/models."))
+  }
+  
+  model_file <- file.path(model_dir, "elasticnet_full.rds")
+  gene_file <- file.path(model_dir, "final_top_genes.rds")
+  if (!file.exists(model_file) || !file.exists(gene_file)) {
+    return(list(
+      available = FALSE,
+      message = "Missing elasticnet_full.rds or final_top_genes.rds."
+    ))
+  }
+  fit <- readRDS(model_file)
+  genes <- readRDS(gene_file)
+  coef_mat <- tryCatch(as.matrix(stats::coef(fit, s = "lambda.min")), error = function(e) NULL)
+  coefficients <- stats::setNames(rep(0, length(genes)), genes)
+  intercept <- NA_real_
+  if (!is.null(coef_mat)) {
+    common_coef_genes <- intersect(genes, rownames(coef_mat))
+    coefficients[common_coef_genes] <- as.numeric(coef_mat[common_coef_genes, 1])
+    if ("(Intercept)" %in% rownames(coef_mat)) {
+      intercept <- as.numeric(coef_mat["(Intercept)", 1])
+    }
+  }
+  nonzero_genes <- names(coefficients)[abs(coefficients) > 1e-10]
+  
+  bootstrap_files <- list.files(
+    model_dir,
+    pattern = "^elasticnet\\.rds$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  bootstrap_files <- bootstrap_files[grepl("bootstrap_", bootstrap_files)]
+  
+  results_dir <- find_risk_results_dir()
+  metric_file <- if (!is.null(results_dir)) {
+    list.files(results_dir, pattern = "elastic_metric_summary.*\\.rds$", full.names = TRUE)[1]
+  } else {
+    NA_character_
+  }
+  
+  list(
+    available = TRUE,
+    model_dir = normalizePath(model_dir),
+    fit = fit,
+    genes = genes,
+    coefficients = coefficients,
+    nonzero_genes = nonzero_genes,
+    intercept = intercept,
+    bootstrap_fits = lapply(bootstrap_files, readRDS),
+    metric_summary = if (!is.na(metric_file) && file.exists(metric_file)) readRDS(metric_file) else NULL,
+    metric_summary_name = if (!is.na(metric_file) && file.exists(metric_file)) basename(metric_file) else NULL
+  )
+}
+
 load_multiclass_model <- function() {
   model_dir <- find_multiclass_model_dir()
   if (is.null(model_dir)) {
@@ -29,8 +175,7 @@ load_multiclass_model <- function() {
   }
   
   required_files <- c(
-    "fit_rf.rds", "fit_lasso.rds", "fit_knn.rds",
-    "panel_genes.rds", "imputation_params.rds",
+    "fit_elasticnet.rds", "panel_genes.rds", "imputation_params.rds",
     "scale_params.rds", "batch_correction_params.rds"
   )
   missing_files <- required_files[!file.exists(file.path(model_dir, required_files))]
@@ -47,14 +192,7 @@ load_multiclass_model <- function() {
   list(
     available = TRUE,
     model_dir = normalizePath(model_dir),
-    fit_rf = readRDS(file.path(model_dir, "fit_rf.rds")),
-    fit_lasso = readRDS(file.path(model_dir, "fit_lasso.rds")),
-    fit_knn = readRDS(file.path(model_dir, "fit_knn.rds")),
-    fit_multinom = if (file.exists(file.path(model_dir, "fit_multinom.rds"))) {
-      readRDS(file.path(model_dir, "fit_multinom.rds"))
-    } else {
-      NULL
-    },
+    fit_elasticnet = readRDS(file.path(model_dir, "fit_elasticnet.rds")),
     panel_genes = readRDS(file.path(model_dir, "panel_genes.rds")),
     imputation = readRDS(file.path(model_dir, "imputation_params.rds")),
     scale = readRDS(file.path(model_dir, "scale_params.rds")),
@@ -196,9 +334,19 @@ read_tabular_upload <- function(file_info) {
     data <- read.delim(connection, check.names = FALSE, comment.char = "", quote = "\"")
   }
   
-  if (!"PatientID" %in% names(data)) {
-    data$PatientID <- paste0("Patient_", sprintf("%03d", seq_len(nrow(data))))
+  id_candidates <- c(
+    "patientid", "patient_id", "patient", "sample_id", "sampleid",
+    "sample", "geo_accession", "gsm", "id"
+  )
+  id_idx <- match(id_candidates, tolower(names(data)), nomatch = 0)
+  id_idx <- id_idx[id_idx > 0][1]
+  
+  if (is.na(id_idx) || is.null(id_idx)) {
+    data$sample_id <- paste0("Patient_", sprintf("%03d", seq_len(nrow(data))))
     data <- data[, c(ncol(data), seq_len(ncol(data) - 1)), drop = FALSE]
+  } else {
+    names(data)[id_idx] <- "sample_id"
+    data <- data[, c(id_idx, setdiff(seq_along(data), id_idx)), drop = FALSE]
   }
   
   list(
@@ -212,7 +360,7 @@ read_tabular_upload <- function(file_info) {
 
 read_expression_upload <- function(file_info) {
   file_name <- tolower(file_info$name)
-  looks_like_geo <- grepl("\\.txt\\.gz$|series.*matrix|gse", file_name)
+  looks_like_geo <- grepl("\\.txt\\.gz$|series.*matrix", file_name)
   
   if (looks_like_geo) {
     geo_result <- tryCatch(
@@ -237,6 +385,14 @@ scale_with_training_params <- function(x, scale_params) {
   as.data.frame(x_scaled)
 }
 
+format_risk_score <- function(x, digits = 3) {
+  if (!is.finite(x)) return("Not available")
+  if (x > 0 && x < 10^-digits) {
+    return(paste0("<", formatC(10^-digits, format = "f", digits = digits)))
+  }
+  formatC(round(x, digits), format = "f", digits = digits)
+}
+
 align_probability_vector <- function(prob_vec, subtype_levels) {
   out <- setNames(rep(NA_real_, length(subtype_levels)), subtype_levels)
   common <- intersect(names(prob_vec), subtype_levels)
@@ -247,47 +403,13 @@ align_probability_vector <- function(prob_vec, subtype_levels) {
 predict_multiclass_model_probabilities <- function(x_i, x_s, multiclass_model, subtype_levels) {
   probs <- list()
   
-  rf_prob <- predict(multiclass_model$fit_rf, x_i, type = "prob")
-  probs$RF <- align_probability_vector(
-    stats::setNames(as.numeric(rf_prob[1, ]), colnames(rf_prob)),
-    subtype_levels
-  )
-  
-  lasso_prob <- tryCatch({
-    pr <- predict(multiclass_model$fit_lasso, as.matrix(x_s), type = "response", s = "lambda.min")
+  elasticnet_prob <- tryCatch({
+    pr <- predict(multiclass_model$fit_elasticnet, as.matrix(x_s), type = "response", s = "lambda.min")
     if (length(dim(pr)) == 3) pr <- pr[, , 1]
     if (is.null(dim(pr))) pr <- t(as.matrix(pr))
     align_probability_vector(stats::setNames(as.numeric(pr[1, ]), colnames(pr)), subtype_levels)
   }, error = function(e) NULL)
-  if (!is.null(lasso_prob)) probs$LassoMC <- lasso_prob
-  
-  if (!is.null(multiclass_model$fit_multinom)) {
-    multinom_prob <- tryCatch({
-      pm <- predict(multiclass_model$fit_multinom, newdata = data.frame(x_s), type = "probs")
-      if (is.null(dim(pm))) pm <- t(as.matrix(pm))
-      align_probability_vector(stats::setNames(as.numeric(pm[1, ]), colnames(pm)), subtype_levels)
-    }, error = function(e) NULL)
-    if (!is.null(multinom_prob)) probs$Multinom <- multinom_prob
-  }
-  
-  knn_prob <- tryCatch({
-    fit <- multiclass_model$fit_knn
-    common <- intersect(colnames(fit$X_train), colnames(x_s))
-    pred <- class::knn(
-      train = fit$X_train[, common, drop = FALSE],
-      test = as.matrix(x_s[, common, drop = FALSE]),
-      cl = fit$y_train,
-      k = fit$k,
-      prob = TRUE
-    )
-    winning_prob <- attr(pred, "prob")
-    winning_class <- as.character(pred)
-    levels_knn <- levels(fit$y_train)
-    pm <- setNames(rep((1 - winning_prob) / max(1, length(levels_knn) - 1), length(levels_knn)), levels_knn)
-    pm[winning_class] <- winning_prob
-    align_probability_vector(pm, subtype_levels)
-  }, error = function(e) NULL)
-  if (!is.null(knn_prob)) probs$kNN <- knn_prob
+  if (!is.null(elasticnet_prob)) probs$ElasticNet <- elasticnet_prob
   
   probs
 }
@@ -298,6 +420,7 @@ calculate_multiclass_uncertainty <- function(model_probabilities, model_disagree
   avg_probs <- avg_probs / sum(avg_probs, na.rm = TRUE)
   pred_subtype <- names(avg_probs)[which.max(avg_probs)]
   disagreement <- stats::sd(prob_stack[, pred_subtype], na.rm = TRUE)
+  if (!is.finite(disagreement) || is.na(disagreement)) disagreement <- 0
   entropy <- {
     p <- avg_probs[avg_probs > 0]
     -sum(p * log(p))
@@ -330,6 +453,91 @@ calculate_multiclass_uncertainty <- function(model_probabilities, model_disagree
     model_count = nrow(prob_stack),
     model_probabilities = prob_stack,
     average_probabilities = avg_probs
+  )
+}
+
+prepare_risk_features <- function(data, selected_sample, required_genes, important_genes = required_genes, min_fraction = 0.80) {
+  selected_index <- which(data[[1]] == selected_sample)[1]
+  if (is.na(selected_index)) {
+    return(list(can_score = FALSE, message = "Selected sample could not be found in the uploaded dataset."))
+  }
+  
+  gene_data <- data[, -1, drop = FALSE]
+  gene_data <- as.data.frame(lapply(gene_data, function(x) suppressWarnings(as.numeric(x))))
+  present_genes <- intersect(required_genes, colnames(gene_data))
+  missing_genes <- setdiff(required_genes, colnames(gene_data))
+  present_important_genes <- intersect(important_genes, colnames(gene_data))
+  missing_important_genes <- setdiff(important_genes, colnames(gene_data))
+  min_required <- ceiling(length(important_genes) * min_fraction)
+  
+  if (length(present_important_genes) < min_required) {
+    return(list(
+      can_score = FALSE,
+      message = paste0(
+        "Risk calculator needs at least ", min_required, " of ",
+        length(important_genes), " non-zero Elastic Net genes. This sample has ",
+        length(present_important_genes), "."
+      ),
+      genes_used = length(present_genes),
+      genes_required = length(required_genes),
+      missing_genes = missing_genes,
+      missing_important_genes = missing_important_genes
+    ))
+  }
+  
+  x <- as.data.frame(matrix(NA_real_, nrow = 1, ncol = length(required_genes)))
+  names(x) <- required_genes
+  x[1, present_genes] <- as.numeric(gene_data[selected_index, present_genes])
+  
+  for (gene in required_genes) {
+    if (is.na(x[[gene]]) || !is.finite(x[[gene]])) {
+      if (gene %in% colnames(gene_data)) {
+        x[[gene]] <- stats::median(gene_data[[gene]], na.rm = TRUE)
+      } else {
+        x[[gene]] <- 0
+      }
+    }
+  }
+  
+  list(
+    can_score = TRUE,
+    x = x,
+    genes_used = length(present_genes),
+    genes_required = length(required_genes),
+    missing_gene_count = length(missing_genes)
+  )
+}
+
+predict_elasticnet_risk <- function(x, risk_model) {
+  risk <- as.numeric(predict(
+    risk_model$fit,
+    newx = as.matrix(x),
+    s = "lambda.min",
+    type = "response"
+  ))
+  
+  bootstrap_scores <- vapply(risk_model$bootstrap_fits, function(fit) {
+    as.numeric(predict(
+      fit,
+      newx = as.matrix(x),
+      s = "lambda.min",
+      type = "response"
+    ))
+  }, numeric(1))
+  
+  if (length(bootstrap_scores) > 0 && any(is.finite(bootstrap_scores))) {
+    ci_low <- as.numeric(stats::quantile(bootstrap_scores, 0.10, na.rm = TRUE))
+    ci_high <- as.numeric(stats::quantile(bootstrap_scores, 0.90, na.rm = TRUE))
+  } else {
+    ci_low <- NA_real_
+    ci_high <- NA_real_
+  }
+  
+  list(
+    risk = risk,
+    ci_low = ci_low,
+    ci_high = ci_high,
+    bootstrap_n = length(bootstrap_scores)
   )
 }
 
@@ -660,10 +868,9 @@ ui <- fluidPage(
         accept = c(".csv", ".txt", ".gz", ".txt.gz")
       ),
       
-      actionButton("load_demo", "Reload Demo Dataset"),
-      
       hr(),
       
+      h4("Patient Selection"),
       uiOutput("sample_selector"),
       
       selectInput(
@@ -671,16 +878,17 @@ ui <- fluidPage(
         "Number of genes shown in plot",
         choices = c(
           "10 genes" = 10,
-          "20 genes" = 20
+          "20 genes" = 20,
+          "50 genes" = 50
         ),
         selected = 10
       ),
       
-      actionButton("run_prediction", "Run Prediction", class = "btn-primary"),
+      actionButton("run_prediction", "Calculate Risk", class = "btn-primary"),
       
       hr(),
       
-      h4("Gene Check"),
+      h4("Upload Quality Check"),
       verbatimTextOutput("gene_check"),
       
       hr(),
@@ -717,7 +925,7 @@ ui <- fluidPage(
               h4("Uncertainty"),
               div(class = "metric-content",
                   uiOutput("uncertainty_box"),
-                  div(class = "uncertainty-note", "95% confidence interval")
+                  div(class = "uncertainty-note", "Estimated prediction range from bootstrap models")
               )
           )
         )
@@ -735,17 +943,17 @@ ui <- fluidPage(
               div(
                 h3("Selected Sample Gene Expression"),
                 div(class = "sample-subtitle",
-                    "Genes shown include the highest- and lowest-expression genes for the selected patient. Genes are ordered from highest to lowest patient expression. Horizontal boxplots show cohort-level distribution, and red triangles indicate the selected patient.")
+                    "This section compares the selected patient with normal reference samples from the training data. The first half of genes are shifted furthest above the normal reference, and the second half are shifted furthest below it. Boxplots show normal-reference expression; red triangles mark the selected patient.")
               )
           ),
           uiOutput("gene_expression_plot_ui"),
           uiOutput("abnormal_gene_summary"),
-          div(class = "gene-value-title", "Selected Patient Gene Values"),
+          div(class = "gene-value-title", "Selected Patient Gene Expression Summary"),
           DTOutput("gene_value_table")
       ),
       
       div(class = "card",
-          h3("Clinical Warning / Limitation"),
+          h3("Clinical Use Notes"),
           div(class = "warning-box", verbatimTextOutput("warning_box"))
       )
     )
@@ -754,24 +962,17 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
-  final_top_genes <- paste0("Gene", 1:50)
+  risk_model <- load_risk_model()
+  final_top_genes <- if (isTRUE(risk_model$available)) risk_model$genes else paste0("Gene", 1:50)
+  normal_reference <- load_normal_reference(final_top_genes)
+  display_risk_genes <- if (isTRUE(risk_model$available) && length(risk_model$nonzero_genes) > 0) {
+    risk_model$nonzero_genes
+  } else {
+    final_top_genes
+  }
   multiclass_model <- load_multiclass_model()
   
-  make_demo_data <- function() {
-    set.seed(3888)
-    
-    data.frame(
-      sample_id = paste0("Patient_", 1:100),
-      matrix(
-        rnorm(100 * 50),
-        nrow = 100,
-        ncol = 50,
-        dimnames = list(NULL, final_top_genes)
-      )
-    )
-  }
-  
-  dataset <- reactiveVal(make_demo_data())
+  dataset <- reactiveVal(NULL)
   upload_summary <- reactiveVal(NULL)
   prediction_values <- reactiveVal(NULL)
   
@@ -783,12 +984,6 @@ server <- function(input, output, session) {
       sample_id = as.character(data[[1]]),
       stringsAsFactors = FALSE
     )
-  })
-  
-  observeEvent(input$load_demo, {
-    dataset(make_demo_data())
-    upload_summary(NULL)
-    prediction_values(NULL)
   })
   
   observeEvent(input$demo_file, {
@@ -813,23 +1008,50 @@ server <- function(input, output, session) {
   })
   
   output$sample_selector <- renderUI({
-    lookup <- patient_lookup()
-    choices <- stats::setNames(lookup$sample_id, lookup$patient_display_id)
-    
     tagList(
-      selectInput(
+      selectizeInput(
         "selected_sample",
         "Select patient",
-        choices = choices,
-        selected = lookup$sample_id[1]
+        choices = NULL,
+        options = list(
+          placeholder = "Upload data first, then choose Patient_1...",
+          maxOptions = 1000
+        )
       ),
       textInput(
         "patient_search",
         "Search patient name",
         placeholder = "Try Patient_1 or Patient_25"
+      ),
+      div(
+        class = "sample-subtitle",
+        if (is.null(dataset())) {
+          "Upload an expression dataset to activate patient selection."
+        } else {
+          paste0("Loaded ", nrow(dataset()), " patients/samples from the uploaded file.")
+        }
       )
     )
   })
+  
+  observeEvent(dataset(), {
+    data <- dataset()
+    if (is.null(data)) {
+      updateSelectizeInput(session, "selected_sample", choices = character(0), selected = character(0), server = TRUE)
+      return()
+    }
+    
+    lookup <- patient_lookup()
+    choices <- stats::setNames(lookup$sample_id, lookup$patient_display_id)
+    
+    updateSelectizeInput(
+      session,
+      "selected_sample",
+      choices = c("Choose a patient..." = "", choices),
+      selected = "",
+      server = TRUE
+    )
+  }, ignoreInit = FALSE)
   
   observeEvent(input$patient_search, {
     query <- trimws(input$patient_search)
@@ -868,7 +1090,7 @@ server <- function(input, output, session) {
   
   gene_summary <- reactive({
     req(dataset())
-    req(input$selected_sample)
+    validate(need(nzchar(input$selected_sample), "Choose a patient to view their gene expression profile."))
     req(input$plot_gene_count)
     
     data <- dataset()
@@ -876,47 +1098,59 @@ server <- function(input, output, session) {
     gene_data <- data[, -1, drop = FALSE]
     gene_data <- as.data.frame(lapply(gene_data, function(x) suppressWarnings(as.numeric(x))))
     
-    available_genes <- intersect(final_top_genes, colnames(gene_data))
-    if (length(available_genes) <= 1) {
-      numeric_genes <- names(gene_data)[vapply(gene_data, function(x) any(is.finite(x), na.rm = TRUE), logical(1))]
-      available_genes <- head(numeric_genes, 50)
-    }
+    validate(
+      need(isTRUE(normal_reference$available), normal_reference$message)
+    )
+    
+    available_genes <- Reduce(intersect, list(final_top_genes, colnames(gene_data), normal_reference$genes))
     
     validate(
-      need(length(available_genes) > 1, "Not enough numeric gene columns to create the plot.")
+      need(
+        length(available_genes) > 1,
+        "Not enough diagnostic panel genes are shared between the uploaded file and the normal reference."
+      )
     )
     
     gene_data <- gene_data[, available_genes, drop = FALSE]
+    normal_expr <- normal_reference$expr[available_genes, , drop = FALSE]
     
     selected_index <- which(data[[1]] == input$selected_sample)[1]
     
     all_patient_values <- as.numeric(gene_data[selected_index, available_genes])
     names(all_patient_values) <- available_genes
+    shifted_score <- (all_patient_values - normal_reference$median[available_genes]) / normal_reference$sd[available_genes]
     
     gene_count <- as.numeric(input$plot_gene_count)
-    
-    ordered_high <- names(sort(all_patient_values, decreasing = TRUE, na.last = NA))
-    ordered_low  <- names(sort(all_patient_values, decreasing = FALSE, na.last = NA))
-    
     n_high <- ceiling(gene_count / 2)
-    n_low  <- floor(gene_count / 2)
+    n_low <- floor(gene_count / 2)
     
-    high_genes <- ordered_high[1:min(n_high, length(ordered_high))]
-    low_genes  <- ordered_low[1:min(n_low, length(ordered_low))]
+    high_genes <- names(sort(shifted_score, decreasing = TRUE, na.last = NA))
+    low_genes <- names(sort(shifted_score, decreasing = FALSE, na.last = NA))
     
-    top_genes <- unique(c(high_genes, low_genes))
+    high_genes <- high_genes[seq_len(min(n_high, length(high_genes)))]
+    low_genes <- low_genes[seq_len(min(n_low, length(low_genes)))]
     
+    # Keep the clinical display order stable:
+    # higher-than-reference genes first, then lower-than-reference genes.
+    top_genes <- c(high_genes, setdiff(low_genes, high_genes))
     selected_values <- as.numeric(gene_data[selected_index, top_genes])
+    selected_coefficients <- if (isTRUE(risk_model$available)) {
+      risk_model$coefficients[top_genes]
+    } else {
+      rep(NA_real_, length(top_genes))
+    }
+    names(selected_coefficients) <- top_genes
+    estimated_contribution <- selected_values * selected_coefficients
+    model_direction <- ifelse(
+      selected_coefficients > 0,
+      "Increases model risk",
+      ifelse(selected_coefficients < 0, "Lowers model risk", "No direct model effect")
+    )
     
-    ordering <- order(selected_values, decreasing = TRUE)
-    
-    top_genes <- top_genes[ordering]
-    selected_values <- selected_values[ordering]
-    
-    cohort_median <- apply(gene_data[, top_genes, drop = FALSE], 2, median, na.rm = TRUE)
+    normal_median <- normal_reference$median[top_genes]
     
     percentile <- sapply(seq_along(top_genes), function(i) {
-      gene_values <- gene_data[[top_genes[i]]]
+      gene_values <- as.numeric(normal_expr[top_genes[i], ])
       round(mean(gene_values <= selected_values[i], na.rm = TRUE) * 100, 1)
     })
     
@@ -931,12 +1165,22 @@ server <- function(input, output, session) {
     })
     
     list(
-      gene_data = gene_data,
+      gene_data = as.data.frame(t(normal_reference$expr[available_genes, , drop = FALSE]), check.names = FALSE),
       top_genes = top_genes,
       selected_values = selected_values,
-      cohort_median = cohort_median,
+      cohort_median = normal_median,
       percentile = percentile,
-      status = status
+      status = status,
+      shift_score = shifted_score[top_genes],
+      group = ifelse(top_genes %in% high_genes, "Higher than normal reference", "Lower than normal reference"),
+      coefficient = selected_coefficients,
+      contribution = estimated_contribution,
+      model_direction = model_direction,
+      n_high = length(high_genes),
+      n_low = length(low_genes),
+      genes_available = length(available_genes),
+      genes_required = length(final_top_genes),
+      reference_n = normal_reference$n_samples
     )
   })
   
@@ -945,29 +1189,36 @@ server <- function(input, output, session) {
     
     gene_table <- data.frame(
       Gene = gs$top_genes,
-      `Patient Value` = round(gs$selected_values, 4),
-      `Cohort Median` = round(gs$cohort_median, 4),
-      `Patient Percentile` = paste0(gs$percentile, "%"),
+      `Patient Expression` = round(gs$selected_values, 4),
+      `Normal Reference Median` = round(gs$cohort_median, 4),
+      `Percentile vs Normal Reference` = paste0(gs$percentile, "%"),
+      `Deviation From Normal Reference` = round(gs$shift_score, 2),
+      `Reference Comparison` = gs$group,
+      `Model Coefficient` = round(gs$coefficient, 4),
+      `Model Direction` = gs$model_direction,
+      `Estimated Model Contribution` = round(gs$contribution, 4),
       `Expression Status` = gs$status,
       check.names = FALSE
     )
     
     summary_df <- data.frame(
       Gene = gs$top_genes,
-      `Patient Value` = round(gs$selected_values, 4),
+      `Patient Expression` = round(gs$selected_values, 4),
       Percentile = paste0(gs$percentile, "%"),
       Status = gs$status,
+      ShiftScore = gs$shift_score,
+      Group = gs$group,
       PercentileNumeric = gs$percentile,
       check.names = FALSE
     )
     
-    high_genes <- summary_df[summary_df$Status == "High", ]
-    high_genes <- high_genes[order(-high_genes$PercentileNumeric), ]
-    high_genes <- head(high_genes[, c("Gene", "Patient Value", "Percentile")], 3)
+    high_genes <- summary_df[summary_df$Group == "Higher than normal reference", ]
+    high_genes <- high_genes[order(-high_genes$ShiftScore), ]
+    high_genes <- head(high_genes[, c("Gene", "Patient Expression", "Percentile")], 3)
     
-    low_genes <- summary_df[summary_df$Status == "Low", ]
-    low_genes <- low_genes[order(low_genes$PercentileNumeric), ]
-    low_genes <- head(low_genes[, c("Gene", "Patient Value", "Percentile")], 3)
+    low_genes <- summary_df[summary_df$Group == "Lower than normal reference", ]
+    low_genes <- low_genes[order(low_genes$ShiftScore), ]
+    low_genes <- head(low_genes[, c("Gene", "Patient Expression", "Percentile")], 3)
     
     list(
       gene_table = gene_table,
@@ -979,7 +1230,14 @@ server <- function(input, output, session) {
   multiclass_prediction <- reactive({
     req(prediction_values())
     req(dataset())
-    req(input$selected_sample)
+    if (is.null(input$selected_sample) || !nzchar(input$selected_sample)) {
+      showNotification(
+        "Please choose a patient before running the calculator.",
+        type = "warning",
+        duration = 6
+      )
+      return()
+    }
     
     risk <- prediction_values()$meta
     if (risk < 0.4) {
@@ -1045,7 +1303,7 @@ server <- function(input, output, session) {
     }
     
     x_s <- scale_with_training_params(x_i, multiclass_model$scale)
-    subtype_levels <- multiclass_model$fit_rf[["classes"]]
+    subtype_levels <- names(stats::coef(multiclass_model$fit_elasticnet, s = "lambda.min"))
     
     model_probabilities <- predict_multiclass_model_probabilities(
       x_i = x_i,
@@ -1069,7 +1327,11 @@ server <- function(input, output, session) {
     probabilities <- sort(uncertainty$average_probabilities, decreasing = TRUE)
     predicted_subtype <- names(probabilities)[1]
     
-    importance <- multiclass_model$fit_rf[["importance"]][, 1]
+    coef_list <- stats::coef(multiclass_model$fit_elasticnet, s = "lambda.min")
+    subtype_coef <- as.matrix(coef_list[[predicted_subtype]])
+    importance <- abs(as.numeric(subtype_coef[, 1]))
+    names(importance) <- rownames(subtype_coef)
+    importance <- importance[setdiff(names(importance), "(Intercept)")]
     importance <- importance[panel_genes]
     importance[is.na(importance)] <- 0
     importance_scaled <- importance / max(importance, na.rm = TRUE)
@@ -1289,7 +1551,7 @@ server <- function(input, output, session) {
     
     text(-1.03, -0.08, "0", cex = 1.15, font = 2, col = "#1d1d1f")
     text(1.03, -0.08, "1", cex = 1.15, font = 2, col = "#1d1d1f")
-    text(0, -0.27, risk, cex = 2.5, font = 2, col = "#ff3b30")
+    text(0, -0.27, format_risk_score(risk), cex = 2.5, font = 2, col = "#ff3b30")
     text(0, -0.47, "Risk Score", cex = 0.95, font = 2, col = "#6e6e73")
     text(
       0,
@@ -1304,11 +1566,14 @@ server <- function(input, output, session) {
   output$gene_expression_plot <- renderPlot({
     gs <- gene_summary()
     
-    top_genes <- gs$top_genes
-    selected_values <- gs$selected_values
+    ranked_genes <- gs$top_genes
+    ranked_values <- gs$selected_values
     
-    plot_data <- gs$gene_data[, rev(top_genes), drop = FALSE]
-    selected_values <- rev(selected_values)
+    # Base R horizontal boxplots draw the first variable at the bottom,
+    # so reverse the ranking to place the strongest elevation on top.
+    plot_genes <- rev(ranked_genes)
+    plot_data <- gs$gene_data[, plot_genes, drop = FALSE]
+    selected_values <- ranked_values[match(plot_genes, ranked_genes)]
     
     par(mar = c(5, 8, 4, 2))
     
@@ -1321,7 +1586,7 @@ server <- function(input, output, session) {
       lwd = 1.6,
       las = 1,
       xlab = "Gene Expression",
-      main = "Patient Gene Expression Ordered from High to Low",
+      main = paste0("Selected Patient Expression Compared With Normal Reference (n = ", gs$reference_n, ")"),
       cex.axis = 0.9,
       cex.lab = 1.1,
       cex.main = 1.2
@@ -1329,7 +1594,7 @@ server <- function(input, output, session) {
     
     points(
       x = selected_values,
-      y = seq_along(top_genes),
+      y = seq_along(plot_genes),
       pch = 17,
       col = "#ff3b30",
       cex = 1.9
@@ -1352,19 +1617,19 @@ server <- function(input, output, session) {
       Gene = gs$top_genes,
       PatientValue = gs$selected_values,
       Percentile = gs$percentile,
-      Status = gs$status
+      Status = gs$status,
+      ShiftScore = gs$shift_score,
+      Group = gs$group
     )
     
-    high_genes <- summary_df[summary_df$Status == "High", ]
-    high_genes <- high_genes[order(-high_genes$PatientValue), ]
-    high_genes <- head(high_genes, 3)
+    high_genes <- summary_df[summary_df$Group == "Higher than normal reference", ]
+    high_genes <- high_genes[order(-high_genes$ShiftScore), ]
     
-    low_genes <- summary_df[summary_df$Status == "Low", ]
-    low_genes <- low_genes[order(low_genes$PatientValue), ]
-    low_genes <- head(low_genes, 3)
+    low_genes <- summary_df[summary_df$Group == "Lower than normal reference", ]
+    low_genes <- low_genes[order(low_genes$ShiftScore), ]
     
     high_items <- if (nrow(high_genes) == 0) {
-      list(div(class = "abnormal-item", span("No high-expression genes detected.")))
+      list(div(class = "abnormal-item", span("No genes above the normal reference available.")))
     } else {
       lapply(seq_len(nrow(high_genes)), function(i) {
         div(
@@ -1385,7 +1650,7 @@ server <- function(input, output, session) {
     }
     
     low_items <- if (nrow(low_genes) == 0) {
-      list(div(class = "abnormal-item", span("No low-expression genes detected.")))
+      list(div(class = "abnormal-item", span("No genes below the normal reference available.")))
     } else {
       lapply(seq_len(nrow(low_genes)), function(i) {
         div(
@@ -1409,12 +1674,12 @@ server <- function(input, output, session) {
       class = "abnormal-grid",
       div(
         class = "abnormal-card",
-        div(class = "abnormal-title-high", "Top High Expression Genes"),
+        div(class = "abnormal-title-high", paste0("Most Elevated vs Normal Reference (Top ", gs$n_high, ")")),
         high_items
       ),
       div(
         class = "abnormal-card",
-        div(class = "abnormal-title-low", "Top Low Expression Genes"),
+        div(class = "abnormal-title-low", paste0("Most Reduced vs Normal Reference (Bottom ", gs$n_low, ")")),
         low_items
       )
     )
@@ -1435,9 +1700,14 @@ server <- function(input, output, session) {
     
     value_table <- data.frame(
       Gene = gs$top_genes,
-      `Patient Value` = round(gs$selected_values, 4),
-      `Cohort Median` = round(gs$cohort_median, 4),
-      `Patient Percentile` = paste0(gs$percentile, "%"),
+      `Patient Expression` = round(gs$selected_values, 4),
+      `Normal Reference Median` = round(gs$cohort_median, 4),
+      `Percentile vs Normal Reference` = paste0(gs$percentile, "%"),
+      `Deviation From Normal Reference` = round(gs$shift_score, 2),
+      `Reference Comparison` = gs$group,
+      `Model Coefficient` = round(gs$coefficient, 4),
+      `Model Direction` = gs$model_direction,
+      `Estimated Model Contribution` = round(gs$contribution, 4),
       `Expression Status` = expression_status,
       check.names = FALSE
     )
@@ -1456,22 +1726,36 @@ server <- function(input, output, session) {
     )
     
     dt <- formatStyle(dt, "Gene", fontWeight = "700")
-    dt <- formatStyle(dt, "Patient Value", fontWeight = "700")
+    dt <- formatStyle(dt, "Patient Expression", fontWeight = "700")
     
     dt
   })
   
   output$gene_check <- renderText({
-    req(dataset())
+    if (is.null(dataset())) {
+      return(paste(
+        "No dataset uploaded.",
+        "Please upload a CSV, TXT, or GEO series-matrix TXT.GZ file.",
+        "The file must contain patient/sample rows and gene-expression columns for the final Elastic Net model.",
+        sep = "\n"
+      ))
+    }
     
     data <- dataset()
     available_genes <- colnames(data)
     
     found_genes <- intersect(final_top_genes, available_genes)
     missing_genes <- setdiff(final_top_genes, available_genes)
+    found_nonzero_genes <- intersect(display_risk_genes, available_genes)
+    missing_nonzero_genes <- setdiff(display_risk_genes, available_genes)
+    found_reference_genes <- if (isTRUE(normal_reference$available)) {
+      intersect(found_genes, normal_reference$genes)
+    } else {
+      character(0)
+    }
     
     upload_text <- if (is.null(upload_summary())) {
-      "Current dataset: built-in demo data"
+      "Current dataset: uploaded expression data"
     } else {
       paste(
         "Current dataset:", upload_summary()$source,
@@ -1484,37 +1768,63 @@ server <- function(input, output, session) {
     paste(
       upload_text,
       "\n\nMain risk model gene check",
-      "Required genes:", length(final_top_genes),
-      "\nFound genes:", length(found_genes),
-      "\nMissing genes:", length(missing_genes),
+      "Final selected genes:", length(final_top_genes),
+      "\nFound selected genes:", length(found_genes),
+      "\nMissing selected genes:", length(missing_genes),
+      "\nActive model genes required for risk scoring:", length(display_risk_genes),
+      "\nFound active model genes:", length(found_nonzero_genes),
+      "\nMissing active model genes:", length(missing_nonzero_genes),
+      "\nNormal reference samples:", ifelse(isTRUE(normal_reference$available), normal_reference$n_samples, "not available"),
+      "\nDiagnostic genes available in normal reference and upload:", length(found_reference_genes),
       "\n\nMissing gene list:",
-      ifelse(length(missing_genes) == 0, "None", paste(missing_genes, collapse = ", "))
+      ifelse(length(missing_nonzero_genes) == 0, "None", paste(missing_nonzero_genes, collapse = ", "))
     )
   })
   
   observeEvent(input$run_prediction, {
-    req(dataset())
+    if (is.null(dataset())) {
+      showNotification(
+        "Please upload an expression dataset before running the calculator.",
+        type = "warning",
+        duration = 6
+      )
+      return()
+    }
+    
     req(input$selected_sample)
     
-    patient_seed <- sum(utf8ToInt(input$selected_sample))
-    set.seed(patient_seed)
+    if (!isTRUE(risk_model$available)) {
+      showNotification(risk_model$message, type = "error", duration = 8)
+      return()
+    }
     
-    rf_pred <- round(runif(1, 0.65, 0.90), 3)
-    ridge_pred <- round(runif(1, 0.60, 0.88), 3)
-    nb_pred <- round(runif(1, 0.58, 0.86), 3)
+    prepared <- prepare_risk_features(
+      dataset(),
+      input$selected_sample,
+      risk_model$genes,
+      important_genes = risk_model$nonzero_genes
+    )
+    if (!isTRUE(prepared$can_score)) {
+      showNotification(prepared$message, type = "error", duration = 10)
+      prediction_values(NULL)
+      return()
+    }
     
-    meta_risk <- round(0.45 * rf_pred + 0.35 * ridge_pred + 0.20 * nb_pred, 3)
-    
-    ci_low <- max(0, round(meta_risk - runif(1, 0.05, 0.10), 3))
-    ci_high <- min(1, round(meta_risk + runif(1, 0.05, 0.10), 3))
+    risk_pred <- predict_elasticnet_risk(prepared$x, risk_model)
+    meta_risk <- risk_pred$risk
+    ci_low <- if (is.finite(risk_pred$ci_low)) risk_pred$ci_low else NA_real_
+    ci_high <- if (is.finite(risk_pred$ci_high)) risk_pred$ci_high else NA_real_
     
     prediction_values(list(
-      rf = rf_pred,
-      ridge = ridge_pred,
-      nb = nb_pred,
+      model = "Elastic Net",
       meta = meta_risk,
       ci_low = ci_low,
-      ci_high = ci_high
+      ci_high = ci_high,
+      genes_used = prepared$genes_used,
+      genes_required = prepared$genes_required,
+      missing_gene_count = prepared$missing_gene_count,
+      bootstrap_n = risk_pred$bootstrap_n,
+      metric_summary_name = risk_model$metric_summary_name
     ))
   })
   
@@ -1563,10 +1873,19 @@ server <- function(input, output, session) {
   
   output$uncertainty_box <- renderUI({
     req(prediction_values())
+    vals <- prediction_values()
+    interval_text <- if (is.finite(vals$ci_low) && is.finite(vals$ci_high)) {
+      paste0(format_risk_score(vals$ci_low), " - ", format_risk_score(vals$ci_high))
+    } else {
+      "Not available"
+    }
     
-    div(
-      class = "uncertainty-pill",
-      paste0(prediction_values()$ci_low, " - ", prediction_values()$ci_high)
+    tagList(
+      div(class = "uncertainty-pill", interval_text),
+      div(
+        class = "uncertainty-note",
+        paste0("Elastic Net bootstrap models: ", vals$bootstrap_n)
+      )
     )
   })
   
@@ -1643,11 +1962,17 @@ server <- function(input, output, session) {
   
   output$warning_box <- renderText({
     paste(
-      "This is currently a front-end demonstration module.",
-      "The final version will replace placeholder values with trained RF, Ridge, NB, and attention meta-model outputs.",
-      "The uploaded dataset must contain the required final top 50 genes.",
-      "Prediction uncertainty will be estimated using bootstrap models.",
-      "Clinical interpretation should be cautious if genes are missing or if the demo dataset differs from the training datasets.",
+      "This dashboard estimates breast cancer likelihood from the uploaded gene-expression profile.",
+      "The uploaded file should contain patient/sample IDs and the diagnostic gene panel used by the model.",
+      "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset, not with the uploaded cohort.",
+      "The uncertainty range shows how much the risk estimate varies across saved bootstrap versions of the model.",
+      paste0(
+        "Internal validation summary loaded from: ",
+        ifelse(isTRUE(risk_model$available) && !is.null(risk_model$metric_summary_name),
+               risk_model$metric_summary_name,
+               "not available")
+      ),
+      "This tool is intended for research demonstration and clinical decision support only. It should not be used as a standalone diagnostic test without external clinical validation.",
       sep = "\n"
     )
   })
