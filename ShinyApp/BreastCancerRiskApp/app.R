@@ -1,4 +1,5 @@
 library(shiny)
+library(rsconnect)
 library(DT)
 library(rmarkdown)
 library(GEOquery)
@@ -13,6 +14,7 @@ options(shiny.maxRequestSize = 100 * 1024^2)
 
 find_multiclass_model_dir <- function() {
   candidates <- c(
+    file.path("app_data", "models", "multiclass"),
     file.path("Pre-processing", "models", "multiclass"),
     file.path("..", "Pre-processing", "models", "multiclass"),
     file.path("..", "..", "Pre-processing", "models", "multiclass")
@@ -24,6 +26,7 @@ find_multiclass_model_dir <- function() {
 
 find_risk_model_dir <- function() {
   candidates <- c(
+    file.path("app_data", "models"),
     file.path("Pre-processing", "models"),
     file.path("..", "Pre-processing", "models"),
     file.path("..", "..", "Pre-processing", "models")
@@ -35,6 +38,7 @@ find_risk_model_dir <- function() {
 
 find_risk_results_dir <- function() {
   candidates <- c(
+    file.path("app_data", "results"),
     file.path("Pre-processing", "results"),
     file.path("..", "Pre-processing", "results"),
     file.path("..", "..", "Pre-processing", "results"),
@@ -43,6 +47,15 @@ find_risk_results_dir <- function() {
     file.path("..", "..", "Pre-processing", "result")
   )
   existing <- candidates[dir.exists(candidates)]
+  if (length(existing) == 0) return(NULL)
+  existing[1]
+}
+
+find_normal_reference_file <- function() {
+  candidates <- c(
+    file.path("app_data", "normal_reference", "normal_reference.rds")
+  )
+  existing <- candidates[file.exists(candidates)]
   if (length(existing) == 0) return(NULL)
   existing[1]
 }
@@ -59,6 +72,27 @@ find_normalised_data_file <- function() {
 }
 
 load_normal_reference <- function(reference_genes, excluded_datasets = "GSE29044") {
+  reference_file <- find_normal_reference_file()
+  if (!is.null(reference_file)) {
+    ref <- readRDS(reference_file)
+    if (is.list(ref) && all(c("expr", "genes", "sample_ids", "median", "sd") %in% names(ref))) {
+      available_genes <- intersect(reference_genes, ref$genes)
+      if (length(available_genes) >= 2) {
+        return(list(
+          available = TRUE,
+          data_file = normalizePath(reference_file),
+          expr = ref$expr[available_genes, , drop = FALSE],
+          genes = available_genes,
+          sample_ids = ref$sample_ids,
+          median = ref$median[available_genes],
+          sd = ref$sd[available_genes],
+          n_samples = length(ref$sample_ids),
+          excluded_datasets = if (!is.null(ref$excluded_datasets)) ref$excluded_datasets else excluded_datasets
+        ))
+      }
+    }
+  }
+  
   data_file <- find_normalised_data_file()
   if (is.null(data_file)) {
     return(list(
@@ -212,6 +246,7 @@ load_multiclass_model <- function() {
 
 find_geo_cache_dir <- function() {
   candidates <- c(
+    file.path("app_data", "geo-cache"),
     file.path("Pre-processing", "data", "geo-cache"),
     file.path("..", "Pre-processing", "data", "geo-cache"),
     file.path("..", "..", "Pre-processing", "data", "geo-cache")
@@ -219,6 +254,33 @@ find_geo_cache_dir <- function() {
   existing <- candidates[dir.exists(candidates)]
   if (length(existing) == 0) return(NULL)
   existing[1]
+}
+
+find_geo_annotation_file <- function(platform_id) {
+  safe_platform <- gsub("[^A-Za-z0-9_.-]", "_", platform_id)
+  candidates <- c(
+    file.path("app_data", "geo_annotation", paste0(safe_platform, "_probe_map.rds"))
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) return(NULL)
+  existing[1]
+}
+
+get_upload_gene_panel <- function() {
+  genes <- character(0)
+  risk_dir <- find_risk_model_dir()
+  if (!is.null(risk_dir)) {
+    risk_gene_file <- file.path(risk_dir, "final_top_genes.rds")
+    if (file.exists(risk_gene_file)) genes <- c(genes, readRDS(risk_gene_file))
+  }
+  
+  multiclass_dir <- find_multiclass_model_dir()
+  if (!is.null(multiclass_dir)) {
+    multiclass_gene_file <- file.path(multiclass_dir, "panel_genes.rds")
+    if (file.exists(multiclass_gene_file)) genes <- c(genes, readRDS(multiclass_gene_file))
+  }
+  
+  unique(as.character(genes))
 }
 
 prepare_geoquery_platform_cache <- function(target_dir) {
@@ -233,8 +295,156 @@ prepare_geoquery_platform_cache <- function(target_dir) {
       if (!isTRUE(linked)) file.copy(src, dest, overwrite = TRUE)
     }
   }
-  
+
   invisible(TRUE)
+}
+
+parse_series_matrix_header <- function(datapath) {
+  con <- gzfile(datapath, open = "rt")
+  on.exit(close(con), add = TRUE)
+  
+  platform_id <- NA_character_
+  series_platform_ids <- character(0)
+  sample_platform_ids <- character(0)
+  sample_ids <- character(0)
+  table_begin_line <- NA_integer_
+  line_number <- 0L
+  
+  repeat {
+    line <- readLines(con, n = 1, warn = FALSE)
+    if (length(line) == 0) break
+    line_number <- line_number + 1L
+    
+    if (startsWith(line, "!Series_platform_id")) {
+      fields <- scan(text = line, what = character(), sep = "\t", quiet = TRUE)
+      series_platform_ids <- c(series_platform_ids, gsub('^"|"$', "", fields[-1]))
+    }
+    
+    if (startsWith(line, "!Sample_geo_accession")) {
+      fields <- scan(text = line, what = character(), sep = "\t", quiet = TRUE)
+      sample_ids <- gsub('^"|"$', "", fields[-1])
+    }
+    
+    if (startsWith(line, "!Sample_platform_id")) {
+      fields <- scan(text = line, what = character(), sep = "\t", quiet = TRUE)
+      sample_platform_ids <- gsub('^"|"$', "", fields[-1])
+    }
+    
+    if (startsWith(line, "!series_matrix_table_begin")) {
+      table_begin_line <- line_number
+      break
+    }
+  }
+  
+  sample_platform_ids <- unique(sample_platform_ids[nzchar(sample_platform_ids)])
+  series_platform_ids <- unique(series_platform_ids[nzchar(series_platform_ids)])
+  if (length(sample_platform_ids) == 1) {
+    platform_id <- sample_platform_ids[1]
+  } else if (length(series_platform_ids) >= 1) {
+    platform_id <- series_platform_ids[1]
+  }
+  
+  list(
+    platform_id = platform_id,
+    sample_ids = sample_ids,
+    table_begin_line = table_begin_line
+  )
+}
+
+read_geo_series_matrix_lightweight <- function(file_info) {
+  header <- parse_series_matrix_header(file_info$datapath)
+  if (is.na(header$table_begin_line)) {
+    stop("Could not find the GEO series matrix expression table.")
+  }
+  if (is.na(header$platform_id) || !nzchar(header$platform_id)) {
+    stop("Could not identify the GEO platform ID.")
+  }
+  
+  annotation_file <- find_geo_annotation_file(header$platform_id)
+  if (is.null(annotation_file)) {
+    stop(paste0("No lightweight probe annotation is bundled for ", header$platform_id, "."))
+  }
+  
+  probe_map <- readRDS(annotation_file)
+  required_genes <- get_upload_gene_panel()
+  if (length(required_genes) > 0) {
+    probe_map <- rbind(
+      probe_map,
+      data.frame(
+        probe_id = required_genes,
+        gene_symbol = required_genes,
+        stringsAsFactors = FALSE
+      )
+    )
+    probe_map <- probe_map[probe_map$gene_symbol %in% required_genes, , drop = FALSE]
+  }
+  if (nrow(probe_map) == 0) {
+    stop("No uploaded probes map to the model gene panel.")
+  }
+  
+  probe_to_gene <- split(probe_map$gene_symbol, probe_map$probe_id)
+  kept_values <- list()
+  kept_genes <- character(0)
+  sample_ids <- header$sample_ids
+  
+  con <- gzfile(file_info$datapath, open = "rt")
+  on.exit(close(con), add = TRUE)
+  for (i in seq_len(header$table_begin_line)) readLines(con, n = 1, warn = FALSE)
+  
+  column_line <- readLines(con, n = 1, warn = FALSE)
+  if (length(column_line) == 0) stop("The GEO expression table is empty.")
+  column_names <- scan(text = column_line, what = character(), sep = "\t", quiet = TRUE)
+  column_names <- gsub('^"|"$', "", column_names)
+  if (length(sample_ids) == 0) sample_ids <- column_names[-1]
+  
+  repeat {
+    line <- readLines(con, n = 1, warn = FALSE)
+    if (length(line) == 0 || startsWith(line, "!series_matrix_table_end")) break
+    
+    fields <- scan(text = line, what = character(), sep = "\t", quiet = TRUE)
+    if (length(fields) < 2) next
+    probe_id <- gsub('^"|"$', "", fields[1])
+    gene_symbols <- unname(probe_to_gene[[probe_id]])
+    if (is.null(gene_symbols) || length(gene_symbols) == 0) next
+    
+    values <- suppressWarnings(as.numeric(gsub('^"|"$', "", fields[-1])))
+    if (length(values) != length(sample_ids)) next
+    
+    for (gene_symbol in unique(gene_symbols)) {
+      if (is.na(gene_symbol) || !nzchar(gene_symbol)) next
+      kept_values[[length(kept_values) + 1]] <- values
+      kept_genes <- c(kept_genes, gene_symbol)
+    }
+  }
+  
+  if (length(kept_values) == 0) {
+    stop("The uploaded GEO file did not contain probes for the model gene panel.")
+  }
+  
+  expr <- do.call(rbind, kept_values)
+  rownames(expr) <- kept_genes
+  colnames(expr) <- sample_ids
+  
+  if (stats::quantile(expr, 0.99, na.rm = TRUE) > 100) {
+    expr <- log2(expr + 1)
+  }
+  
+  expr_gene <- limma::avereps(expr, ID = rownames(expr))
+  expr_table <- as.data.frame(t(expr_gene), check.names = FALSE)
+  expr_table <- data.frame(
+    sample_id = rownames(expr_table),
+    expr_table,
+    check.names = FALSE
+  )
+  
+  list(
+    data = expr_table,
+    source = paste0("GEO series-matrix TXT.GZ lightweight parser (", header$platform_id, ")"),
+    n_probes = length(kept_genes),
+    n_genes = nrow(expr_gene),
+    n_samples = ncol(expr_gene),
+    platform = header$platform_id
+  )
 }
 
 standardize_metadata_ids <- function(meta) {
@@ -367,14 +577,24 @@ read_expression_upload <- function(file_info) {
   looks_like_geo <- grepl("\\.txt\\.gz$|series.*matrix", file_name)
   
   if (looks_like_geo) {
-    geo_result <- tryCatch(
-      read_geo_series_matrix_upload(file_info),
+    lightweight_error <- NULL
+    lightweight_result <- tryCatch(
+      read_geo_series_matrix_lightweight(file_info),
       error = function(e) {
-        warning("GEO parser failed, trying as a regular table: ", conditionMessage(e))
+        lightweight_error <<- conditionMessage(e)
+        warning("Lightweight GEO parser failed: ", lightweight_error)
         NULL
       }
     )
-    if (!is.null(geo_result)) return(geo_result)
+    if (!is.null(lightweight_result)) return(lightweight_result)
+    
+    stop(
+      paste(
+        "This GEO series-matrix file could not be processed by the lightweight parser.",
+        lightweight_error,
+        "Please upload a supported GEO platform file or a preprocessed CSV/TXT table with sample rows and gene columns."
+      )
+    )
   }
   
   read_tabular_upload(file_info)
@@ -978,6 +1198,7 @@ server <- function(input, output, session) {
   
   dataset <- reactiveVal(NULL)
   upload_summary <- reactiveVal(NULL)
+  upload_error <- reactiveVal(NULL)
   prediction_values <- reactiveVal(NULL)
   
   patient_lookup <- reactive({
@@ -996,6 +1217,7 @@ server <- function(input, output, session) {
     uploaded <- tryCatch(
       read_expression_upload(input$demo_file),
       error = function(e) {
+        upload_error(conditionMessage(e))
         showNotification(
           paste("Upload failed:", conditionMessage(e)),
           type = "error",
@@ -1008,6 +1230,7 @@ server <- function(input, output, session) {
     
     dataset(uploaded$data)
     upload_summary(uploaded)
+    upload_error(NULL)
     prediction_values(NULL)
   })
   
@@ -1735,6 +1958,14 @@ server <- function(input, output, session) {
   
   output$gene_check <- renderText({
     if (is.null(dataset())) {
+      if (!is.null(upload_error())) {
+        return(paste(
+          "Upload failed after the file reached the server.",
+          upload_error(),
+          "Please try a supported GEO TXT.GZ platform or upload a processed CSV/TXT table with patient/sample rows and gene-expression columns.",
+          sep = "\n"
+        ))
+      }
       return(paste(
         "No dataset uploaded.",
         "Please upload a CSV, TXT, or GEO series-matrix TXT.GZ file.",
