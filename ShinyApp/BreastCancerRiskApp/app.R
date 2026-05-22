@@ -213,9 +213,15 @@ load_multiclass_model <- function() {
   }
   
   required_files <- c(
-    "fit_elasticnet.rds", "panel_genes.rds", "imputation_params.rds",
+    "panel_genes.rds", "imputation_params.rds",
     "scale_params.rds", "batch_correction_params.rds"
   )
+  fit_file <- if (file.exists(file.path(model_dir, "fit_best_model.rds"))) {
+    "fit_best_model.rds"
+  } else {
+    "fit_elasticnet.rds"
+  }
+  required_files <- c(fit_file, required_files)
   missing_files <- required_files[!file.exists(file.path(model_dir, required_files))]
   if (length(missing_files) > 0) {
     return(list(
@@ -226,11 +232,14 @@ load_multiclass_model <- function() {
   
   model_disagreement_file <- file.path(model_dir, "model_disagreement.rds")
   bootstrap_risk_file <- file.path(model_dir, "bootstrap_risk_scores.rds")
+  best_model_name_file <- file.path(model_dir, "best_model_name.rds")
   
   list(
     available = TRUE,
     model_dir = normalizePath(model_dir),
-    fit_elasticnet = readRDS(file.path(model_dir, "fit_elasticnet.rds")),
+    fit_elasticnet = readRDS(file.path(model_dir, fit_file)),
+    fit_file = fit_file,
+    best_model_name = if (file.exists(best_model_name_file)) readRDS(best_model_name_file) else tools::file_path_sans_ext(fit_file),
     panel_genes = readRDS(file.path(model_dir, "panel_genes.rds")),
     imputation = readRDS(file.path(model_dir, "imputation_params.rds")),
     scale = readRDS(file.path(model_dir, "scale_params.rds")),
@@ -750,8 +759,8 @@ predict_elasticnet_risk <- function(x, risk_model) {
   }, numeric(1))
   
   if (length(bootstrap_scores) > 0 && any(is.finite(bootstrap_scores))) {
-    ci_low <- as.numeric(stats::quantile(bootstrap_scores, 0.10, na.rm = TRUE))
-    ci_high <- as.numeric(stats::quantile(bootstrap_scores, 0.90, na.rm = TRUE))
+    ci_low <- as.numeric(stats::quantile(bootstrap_scores, 0.025, na.rm = TRUE))
+    ci_high <- as.numeric(stats::quantile(bootstrap_scores, 0.975, na.rm = TRUE))
   } else {
     ci_low <- NA_real_
     ci_high <- NA_real_
@@ -761,6 +770,7 @@ predict_elasticnet_risk <- function(x, risk_model) {
     risk = risk,
     ci_low = ci_low,
     ci_high = ci_high,
+    ci_level = 0.95,
     bootstrap_n = length(bootstrap_scores)
   )
 }
@@ -835,6 +845,16 @@ ui <- fluidPage(
         font-weight: 800;
         text-align: center;
         letter-spacing: -1.5px;
+      }
+
+      .uncertainty-label {
+        text-align: center;
+        color: #6e6e73;
+        font-size: 15px;
+        font-weight: 750;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 10px;
       }
 
       .uncertainty-note {
@@ -1148,8 +1168,7 @@ ui <- fluidPage(
           div(class = "card metric-card",
               h4("Uncertainty"),
               div(class = "metric-content",
-                  uiOutput("uncertainty_box"),
-                  div(class = "uncertainty-note", "Estimated prediction range from bootstrap models")
+                  uiOutput("uncertainty_box")
               )
           )
         )
@@ -1424,10 +1443,6 @@ server <- function(input, output, session) {
       `Normal Reference Median` = round(gs$cohort_median, 4),
       `Percentile vs Normal Reference` = paste0(gs$percentile, "%"),
       `Deviation From Normal Reference` = round(gs$shift_score, 2),
-      `Reference Comparison` = gs$group,
-      `Model Coefficient` = round(gs$coefficient, 4),
-      `Model Direction` = gs$model_direction,
-      `Estimated Model Contribution` = round(gs$contribution, 4),
       `Expression Status` = gs$status,
       check.names = FALSE
     )
@@ -1722,7 +1737,10 @@ server <- function(input, output, session) {
         dom = "t",
         ordering = FALSE,
         paging = FALSE,
-        autoWidth = TRUE
+        autoWidth = TRUE,
+        columnDefs = list(
+          list(className = "dt-center", targets = 1:4)
+        )
       )
     )
   })
@@ -1929,10 +1947,6 @@ server <- function(input, output, session) {
       `Normal Reference Median` = round(gs$cohort_median, 4),
       `Percentile vs Normal Reference` = paste0(gs$percentile, "%"),
       `Deviation From Normal Reference` = round(gs$shift_score, 2),
-      `Reference Comparison` = gs$group,
-      `Model Coefficient` = round(gs$coefficient, 4),
-      `Model Direction` = gs$model_direction,
-      `Estimated Model Contribution` = round(gs$contribution, 4),
       `Expression Status` = expression_status,
       check.names = FALSE
     )
@@ -1946,12 +1960,26 @@ server <- function(input, output, session) {
         lengthMenu = c(10, 20),
         dom = "tip",
         ordering = FALSE,
-        autoWidth = TRUE
+        autoWidth = TRUE,
+        columnDefs = list(
+          list(className = "dt-center", targets = 1:5)
+        )
       )
     )
     
     dt <- formatStyle(dt, "Gene", fontWeight = "700")
     dt <- formatStyle(dt, "Patient Expression", fontWeight = "700")
+    dt <- formatStyle(
+      dt,
+      c(
+        "Patient Expression",
+        "Normal Reference Median",
+        "Percentile vs Normal Reference",
+        "Deviation From Normal Reference",
+        "Expression Status"
+      ),
+      textAlign = "center"
+    )
     
     dt
   })
@@ -2055,6 +2083,7 @@ server <- function(input, output, session) {
       meta = meta_risk,
       ci_low = ci_low,
       ci_high = ci_high,
+      ci_level = risk_pred$ci_level,
       genes_used = prepared$genes_used,
       genes_required = prepared$genes_required,
       missing_gene_count = prepared$missing_gene_count,
@@ -2114,12 +2143,18 @@ server <- function(input, output, session) {
     } else {
       "Not available"
     }
+    interval_note <- if (is.finite(vals$ci_low) && is.finite(vals$ci_high)) {
+      paste0("95% bootstrap confidence interval from ", vals$bootstrap_n, " Elastic Net models")
+    } else {
+      paste0("Confidence interval not available. Bootstrap models: ", vals$bootstrap_n)
+    }
     
     tagList(
+      div(class = "uncertainty-label", "95% bootstrap CI"),
       div(class = "uncertainty-pill", interval_text),
       div(
         class = "uncertainty-note",
-        paste0("Elastic Net bootstrap models: ", vals$bootstrap_n)
+        interval_note
       )
     )
   })
@@ -2200,7 +2235,7 @@ server <- function(input, output, session) {
       "This dashboard estimates breast cancer likelihood from the uploaded gene-expression profile.",
       "The uploaded file should contain patient/sample IDs and the diagnostic gene panel used by the model.",
       "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset, excluding GSE29044 because it is reserved as the external demo dataset.",
-      "The uncertainty range shows how much the risk estimate varies across saved bootstrap versions of the model.",
+      "The 95% bootstrap confidence interval shows how much the risk estimate varies across saved bootstrap versions of the model.",
       paste0(
         "Internal validation summary loaded from: ",
         ifelse(isTRUE(risk_model$available) && !is.null(risk_model$metric_summary_name),
