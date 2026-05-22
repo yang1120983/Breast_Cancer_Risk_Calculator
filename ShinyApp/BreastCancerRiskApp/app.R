@@ -1186,7 +1186,7 @@ ui <- fluidPage(
               div(
                 h3("Selected Sample Gene Expression"),
                 div(class = "sample-subtitle",
-                    "This section compares the selected patient with normal reference samples from the training data. GSE29044 is excluded from this reference because it is reserved as the external demo dataset. Boxplots show normal-reference expression; red triangles mark the selected patient.")
+                    "This section compares the selected patient with normal reference samples from the training data. Boxplots show normal-reference expression; red triangles mark the selected patient.")
               )
           ),
           uiOutput("gene_expression_plot_ui"),
@@ -2234,7 +2234,7 @@ server <- function(input, output, session) {
     paste(
       "This dashboard estimates breast cancer likelihood from the uploaded gene-expression profile.",
       "The uploaded file should contain patient/sample IDs and the diagnostic gene panel used by the model.",
-      "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset, excluding GSE29044 because it is reserved as the external demo dataset.",
+      "Gene-expression boxplots compare the selected patient with normal reference samples from the normalized training dataset.",
       "The 95% bootstrap confidence interval shows how much the risk estimate varies across saved bootstrap versions of the model.",
       paste0(
         "Internal validation summary loaded from: ",
