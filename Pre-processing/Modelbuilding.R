@@ -1,14 +1,5 @@
----
-title: "Model building"
-format:
-  html:
-    embed-resources: true
-    code-fold: true
-    df-print: paged
-    toc: true
-editor: visual
----
-```{r}
+﻿# Generated from Modelbuilding.qmd
+
 library(dplyr)
 library(tibble)
 
@@ -116,8 +107,7 @@ cat("External dataset distribution:\n")
 print(table(meta_external$dataset, meta_external$Status))
 
 all(colnames(expr) == rownames(meta))
-```
-```{r}
+
 # Ensure sample order matches
 meta <- meta[colnames(expr), ]
 # Final safety check
@@ -145,9 +135,7 @@ y <- factor(meta$Status, levels = c("Normal", "Cancer"))
 
 
 table(y)
-```
 
-```{r}
 # =========================================================
 # Step 3: LODO with fold-specific limma feature selection
 # =========================================================
@@ -198,14 +186,11 @@ group <- factor(y[train_idx], levels = c("Normal", "Cancer"))
   
   cat("Selected genes:", length(top_genes_fold), "\n")
 }
-```
-```{r}
+
 class(y)
 levels(y)
 table(y)
-```
 
-```{r}
 # =========================================================
 # Step 4: LODO predictions with fold-specific top genes
 # =========================================================
@@ -402,8 +387,7 @@ for (test_ds in dataset_list) {
   
   cat("Finished:", test_ds, "\n")
 }
-```
-```{r}
+
 # =========================================================
 # Step 6: Performance vs Redundancy plot
 # =========================================================
@@ -492,9 +476,7 @@ ggplot(plot_tbl, aes(x = mean_abs_cor, y = auc, label = model)) +
     x = "Mean Absolute Correlation with Other Models",
     y = "Mean FULL-DATA LODO AUC"
   )
-```
 
-```{r}
 # =========================================================
 # Step 7: Prepare meta-model training data
 # =========================================================
@@ -506,8 +488,7 @@ meta_y <- factor(lodo_pred$truth, levels = c("Normal", "Cancer"))
 
 head(meta_X)
 table(meta_y)
-```
-```{r}
+
 # =========================================================
 # Attention-based meta model using optim()
 # No torch version
@@ -719,8 +700,7 @@ ggplot(att_df, aes(x = reorder(model, attention), y = attention)) +
     x = "Base model",
     y = "Average attention weight"
   )
-```
-```{r}
+
 # =========================================================
 # Plot: Smoothed dynamic attention weights by truth
 # =========================================================
@@ -762,8 +742,7 @@ ggplot(att_long, aes(
     y = "Attention weight",
     fill = "truth"
   )
-```
-```{r}
+
 library(limma)
 library(sva)
 
@@ -919,9 +898,7 @@ if (sum(keep_genes) >= 5 && ncol(expr) >= 2) {
 } else {
   message("Skipping PCA plot: insufficient genes or samples.")
 }
-```
-# Ensemble train(base models)
-```{r}
+
 library(e1071)
 library(randomForest)
 library(glmnet)
@@ -982,9 +959,7 @@ saveRDS(fit_nb_full, "models/nb_full.rds")
 saveRDS(fit_enet_full, "models/elasticnet_full.rds")
 saveRDS(fit_svm_rbf_full, "models/svm_rbf_full.rds")
    
-```
-# Ensemble Testing(main model)
-```{r}
+
 # =========================================================
 # External test on the held-out dataset
 # =========================================================
@@ -1132,9 +1107,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
     y = "Count",
     fill = "True label"
   )
-```
-# Single best testing
-```{r}
+
 X_external <- t(expr_external[final_top_genes, , drop = FALSE])
 
 y_external <- factor(meta_external$Status, levels = c("Normal", "Cancer"))
@@ -1222,10 +1195,7 @@ ggplot(plot_df, aes(x = risk_score, fill = truth)) +
     y = "Count",
     fill = "True label"
   )
-```
 
-# BOOTSTRAP
-```{r}
 allocate_bootstrap_counts <- function(weights, total_n) {
   weight_names <- names(weights)
   weights_num <- as.numeric(weights)
@@ -1269,17 +1239,14 @@ make_bootstrap_indices <- function(dataset, y) {
   
   boot_idx
 }
-```
 
-```{r}
 set.seed(seed_from_label("bootstrap_preview", 6000L))
 boot_idx <- make_bootstrap_indices(dataset, y)
 
 table(dataset, y)
 
 table(dataset[boot_idx], y[boot_idx])
-```
-```{r}
+
 B <- 100
 
 X_external <- t(expr_external[final_top_genes, , drop = FALSE])
@@ -1371,9 +1338,7 @@ for (b in 1:B) {
   
   bootstrap_scores[, b] <- att_boot$final_score
 }
-```
 
-```{r}
 bootstrap_ci_level <- 0.80
 bootstrap_alpha <- 1 - bootstrap_ci_level
 bootstrap_ci_label <- paste0(round(bootstrap_ci_level * 100), "% bootstrap interval")
@@ -1393,8 +1358,7 @@ bootstrap_summary <- data.frame(
 )
 
 head(bootstrap_summary)
-```
-```{r}
+
 library(ggplot2)
 library(dplyr)
 
@@ -1434,8 +1398,7 @@ ggplot(plot_boot, aes(x = risk_mean, fill = truth)) +
     fill = "True label"
   )
 
-```
-```{r}
+
 # example for
 uncertain_samples <- bootstrap_summary %>%
   mutate(distance_to_05 = abs(risk_mean - 0.5)) %>%
@@ -1476,10 +1439,7 @@ ggplot(single_df, aes(x = risk)) +
     x = "Predicted cancer risk score",
     y = "Bootstrap model count"
   )
-```
 
-# Elastic Net only bootstrap uncertainty
-```{r}
 elastic_bootstrap_scores <- matrix(
   NA_real_,
   nrow = nrow(X_external),
@@ -1511,9 +1471,7 @@ for (b in 1:B) {
 
 dim(elastic_bootstrap_scores)
 head(elastic_bootstrap_scores[, 1:min(5, ncol(elastic_bootstrap_scores)), drop = FALSE])
-```
 
-```{r}
 elastic_bootstrap_summary <- data.frame(
   sample_id = rownames(elastic_bootstrap_scores),
   truth = y_external,
@@ -1529,9 +1487,7 @@ elastic_bootstrap_summary <- data.frame(
 )
 
 head(elastic_bootstrap_summary)
-```
 
-```{r}
 plot_elastic_boot <- elastic_bootstrap_summary %>%
   mutate(
     sample_order = reorder(sample_id, risk_mean),
@@ -1573,9 +1529,7 @@ ggplot(plot_elastic_boot, aes(x = risk_mean, fill = truth)) +
     y = "Density",
     fill = "True label"
   )
-```
 
-```{r}
 elastic_uncertain_samples <- elastic_bootstrap_summary %>%
   mutate(distance_to_05 = abs(risk_mean - 0.5)) %>%
   arrange(distance_to_05)
@@ -1610,13 +1564,7 @@ ggplot(elastic_single_df, aes(x = risk)) +
     x = "Predicted cancer risk score",
     y = "Bootstrap model count"
   )
-```
 
-# Uncertainty for Metrics
-
-The section below keeps the final Elastic Net model fixed and quantifies how uncertain its external-test performance metrics are under 100 class-stratified bootstrap resamples of the held-out dataset.
-
-```{r}
 make_external_metric_boot_idx <- function(y) {
   y_chr <- as.character(y)
   
@@ -1688,9 +1636,7 @@ calc_binary_metric_set <- function(truth, score, threshold = 0.5, eps = 1e-6) {
     BrierScore = mean((score - truth_num) ^ 2)
   )
 }
-```
 
-```{r}
 metric_boot_ci_level <- 0.95
 metric_boot_alpha <- 1 - metric_boot_ci_level
 metric_boot_ci_label <- paste0(round(metric_boot_ci_level * 100), "% percentile interval")
@@ -1778,9 +1724,7 @@ saveRDS(
 )
 
 message("Saved Elastic Net metric summary to: ", elastic_metric_summary_rds)
-```
 
-```{r}
 elastic_metric_boot_long <- stack(elastic_metric_boot[, metric_display_order, drop = FALSE])
 colnames(elastic_metric_boot_long) <- c("value", "metric")
 
@@ -1838,9 +1782,7 @@ ggplot(elastic_metric_boot_long, aes(x = value)) +
     x = "Metric value",
     y = "Bootstrap count"
   )
-```
 
-```{r}
 # Additional visualisation: top 5 models by mean LODO AUC
 top5_auc_lodo <- auc_tbl %>%
   arrange(desc(auc)) %>%
@@ -1882,9 +1824,7 @@ ggplot(top5_auc_lodo, aes(x = model, y = auc, fill = group)) +
     x = NULL,
     y = "Mean FULL-DATA LODO AUC"
   )
-```
 
-```{r}
 # Additional visualisation: focused bootstrap metrics
 metric_focus <- c(
   F1 = "F1 score",
@@ -1996,9 +1936,7 @@ ggplot(metric_focus_long, aes(x = value, y = metric_label, fill = metric_label))
     x = "Metric value",
     y = NULL
   )
-```
 
-```{r}
 # Additional visualisation: forest-style AUC summary across held-out datasets
 # This block only summarises the existing LODO predictions in lodo_pred.
 # It does not refit or rerun any classifier.
@@ -2114,9 +2052,7 @@ ggplot(auc_lodo_forest, aes(x = median_auc, y = display_label)) +
     x = "Discrimination (AUC) - higher is better",
     y = NULL
   )
-```
 
-```{r}
 # Additional experiment: single Elastic Net with different LIMMA top-gene counts
 library(glmnet)
 library(pROC)
@@ -2425,10 +2361,7 @@ ggplot(
     x = "Number of LIMMA-selected top genes",
     y = "Balanced accuracy"
   )
-```
 
-# Bootstrap metric uncertainty across LIMMA top-gene sets
-```{r}
 #| fig-width: 9
 #| fig-height: 5.8
 # Additional bootstrap metric uncertainty plots for Top 10/20/50/100/200 genes.
@@ -2606,12 +2539,7 @@ for (top_label_use in levels(top_gene_metric_summary$TopGenesLabel)) {
   
   print(p)
 }
-```
 
-
-## Confusion matrix (single best model: Elastic Net)
-
-```{r confusion-matrix-elastic-external}
 #| message: false
 #| warning: false
 elastic_external_pred <- factor(
@@ -2656,11 +2584,7 @@ ggplot(elastic_external_cm_df, aes(x = Predicted, y = Truth, fill = Freq)) +
     y = "True label",
     fill = "Count"
   )
-```
 
-## LODO model summary with AUC, balanced accuracy, and sensitivity
-
-```{r lodo-model-metric-summary}
 #| message: false
 #| warning: false
 library(pROC)
@@ -2700,11 +2624,7 @@ lodo_metric_tbl <- bind_rows(lapply(model_cols, function(m) {
 
 lodo_metric_tbl %>%
   arrange(desc(AUC))
-```
 
-## Coefficient formulas for Ridge, LASSO, Logistic Regression, and Elastic Net
-
-```{r coefficient-formulas-four-models}
 #| message: false
 #| warning: false
 library(glmnet)
@@ -2853,11 +2773,7 @@ for (i in seq_len(nrow(formula_tbl))) {
   )
 }
 cat("\nP(Cancer) = 1 / (1 + exp(-Y))\n")
-```
 
-## Coefficient visualisation for the four linear models
-
-```{r coefficient-visualisation-four-models}
 #| message: false
 #| warning: false
 library(dplyr)
@@ -2958,11 +2874,7 @@ ggplot(
     x = "Coefficient",
     y = "Gene"
   )
-```
 
-## Faceted boxplot for Top 10/20/50/100/200 metric uncertainty
-
-```{r top-gene-metric-facet-boxplot}
 #| message: false
 #| warning: false
 library(dplyr)
@@ -3049,15 +2961,4 @@ ggplot(
     x = "Number of top genes",
     y = "Metric value"
   )
-```
-
-
-
-
-
-
-
-
-
-
 
