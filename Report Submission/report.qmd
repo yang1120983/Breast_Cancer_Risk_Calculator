@@ -434,9 +434,19 @@ The 91.1% median predicted confidence has a mean bootstrap 95% CI width of 24.1%
 
 ## B. Shiny Application
 
-<!-- FIGURE 5 PLACEHOLDER: Shiny app screenshot — add manually -->
+![](images/clipboard-3325305555.png)
 
-**Figure 5.** Shiny application — *screenshot to be inserted manually.*
+**Figure 5.** Shiny application dashboard for breast cancer risk assessment.
+
+The Shiny application was developed to translate the trained breast cancer classification models into an interactive patient-level risk calculator (Figure 5). Users can upload gene expression datasets in CSV, TXT, or GEO txt.gz format. The application automatically identifies patient profiles, maps probe identifiers to gene symbols when required, and performs quality checks to ensure that the uploaded data contain the genes required by the prediction model.
+
+After a patient is selected, the final Elastic Net classifier generates a risk score between 0 and 1, together with a risk category and a 95% bootstrap confidence interval to indicate prediction uncertainty. For medium- and high-risk patients, a secondary multiclass model predicts the most likely molecular subtype and displays subtype probabilities, providing additional biological interpretation.
+
+To improve clinician usability and interpretability, the dashboard was designed as a simplified and interactive interface with seven functional components (Figure 5): (1) Input/Upload, (2) Patient Selection and Options, (3) Main Risk Summary, (4) Molecular Subtype Assessment, (5) Gene Expression Visualisation, (6) Gene Expression Summary Table, and (7) Clinical Use Notes. These modules guide users from data upload and quality assessment through prediction and interpretation.
+
+The dashboard also includes gene-expression visualisations that compare the selected patient with reference samples, allowing potentially abnormal biomarkers to be identified. In addition, key contributing genes and summary statistics are displayed to improve model transparency and support interpretation of prediction results.
+
+The final application was deployed through shinyapps.io, enabling interactive access across devices and allowing users to explore prediction results in real time. This deployment demonstrates how machine-learning models can be translated into a practical clinical decision-support tool.
 
 ------------------------------------------------------------------------
 
