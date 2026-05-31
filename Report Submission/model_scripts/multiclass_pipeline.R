@@ -2011,9 +2011,9 @@ if (exists("risk_df")) {
 # 
 # if (exists("boot_risk_mc") && !is.null(boot_risk_mc))
 #   saveRDS(boot_risk_mc, "models/multiclass/bootstrap_risk_scores.rds")
-# if (exists("uncertainty_df") && !is.null(uncertainty_df))
-#   saveRDS(uncertainty_df, "models/multiclass/model_disagreement.rds")
-# 
+if (exists("uncertainty_df") && !is.null(uncertainty_df))
+  saveRDS(uncertainty_df, "../RDS_Files/multiclass/model_disagreement.rds")
+
 # 
 # # ─────────────────────────────────────────────────────────────────
 # 
@@ -2076,40 +2076,40 @@ if (exists("risk_df")) {
 
 
 # ─────────────────────────────────────────────────────────────────
-
-if (grepl("ElasticNet|Lasso|Ridge", best_model_mc)) {
-  fit_final  <- readRDS("models/multiclass/fit_best_model.rds")
-  coef_list  <- coef(fit_final, s = "lambda.min")
-
-  coef_df <- bind_rows(lapply(names(coef_list), function(k) {
-    cf <- as.matrix(coef_list[[k]])
-    df <- data.frame(gene = rownames(cf), subtype = k,
-                     coef = as.numeric(cf[, 1]), stringsAsFactors = FALSE)
-    df <- df[df$gene != "(Intercept)", ]
-    if (grepl("Ridge", best_model_mc))
-      df %>% arrange(desc(abs(coef))) %>% slice_head(n = 15)
-    else df[df$coef != 0, ]
-  }))
-
-  cat("Non-zero genes per subtype:\n"); print(table(coef_df$subtype))
-  cat("Total unique genes:", length(unique(coef_df$gene)), "\n")
-
-  coef_df %>%
-    group_by(subtype) %>%
-    slice_max(abs(coef), n = 10, with_ties = FALSE) %>%
-    ungroup() %>%
-    mutate(direction = ifelse(coef > 0, "Positive", "Negative")) %>%
-    ggplot(aes(x = reorder(gene, abs(coef)), y = coef, fill = direction)) +
-    geom_col(alpha = 0.85) + coord_flip() +
-    facet_wrap(~subtype, scales = "free_y") +
-    scale_fill_manual(values = c("Positive" = "#2166AC",
-                                 "Negative" = "#D7191C")) +
-    theme_bw(base_size = 9) +
-    labs(x = NULL, y = "Coefficient", fill = NULL,
-         title = paste0("Top 10 genes per subtype — ", best_model_mc),
-         subtitle = "Positive = upregulated in this subtype vs others") +
-    theme(legend.position = "bottom")
-}
+# 
+# if (grepl("ElasticNet|Lasso|Ridge", best_model_mc)) {
+#   fit_final  <- readRDS("models/multiclass/fit_best_model.rds")
+#   coef_list  <- coef(fit_final, s = "lambda.min")
+# 
+#   coef_df <- bind_rows(lapply(names(coef_list), function(k) {
+#     cf <- as.matrix(coef_list[[k]])
+#     df <- data.frame(gene = rownames(cf), subtype = k,
+#                      coef = as.numeric(cf[, 1]), stringsAsFactors = FALSE)
+#     df <- df[df$gene != "(Intercept)", ]
+#     if (grepl("Ridge", best_model_mc))
+#       df %>% arrange(desc(abs(coef))) %>% slice_head(n = 15)
+#     else df[df$coef != 0, ]
+#   }))
+# 
+#   cat("Non-zero genes per subtype:\n"); print(table(coef_df$subtype))
+#   cat("Total unique genes:", length(unique(coef_df$gene)), "\n")
+# 
+#   coef_df %>%
+#     group_by(subtype) %>%
+#     slice_max(abs(coef), n = 10, with_ties = FALSE) %>%
+#     ungroup() %>%
+#     mutate(direction = ifelse(coef > 0, "Positive", "Negative")) %>%
+#     ggplot(aes(x = reorder(gene, abs(coef)), y = coef, fill = direction)) +
+#     geom_col(alpha = 0.85) + coord_flip() +
+#     facet_wrap(~subtype, scales = "free_y") +
+#     scale_fill_manual(values = c("Positive" = "#2166AC",
+#                                  "Negative" = "#D7191C")) +
+#     theme_bw(base_size = 9) +
+#     labs(x = NULL, y = "Coefficient", fill = NULL,
+#          title = paste0("Top 10 genes per subtype — ", best_model_mc),
+#          subtitle = "Positive = upregulated in this subtype vs others") +
+#     theme(legend.position = "bottom")
+# }
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2666,7 +2666,7 @@ sweep_summary_v2 %>%
 dir.create("../RDS_Files/multiclass", showWarnings = FALSE, recursive = TRUE)
 
 # ── LODO performance and probs ────────────────────────────────────────────────
-saveRDS(res_lodo$perf,  "../RDS_Files/multiclasslodo_perf_multiclass.rds")
+saveRDS(res_lodo$perf,  "../RDS_Files/multiclass/lodo_perf_multiclass.rds")
 saveRDS(res_lodo$probs, "../RDS_Files/multiclass/lodo_probs_multiclass.rds")
 
 # ── Scorecard and BA summary ──────────────────────────────────────────────────

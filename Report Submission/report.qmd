@@ -58,9 +58,9 @@ Beyond distinguishing malignant from normal tissue, breast cancers are biologica
 
 This project applies machine learning to gene expression data to address delays in breast cancer diagnosis. The aims are:
 
-1. To develop a binary classifier that distinguishes tumour from normal breast tissue using gene expression data.
-2. To develop a multiclass classifier that predicts PAM50 molecular subtypes, including Luminal A, Luminal B, HER2-enriched, Basal-like, and Normal-like, for patients identified as higher risk.
-3. To evaluate both models for generalisability across independent datasets and provide rapid, interpretable predictions to support clinical decision-making while awaiting definitive pathology results.
+1.  To develop a binary classifier that distinguishes tumour from normal breast tissue using gene expression data.
+2.  To develop a multiclass classifier that predicts PAM50 molecular subtypes, including Luminal A, Luminal B, HER2-enriched, Basal-like, and Normal-like, for patients identified as higher risk.
+3.  To evaluate both models for generalisability across independent datasets and provide rapid, interpretable predictions to support clinical decision-making while awaiting definitive pathology results.
 
 # Methods
 
@@ -94,10 +94,10 @@ knitr::include_graphics("images/fig_overview.png")
 
 **Metrics Used:**
 
-- **Sensitivity (recall):** the proportion of patients that the model correctly identifies.
-- **Specificity:** the proportion of patients not of that class that are correctly ruled out.
-- **Balanced accuracy:** the average sensitivity across all subtypes, giving each equal weight.
-- **AUC:** measures how well the model's probabilities rank true cases above non-cases, independent of any decision threshold.
+-   **Sensitivity (recall):** the proportion of patients that the model correctly identifies.
+-   **Specificity:** the proportion of patients not of that class that are correctly ruled out.
+-   **Balanced accuracy:** the average sensitivity across all subtypes, giving each equal weight.
+-   **AUC:** measures how well the model's probabilities rank true cases above non-cases, independent of any decision threshold.
 
 ### A.1 Binary Classifier
 
@@ -115,31 +115,21 @@ knitr::include_graphics("images/fig_overview.png")
 
 **A.2.2 Model Selection.** 19 models, including weighted variations and ensembling, were evaluated. Metrics are computed in a one-vs-rest (OvR), macro-averaged form. Model selection prioritised mean balanced accuracy as the primary criterion. AUC, while able to identify good models, was excluded as a selection criterion because it saturates under clear class separation and is uninformative for identifying the best model. Balanced accuracy directly reflects per-class recall under class imbalance and is thus more suitable. Random Forest was excluded as its non-winning class probabilities are uninformative, degrading the clinical utility of the full probability vector output. kNN was excluded since predicted probabilities are restricted to multiples of 1/k, rendering the probability vector clinically uninterpretable. The winning model will then be hyperparameter-tuned to maximise performance.
 
-**A.2.3 Output.** The classifier outputs a probability for each subtype per patient. The predicted subtype is the one with the largest probability, and that largest probability is taken as the prediction confidence. Bootstrap CIs (B = 200 training resamples, fixed hyperparameters) provide per-patient 95% probability ranges, defined as the 2.5th and 97.5th percentiles across 200 refitted predictions. Patients are assigned high- (>=0.70), moderate- (>=0.50), or low-confidence (<=0.50) bands based on prediction probability thresholds, where low-confidence cases are flagged for mandatory pathology review.
+**A.2.3 Output.** The classifier outputs a probability for each subtype per patient. The predicted subtype is the one with the largest probability, and that largest probability is taken as the prediction confidence. Bootstrap CIs (B = 200 training resamples, fixed hyperparameters) provide per-patient 95% probability ranges, defined as the 2.5th and 97.5th percentiles across 200 refitted predictions. Patients are assigned high- (\>=0.70), moderate- (\>=0.50), or low-confidence (\<=0.50) bands based on prediction probability thresholds, where low-confidence cases are flagged for mandatory pathology review.
 
 **A.2.4 Sweep for Optional Top Genes.** For multiclass, a panel-sized sweep across 5 to 50 genes per class was conducted, evaluating each panel size on balanced accuracy and high-confidence prediction percentage. High-confidence rate was included because a clinically deployed classifier must not only be accurate but also produce clinically actionable predictions. The deployed panel is determined by a single selection pass on the full batch-corrected dataset, yielding a fixed gene list independent of fold assignments. This directly informs the number of probes required for a potential NanoString assay.
 
 ## Part B -- Specific to Biomed
 
-Samples were filtered to retain primary breast tissue only, excluding non-relevant samples such as cell lines (e.g. MCF-7), blood-derived samples (e.g. PBMC), and off-target tissues (e.g. colon) using metadata keyword matching. Class labels were assigned using a custom inference pipeline to resolve inconsistent GEO annotations. The most informative metadata fields were prioritised, with regex-based parsing used to assign Cancer or Normal labels for binary datasets and PAM50 subtypes for multiclass datasets. Ambiguous samples were resolved using keyword fallback (e.g. "tumour", "normal"), and unresolved cases were excluded. The Basal-like subtype includes triple-negative breast cancer, which overlaps with Basal-like tumours by ~70-80% and is clinically treated equivalently.
+Samples were filtered to retain primary breast tissue only, excluding non-relevant samples such as cell lines (e.g. MCF-7), blood-derived samples (e.g. PBMC), and off-target tissues (e.g. colon) using metadata keyword matching. Class labels were assigned using a custom inference pipeline to resolve inconsistent GEO annotations. The most informative metadata fields were prioritised, with regex-based parsing used to assign Cancer or Normal labels for binary datasets and PAM50 subtypes for multiclass datasets. Ambiguous samples were resolved using keyword fallback (e.g. "tumour", "normal"), and unresolved cases were excluded. The Basal-like subtype includes triple-negative breast cancer, which overlaps with Basal-like tumours by \~70-80% and is clinically treated equivalently.
 
-Expression data were log2-transformed when required, identified via a 99th percentile threshold (>50). Probes were mapped to HGNC symbols and collapsed to gene-level expression using averaging (`limma::avereps`), yielding 11,488 shared genes. Within each leave-one-dataset-out fold, ComBat (`sva`) batch correction was applied only to training data to prevent test leakage [@johnson2007adjusting]. Differential expression analysis (`limma`) was then performed within each training fold, with p-values adjusted using the Benjamini--Hochberg procedure [@ritchie2015limma]. Genes were ranked by adjusted p-value and effect size, and used to define candidate gene panels for the 5-50 gene sweep in Part A, ensuring a fixed feature set independent of test folds and supporting NanoString-style assay design. Each dataset was independently quantile-normalised using `limma::normalizeBetweenArrays`.
+Expression data were log2-transformed when required, identified via a 99th percentile threshold (\>50). Probes were mapped to HGNC symbols and collapsed to gene-level expression using averaging (`limma::avereps`), yielding 11,488 shared genes. Within each leave-one-dataset-out fold, ComBat (`sva`) batch correction was applied only to training data to prevent test leakage [@johnson2007adjusting]. Differential expression analysis (`limma`) was then performed within each training fold, with p-values adjusted using the Benjamini--Hochberg procedure [@ritchie2015limma]. Genes were ranked by adjusted p-value and effect size, and used to define candidate gene panels for the 5-50 gene sweep in Part A, ensuring a fixed feature set independent of test folds and supporting NanoString-style assay design. Each dataset was independently quantile-normalised using `limma::normalizeBetweenArrays`.
 
 # Results
 
 ## Part A -- The Model
 
-### Binary Classifier
-
-**A.1.1 Binary Model Selection Performance.** Among all evaluated classifiers, Elastic Net achieved the highest overall ranking, with a mean LODO AUC of 0.9869. Based on these results, Elastic Net was selected as the final single best model for deployment in the binary risk calculator.
-
-**A.1.2 Gene Panel.** The top 50 genes were ultimately selected, achieving strong balanced accuracy (0.875) while maintaining relatively low extraction and assay costs for potential clinical deployment.
-
-**A.1.3 Lambda Optimisation.** Lambda was selected using stratified five-fold cross-validation within `cv.glmnet`. For each training set, the optimal value was defined as `lambda.min`, corresponding to the lambda that achieved the best cross-validated AUC. In the final Elastic Net model, this procedure resulted in 31 non-zero gene coefficients (excluding the intercept), indicating that the penalty retained only the most informative genes for discriminating Cancer from Normal.
-
-**A.1.4 External Testing Performance.** The selected single best model (Elastic Net) and the previously trained ensemble model were evaluated on the independent external testing dataset. The Elastic Net classifier achieved an AUC of 0.97, balanced accuracy of 0.88, sensitivity of 0.95, and specificity of 0.80. The ensemble model achieved a similar AUC of 0.97, with improved balanced accuracy (0.95) and specificity (0.97), but slightly lower sensitivity (0.93). Although the ensemble model provided a modest improvement in overall balanced performance, sensitivity was prioritised due to the clinical importance of minimising missed cancer cases. In addition, the ensemble framework introduced greater complexity and reduced interpretability. Therefore, the Elastic Net model was selected as the final deployed binary classifier.
-
-**A.1.5 Uncertainty Quantification.** Bootstrap resampling demonstrated stable predictive performance for the final Elastic Net classifier. For the selected top-50 gene panel, the bootstrap mean AUC was 0.976 (95% CI: 0.939--0.995), while balanced accuracy remained stable at 0.876 (95% CI: 0.820--0.931). Sensitivity also remained consistently high across resampling iterations, with a bootstrap mean of 0.945 (95% CI: 0.890--0.986). These results suggest that the classifier is robust to sampling variability and maintains stable cancer detection performance across bootstrap resamples.
+### A.1 Binary Classifier
 
 ```{r fig-binary}
 #| label: fig-binary
@@ -209,17 +199,17 @@ pc <- ggplot(elastic_external_cm_df, aes(x = Predicted, y = Truth, fill = Freq))
 (pa | pb) / pc + plot_layout(heights = c(1, 0.8))
 ```
 
-### Multiclass Classifier
+**A.1.1 Binary Model Selection Performance.** Among all evaluated classifiers, Elastic Net achieved the highest overall ranking, with a mean LODO AUC of 0.9869. Based on these results, Elastic Net was selected as the final single best model for deployment in the binary risk calculator.
 
-**A.2.1 Multiclass Model Performance.** The top models were penalised multinomial regression models: ElasticNet, Ridge, and Lasso. ElasticNet was selected as it combines L1 sparsity with L2 stability, performing best on balanced accuracy (0.704 vs Ridge's 0.683 and Lasso's 0.694) while maintaining competitive AUC. Non-regression approaches performed consistently worse. The stacked ensemble produced no improvement over the single best model, confirming that the additional complexity was not justified.
+**A.1.2 Gene Panel.** The top 50 genes were ultimately selected, achieving strong balanced accuracy (0.875) while maintaining relatively low extraction and assay costs for potential clinical deployment.
 
-**A.2.2 Lambda Optimisation.** Similar to binary, lambda was selected via 10-fold cross-validation in `cv.glmnet`, with alpha fixed at 0.5 after comparing Lasso (alpha = 1) and Ridge (alpha = 0). The number of non-zero coefficients (130) at `lambda.min` confirms the model retains only the most discriminative genes per subtype contrast.
+**A.1.3 Lambda Optimisation.** Lambda was selected using stratified five-fold cross-validation within `cv.glmnet`. For each training set, the optimal value was defined as `lambda.min`, corresponding to the lambda that achieved the best cross-validated AUC. In the final Elastic Net model, this procedure resulted in 31 non-zero gene coefficients (excluding the intercept), indicating that the penalty retained only the most informative genes for discriminating Cancer from Normal.
 
-**A.2.3 Gene Panel.** The panel size sweep across 5 to 50 genes per class revealed that AUC plateaued rapidly across panel sizes (approximately 0.93). In contrast, balanced accuracy and high-confidence predictions continued to improve. Thus, the top 50 genes per class were selected. The final model takes 207 unique genes as input. Inter-class overlap was extremely limited, with most subtypes sharing fewer than 10 genes, confirming largely distinct transcriptional programmes per subtype. Top-ranked genes were biologically coherent with known PAM50 biology: ERBB2 and GRB7 for HER2, ESR1 and GATA3 for the Luminal subtypes, and loss of luminal marker expression for Basal/TNBC [@slamon1987human; @perou2000molecular].
+**A.1.4 External Testing Performance.** The selected single best model (Elastic Net) and the previously trained ensemble model were evaluated on the independent external testing dataset. The Elastic Net classifier achieved an AUC of 0.97, balanced accuracy of 0.88, sensitivity of 0.95, and specificity of 0.80. The ensemble model achieved a similar AUC of 0.97, with improved balanced accuracy (0.95) and specificity (0.97), but slightly lower sensitivity (0.93). Although the ensemble model provided a modest improvement in overall balanced performance, sensitivity was prioritised due to the clinical importance of minimising missed cancer cases. In addition, the ensemble framework introduced greater complexity and reduced interpretability. Therefore, the Elastic Net model was selected as the final deployed binary classifier.
 
-**A.2.4 Per-Class Sensitivity and Specificity.** Evaluated on a stratified hold-out set, the model achieved an 88.7% bootstrap mean accuracy and a 91.1% median predicted confidence. Subtype-level performance varied: Luminal A and B sensitivity were similar, with high specificity. Basal/TNBC showed perfect specificity (1.000) but sensitivity of only 0.427, attributable in part to data imbalance. HER2 achieved the highest sensitivity (0.898), though specificity was moderate (0.687), reflecting spillover predictions into the HER2 class from mostly Basal/TNBC. This is consistent with known transcriptional overlap [@cheang2009ki67], yet it is still the main limitation of the classifier.
+**A.1.5 Uncertainty Quantification.** Bootstrap resampling demonstrated stable predictive performance for the final Elastic Net classifier. For the selected top-50 gene panel, the bootstrap mean AUC was 0.976 (95% CI: 0.939--0.995), while balanced accuracy remained stable at 0.876 (95% CI: 0.820--0.931). Sensitivity also remained consistently high across resampling iterations, with a bootstrap mean of 0.945 (95% CI: 0.890--0.986). These results suggest that the classifier is robust to sampling variability and maintains stable cancer detection performance across bootstrap resamples.
 
-**A.2.5 Uncertainty Quantification.** The 91.1% median predicted confidence has a mean bootstrap 95% CI width of 24.1%, indicating moderate uncertainty in predicted subtype probabilities. Of 256 hold-out patients, 196 (77%) received a high-confidence classification, and 22 (9%) were flagged as low-confidence for clinical review. Model disagreement analysis confirmed that incorrectly classified samples cluster at lower confidence values, validating the confidence score as a clinically meaningful signal for flagging ambiguous cases.
+### A.2 Multiclass Classifier
 
 ```{r fig-multiclass}
 #| label: fig-multiclass
@@ -235,6 +225,26 @@ best_mc    <- readRDS(file.path(mc_results, "best_model_mc_multiclass.rds"))
 preds_best <- readRDS(file.path(mc_results, "preds_best_multiclass.rds"))
 all_lvls   <- readRDS(file.path(mc_results, "all_lvls_multiclass.rds"))
 sweep_v2   <- readRDS(file.path(mc_results, "gene_sweep_correctedv4.rds"))
+uncertainty_df <- readRDS(file.path(mc_results, "model_disagreement.rds"))
+
+# ── Panel D: Confidence vs model disagreement ─────────────────────────────────
+pd_mc <- ggplot(uncertainty_df,
+       aes(x = confidence, y = disagreement, colour = correct)) +
+  geom_jitter(alpha = 0.65, size = 1.8,
+              width = 0.008, height = 0.003,
+              seed = 42) +
+  scale_colour_manual(
+    values = c("TRUE" = "#41AB5D", "FALSE" = "#D7191C"),
+    labels = c("TRUE" = "Correct", "FALSE" = "Incorrect")
+  ) +
+  theme_bw(base_size = 11) +
+  labs(title    = "(D) Confidence vs Model Disagreement",
+       subtitle = "Incorrect predictions concentrate at low confidence",
+       x        = "Ensemble confidence (max P)",
+       y        = "Model disagreement (SD of P)",
+       colour   = NULL) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
 
 # Panel A: model comparison
 mc_summary <- lodo_perf %>%
@@ -316,8 +326,38 @@ pc_mc <- ggplot(cm_mc, aes(x = pred, y = fct_rev(truth), fill = pct)) +
        subtitle = "Rows = true subtype; % = row-normalised recall",
        x = "Predicted subtype", y = "True subtype")
 
-(pa_mc | pb_mc) / pc_mc + plot_layout(heights = c(1, 1.1))
+# ── Panel D: Confidence vs model disagreement ─────────────────────────────────
+pd_mc <- ggplot(uncertainty_df,
+       aes(x = confidence, y = disagreement, colour = correct)) +
+  geom_jitter(alpha = 0.65, size = 1.8,
+              width = 0.008, height = 0.003,
+              seed = 42) +
+  scale_colour_manual(
+    values = c("TRUE" = "#41AB5D", "FALSE" = "#D7191C"),
+    labels = c("TRUE" = "Correct", "FALSE" = "Incorrect")
+  ) +
+  theme_bw(base_size = 11) +
+  labs(title    = "(D) Confidence vs Model Disagreement",
+       subtitle = "Incorrect predictions concentrate at low confidence",
+       x        = "Ensemble confidence (max P)",
+       y        = "Model disagreement (SD of P)",
+       colour   = NULL) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+
+(pa_mc | pb_mc) / (pc_mc | pd_mc) + plot_layout(heights = c(1, 1.1))
+
 ```
+
+**A.2.1 Multiclass Model Performance.** The top models were penalised multinomial regression models: ElasticNet, Ridge, and Lasso. ElasticNet was selected as it combines L1 sparsity with L2 stability, performing best on balanced accuracy (0.704 vs Ridge's 0.683 and Lasso's 0.694) while maintaining competitive AUC. Non-regression approaches performed consistently worse. The stacked ensemble produced no improvement over the single best model, confirming that the additional complexity was not justified.
+
+**A.2.2 Lambda Optimisation.** Similar to binary, lambda was selected via 10-fold cross-validation in `cv.glmnet`, with alpha fixed at 0.5 after comparing Lasso (alpha = 1) and Ridge (alpha = 0). The number of non-zero coefficients (130) at `lambda.min` confirms the model retains only the most discriminative genes per subtype contrast.
+
+**A.2.3 Gene Panel.** The panel size sweep across 5 to 50 genes per class revealed that AUC plateaued rapidly across panel sizes (approximately 0.93). In contrast, balanced accuracy and high-confidence predictions continued to improve. Thus, the top 50 genes per class were selected. The final model takes 207 unique genes as input. Inter-class overlap was extremely limited, with most subtypes sharing fewer than 10 genes, confirming largely distinct transcriptional programmes per subtype. Top-ranked genes were biologically coherent with known PAM50 biology: ERBB2 and GRB7 for HER2, ESR1 and GATA3 for the Luminal subtypes, and loss of luminal marker expression for Basal/TNBC [@slamon1987human; @perou2000molecular].
+
+**A.2.4 Per-Class Sensitivity and Specificity.** Evaluated on a stratified hold-out set, the model achieved an 88.7% bootstrap mean accuracy and a 91.1% median predicted confidence. Subtype-level performance varied: Luminal A and B sensitivity were similar, with high specificity. Basal/TNBC showed perfect specificity (1.000) but sensitivity of only 0.427, attributable in part to data imbalance. HER2 achieved the highest sensitivity (0.898), though specificity was moderate (0.687), reflecting spillover predictions into the HER2 class from mostly Basal/TNBC. This is consistent with known transcriptional overlap [@cheang2009ki67], yet it is still the main limitation of the classifier.
+
+**A.2.5 Uncertainty Quantification.** The 91.1% median predicted confidence has a mean bootstrap 95% CI width of 24.1%, indicating moderate uncertainty in predicted subtype probabilities. Of 256 hold-out patients, 201 (78%) received a high-confidence classification, and 14 (5.5%) were flagged as low-confidence for clinical review. Model disagreement analysis confirmed that incorrectly classified samples cluster at lower confidence values, validating the confidence score as a clinically meaningful signal for flagging ambiguous cases.
 
 ## Part B -- The Shiny Application
 
@@ -362,12 +402,12 @@ Future work should focus on increasing representation of under-sampled subtypes,
 
 All six members identified candidate datasets from GEO and contributed to exploratory data analysis and report writing.
 
-- **Rihan Wang** developed the back-end functionality of the Shiny application, ensuring model outputs were correctly processed and served to the interface, and was responsible for transitioning and organising the presentation slides.
-- **Ant Le** built and evaluated the multiclass PAM50 subtype classification models, including model selection and performance assessment, and addressed technical and scientific questions during the group presentation.
-- **Jing Meng** led the development of the project's background and aims, ensuring the scientific motivation was clearly articulated, and delivered this content during the group presentation.
-- **Yang Chen** built and evaluated the binary cancer vs. normal classification models, including model tuning and performance benchmarking, and demonstrated the deployed Shiny application during the presentation.
-- **Zilong Li** designed and implemented the front-end interface of the Shiny application, focusing on layout, usability, and visual presentation, and demonstrated the Shiny application during the group presentation.
-- **Camila Calahorrano** led the data preprocessing pipeline, including sample filtering, label assignment, normalisation, and batch correction, and presented an overview of the modelling approach in the slides.
+-   **Rihan Wang** developed the back-end functionality of the Shiny application, ensuring model outputs were correctly processed and served to the interface, and was responsible for transitioning and organising the presentation slides.
+-   **Ant Le** built and evaluated the multiclass PAM50 subtype classification models, including model selection and performance assessment, and addressed technical and scientific questions during the group presentation.
+-   **Jing Meng** led the development of the project's background and aims, ensuring the scientific motivation was clearly articulated, and delivered this content during the group presentation.
+-   **Yang Chen** built and evaluated the binary cancer vs. normal classification models, including model tuning and performance benchmarking, and demonstrated the deployed Shiny application during the presentation.
+-   **Zilong Li** designed and implemented the front-end interface of the Shiny application, focusing on layout, usability, and visual presentation, and demonstrated the Shiny application during the group presentation.
+-   **Camila Calahorrano** led the data preprocessing pipeline, including sample filtering, label assignment, normalisation, and batch correction, and presented an overview of the modelling approach in the slides.
 
 # References {.unnumbered}
 
@@ -492,4 +532,3 @@ For the deployed ElasticNet, the single lambda chosen by cross-validation on the
 ### B.7 High-Confidence Rate as a Tuning Objective
 
 The high-confidence rate was used as a selection objective alongside balanced accuracy during the panel sweep because a deployed classifier must produce not just accurate but actionable calls. Two configurations can reach the same balanced accuracy while differing greatly in how decisively they predict: one may leave most patients hovering near the decision boundary, the other may place the same predictions confidently above the actionable threshold. The latter is clinically more useful, since it sends fewer ambiguous cases to mandatory review. Tracking the percentage of patients exceeding the high-confidence threshold makes this distinction an explicit selection criterion rather than letting it go unmeasured.
-
