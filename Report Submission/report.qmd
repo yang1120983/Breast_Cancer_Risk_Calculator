@@ -139,7 +139,7 @@ Expression data were log2-transformed when required, identified via a 99th perce
 
 **A.1.4 External Testing Performance.** The selected single best model (Elastic Net) and the previously trained ensemble model were evaluated on the independent external testing dataset. The Elastic Net classifier achieved an AUC of 0.97, balanced accuracy of 0.88, sensitivity of 0.95, and specificity of 0.80. The ensemble model achieved a similar AUC of 0.97, with improved balanced accuracy (0.95) and specificity (0.97), but slightly lower sensitivity (0.93). Although the ensemble model provided a modest improvement in overall balanced performance, sensitivity was prioritised due to the clinical importance of minimising missed cancer cases. In addition, the ensemble framework introduced greater complexity and reduced interpretability. Therefore, the Elastic Net model was selected as the final deployed binary classifier.
 
-**A.1.5 Uncertainty Quantification.** Bootstrap resampling demonstrated stable predictive performance for the final Elastic Net classifier. For the selected top-50 gene panel, the bootstrap mean AUC was 0.976 (95% CI: 0.939--0.995), while balanced accuracy remained stable at 0.876 (95% CI: 0.820--0.931). Sensitivity also remained consistently high across resampling iterations, with a bootstrap mean of 0.945 (95% CI: 0.890--0.986). These results suggest that the classifier is robust to sampling variability and maintains stable cancer detection performance across bootstrap resamples.
+**A.1.5 Uncertainty Quantification.** Bootstrap resampling demonstrated stable predictive performance for the final Elastic Net classifier. For the selected top-50 gene panel, the bootstrap mean AUC was 0.976 (95% CI: 0.939--0.995), while balanced accuracy remained stable at 0.83 (95% CI: 0.780--0.871). Sensitivity also remained consistently high across resampling iterations, with a bootstrap mean of 0.945 (95% CI: 0.890--0.986). These results suggest that the classifier is robust to sampling variability and maintains stable cancer detection performance across bootstrap resamples.
 
 ```{r fig-binary}
 #| label: fig-binary
@@ -427,7 +427,15 @@ if (!is.null(elastic_metric_summary)) {
 
 ### A.1 Ensemble Model Workflow
 
+
+
 Base models were first evaluated according to both predictive performance (mean AUC) and pairwise prediction correlation. Three models with relatively strong performance and low inter-model correlation were selected as ensemble candidates to maximise model diversity: Naive Bayes, SVM, and Elastic Net. Predicted probabilities from the selected base models were then used as input to an attention-based meta-model, which learned dynamic sample-specific weighting across models during prediction. Despite higher specificity (0.97 vs. 0.80), the ensemble was not deployed because it reduced sensitivity (0.93 vs. 0.95) and interpretability.
+```{r}
+#| echo: false
+#| out-width: "100%"
+
+knitr::include_graphics("images/Ensemble_workflow.png")
+```
 
 ## Appendix B -- Multiclass Model: Per-class Performance
 
