@@ -1,0 +1,527 @@
+/* ============================================================
+   EDIT Data Governance Report — Custom Stylesheet
+   For use with Quarto HTML output (embed-resources: TRUE)
+   Usage: add `css: edit_report.css` under format > html
+   ============================================================ */
+
+/* ── Fonts ──────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Colour tokens ──────────────────────────────────────── */
+:root {
+  --edit-navy:      #1B2A4A;
+  --edit-blue:      #2E5FA3;
+  --edit-blue-mid:  #4A7DC4;
+  --edit-blue-light:#EBF1FA;
+  --edit-teal:      #1D7874;
+  --edit-teal-light:#E6F4F3;
+  --edit-amber:     #B45309;
+  --edit-amber-light:#FEF3C7;
+  --edit-red:       #991B1B;
+  --edit-red-light: #FEE2E2;
+  --edit-gray-50:   #F8F9FA;
+  --edit-gray-100:  #F1F3F5;
+  --edit-gray-200:  #E9ECEF;
+  --edit-gray-400:  #9CA3AF;
+  --edit-gray-600:  #4B5563;
+  --edit-gray-800:  #1F2937;
+  --edit-border:    #D1D5DB;
+  --edit-radius:    6px;
+  --edit-shadow:    0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+}
+
+/* ── Base ───────────────────────────────────────────────── */
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--edit-gray-800);
+  background: #ffffff;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Page layout — let Quarto's grid handle sidebar/content split ── */
+
+/* ── Title block ─────────────────────────────────────────── */
+#title-block-header {
+  background: var(--edit-navy);
+  color: #ffffff;
+  padding: 3rem 2.5rem 2.5rem;
+  margin: 0 0 3rem 0;
+  border-bottom: 4px solid var(--edit-blue);
+  border-radius: var(--edit-radius);
+}
+
+#title-block-header .title {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin-bottom: 0.5rem;
+}
+
+#title-block-header .subtitle {
+  font-size: 1.05rem;
+  color: #C8D8F0;           /* was rgba(255,255,255,0.75) — now a solid light blue */
+  font-weight: 400;
+  margin-bottom: 1.25rem;
+}
+
+#title-block-header .author,
+#title-block-header .date {
+  font-size: 0.875rem;
+  color: #B8CCE8;
+}
+
+/* Override link colour inside title block so author names don't go blue */
+#title-block-header a,
+#title-block-header .author a {
+  color: #B8CCE8 !important;
+  border-bottom: none;
+}
+
+/* Abstract block on the cover */
+#title-block-header .abstract,
+.abstract {
+  margin-top: 1.5rem;
+  padding: 1.25rem 1.5rem;
+  background: rgba(255,255,255,0.08);
+  border-left: 3px solid var(--edit-blue-mid);
+  border-radius: 0 var(--edit-radius) var(--edit-radius) 0;
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: #D8E8F8;
+}
+
+#title-block-header .abstract-title,
+.abstract-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8AADD4;
+  margin-bottom: 0.5rem;
+}
+
+#title-block-header .abstract p,
+.abstract p {
+  margin: 0;
+  color: #D8E8F8;
+}
+
+#title-block-header .quarto-title-meta {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid rgba(255,255,255,0.35);
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+#title-block-header .quarto-title-meta-heading {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8AADD4;
+  margin-bottom: 0.35rem;
+}
+
+#title-block-header .quarto-title-meta-contents {
+  font-size: 0.875rem;
+  color: #E8F0FA;
+}
+
+/* Each author on its own line in the meta block */
+#title-block-header .quarto-title-meta-contents p {
+  margin: 0 0 0.15rem 0;
+  color: #E8F0FA;
+}
+
+/* Affiliation text slightly dimmer than name */
+#title-block-header .quarto-title-author-orcid,
+#title-block-header .quarto-title-affiliation {
+  font-size: 0.8rem;
+  color: #8AADD4;
+}
+
+/* ── Headings ────────────────────────────────────────────── */
+h1, h2, h3, h4 {
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  color: var(--edit-navy);
+  letter-spacing: -0.015em;
+  line-height: 1.3;
+}
+
+h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin-top: 2.5rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 2px solid var(--edit-blue);
+}
+
+h2 {
+  font-size: 1.3rem;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  padding-left: 0.75rem;
+  border-left: 3px solid var(--edit-blue-mid);
+}
+
+h3 {
+  font-size: 1.05rem;
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  color: var(--edit-blue);
+}
+
+h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--edit-gray-600);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 1.25rem;
+  margin-bottom: 0.4rem;
+}
+
+/* ── Paragraphs and text ─────────────────────────────────── */
+p {
+  margin-bottom: 1rem;
+  color: var(--edit-gray-800);
+}
+
+strong {
+  font-weight: 600;
+  color: var(--edit-navy);
+}
+
+/* ── Links ───────────────────────────────────────────────── */
+a {
+  color: var(--edit-blue);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease;
+}
+
+a:hover {
+  border-bottom-color: var(--edit-blue);
+}
+
+/* ── Code blocks ─────────────────────────────────────────── */
+pre, code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  font-size: 0.82rem;
+}
+
+pre {
+  background: var(--edit-gray-50);
+  border: 1px solid var(--edit-border);
+  border-left: 3px solid var(--edit-blue-mid);
+  border-radius: var(--edit-radius);
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  line-height: 1.6;
+  margin: 1.25rem 0;
+  box-shadow: var(--edit-shadow);
+}
+
+/* SQL chunks get a teal left border */
+div.sourceCode pre {
+  border-left-color: var(--edit-teal);
+  background: #F0FAF9;
+}
+
+/* R chunks get a blue left border */
+div.sourceCode[data-lang="r"] pre,
+div.sourceCode[data-lang="R"] pre {
+  border-left-color: var(--edit-blue);
+  background: var(--edit-blue-light);
+}
+
+code {
+  background: var(--edit-gray-100);
+  border: 1px solid var(--edit-border);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  font-size: 0.83em;
+  color: var(--edit-teal);
+}
+
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* ── Tables ──────────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin: 1.5rem 0;
+  box-shadow: var(--edit-shadow);
+  border-radius: var(--edit-radius);
+  overflow: hidden;
+}
+
+thead {
+  background: var(--edit-navy);
+  color: #ffffff;
+}
+
+thead th {
+  padding: 0.75rem 1rem;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+tbody tr {
+  border-bottom: 1px solid var(--edit-gray-200);
+  transition: background 0.1s ease;
+}
+
+tbody tr:last-child {
+  border-bottom: none;
+}
+
+tbody tr:hover {
+  background: var(--edit-blue-light);
+}
+
+tbody td {
+  padding: 0.65rem 1rem;
+  vertical-align: top;
+}
+
+tbody tr:nth-child(even) {
+  background: var(--edit-gray-50);
+}
+
+tbody tr:nth-child(even):hover {
+  background: var(--edit-blue-light);
+}
+
+/* ── Callout / blockquote ────────────────────────────────── */
+blockquote {
+  background: var(--edit-blue-light);
+  border-left: 4px solid var(--edit-blue);
+  border-radius: 0 var(--edit-radius) var(--edit-radius) 0;
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+  color: var(--edit-navy);
+  font-size: 0.95rem;
+}
+
+blockquote p {
+  margin: 0;
+  color: var(--edit-navy);
+}
+
+/* ── Lists ───────────────────────────────────────────────── */
+ul, ol {
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+li {
+  margin-bottom: 0.35rem;
+  line-height: 1.65;
+}
+
+ul li::marker {
+  color: var(--edit-blue-mid);
+}
+
+ol li::marker {
+  color: var(--edit-blue-mid);
+  font-weight: 600;
+}
+
+/* ── Figures and captions ────────────────────────────────── */
+figure {
+  margin: 2rem 0;
+  text-align: center;
+}
+
+figure img {
+  max-width: 100%;
+  border: 1px solid var(--edit-border);
+  border-radius: var(--edit-radius);
+  box-shadow: var(--edit-shadow);
+}
+
+figcaption,
+.figure-caption {
+  font-size: 0.85rem;
+  color: var(--edit-gray-600);
+  margin-top: 0.6rem;
+  font-style: italic;
+  text-align: center;
+}
+
+/* ── Appendix ────────────────────────────────────────────── */
+#appendix h2,
+section[id^="appendix"] h2 {
+  font-size: 1.15rem;
+  color: var(--edit-gray-600);
+  border-left-color: var(--edit-gray-400);
+}
+
+/* ── Table of contents ───────────────────────────────────── */
+
+/* Quarto renders toc-location:left into .sidebar-navigation — style it here */
+.sidebar-navigation,
+#TOC,
+nav#TOC {
+  background: var(--edit-gray-50);
+  border: 1px solid var(--edit-border);
+  border-left: none;
+  border-right: 3px solid var(--edit-blue);
+  border-radius: 0 var(--edit-radius) var(--edit-radius) 0;
+  padding: 1.25rem 1.5rem;
+  font-size: 0.875rem;
+}
+
+/* Let Quarto's own grid handle the sidebar/content split */
+
+/* Inline .toc fallback (non-fixed contexts) */
+.toc {
+  background: var(--edit-gray-50);
+  border: 1px solid var(--edit-border);
+  border-left: 3px solid var(--edit-blue);
+  border-radius: var(--edit-radius);
+  padding: 1.25rem 1.5rem;
+  font-size: 0.875rem;
+  margin-bottom: 2rem;
+}
+
+#TOC::before,
+nav#TOC::before {
+  content: "Contents";
+  display: block;
+  font-weight: 700;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--edit-navy);
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--edit-border);
+}
+
+#TOC ul,
+.toc ul,
+nav#TOC ul {
+  padding-left: 1.1rem;
+  margin: 0;
+}
+
+#TOC li,
+.toc li,
+nav#TOC li {
+  margin-bottom: 0.3rem;
+  line-height: 1.4;
+}
+
+#TOC a,
+.toc a,
+nav#TOC a {
+  color: var(--edit-gray-600);
+  border: none;
+  font-size: 0.85rem;
+}
+
+#TOC a:hover,
+.toc a:hover,
+nav#TOC a:hover {
+  color: var(--edit-blue);
+}
+
+/* Top-level TOC entries slightly bolder */
+nav#TOC > ul > li > a,
+#TOC > ul > li > a {
+  font-weight: 500;
+  color: var(--edit-navy);
+}
+
+/* Indent nested entries */
+nav#TOC ul ul,
+#TOC ul ul {
+  padding-left: 1rem;
+  margin-top: 0.2rem;
+}
+
+/* ── Horizontal rule ─────────────────────────────────────── */
+hr {
+  border: none;
+  border-top: 1px solid var(--edit-gray-200);
+  margin: 2.5rem 0;
+}
+
+/* ── References section ──────────────────────────────────── */
+#refs {
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+#refs .csl-entry {
+  margin-bottom: 0.75rem;
+  padding-left: 1.5rem;
+  text-indent: -1.5rem;
+}
+
+/* ── Print ───────────────────────────────────────────────── */
+@media print {
+  #title-block-header {
+    background: var(--edit-navy) !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  a {
+    color: var(--edit-navy);
+    border: none;
+  }
+
+  a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.75em;
+    color: var(--edit-gray-400);
+  }
+}
+
+/* ── Responsive ──────────────────────────────────────────── */
+@media (max-width: 768px) {
+  body { font-size: 14px; }
+
+  #title-block-header {
+    padding: 2rem 1.25rem;
+    margin: 0 0 2rem 0;
+  }
+
+  #title-block-header .title { font-size: 1.5rem; }
+
+  #title-block-header .quarto-title-meta {
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  table { font-size: 0.8rem; }
+  thead th, tbody td { padding: 0.5rem 0.75rem; }
+}
