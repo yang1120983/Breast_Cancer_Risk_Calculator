@@ -1,0 +1,803 @@
+---
+title: "Corrected Interdisciplinary Project"
+format: html
+editor: visual
+---
+
+```{r}
+# Load libraries
+library(GEOquery)
+library(Biobase)
+library(caret)
+library(janitor)
+library(survival)
+library(data.table)
+library(glmnet)
+library(matrixStats)
+library(randomForest)
+library(pbapply)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(sva)
+library(devtools)
+library(limma)
+library(ggplot2)
+library(e1071)
+library(pheatmap)
+
+set.seed(3888)
+```
+
+## Helper Functions
+
+```{r}
+ALLOWED_PLATFORMS<-c("GPL96","GPL570")
+# =========================================================
+# DATASET-SPECIFIC OVERRIDES
+# =========================================================
+DATASET_OVERRIDES <- list(
+
+  GSE10810 = list(
+    label_col     = "characteristics_ch1.6",
+    normal_val_rx = ":\\s*s\\s*$",
+    cancer_val_rx = ":\\s*t\\s*$"
+  ),
+
+  GSE15852 = list(
+    label_col     = "source_name_ch1",
+    normal_val_rx = "^normal breast tissue$",
+    cancer_val_rx = "^breast tumor tissue$"
+  ),
+
+  GSE25066 = list(
+  label_col     = "characteristics_ch1.20",
+  normal_val_rx = "pam50_class:\\s*normal",
+  cancer_val_rx = "pam50_class:\\s*(basal|luma|lumb|her2)"
+  # no subtype storage
+),
+
+  GSE29044 = list(
+    force_platform    = "GPL570",
+    exclude_tissue_rx = "whole blood",
+    label_col         = "type:ch1",
+    normal_val_rx     = "^normal$",
+    cancer_val_rx     = "^(idc|dcis)$"
+  ),
+
+  GSE29431 = list(
+    label_col     = "characteristics_ch1",
+    normal_val_rx = "disease state: none",
+    cancer_val_rx = "disease state: tumor"
+  ),
+
+  GSE42568 = list(
+    label_col     = "characteristics_ch1",
+    normal_val_rx = "tissue: normal breast",
+    cancer_val_rx = "tissue: breast cancer"
+  ),
+
+  GSE45827 = list(
+    label_col     = "characteristics_ch1",
+    normal_val_rx = "diagnosis:\\s*none|none \\(normal\\)",
+    cancer_val_rx = "diagnosis:\\s*breast cancer"
+  ),
+
+  GSE54002 = list(
+    label_col     = "characteristics_ch1",
+    normal_val_rx = "non-tumor",
+    cancer_val_rx = "^tumor/nontumor: tumor$"
+  ),
+
+  # sample_group: Healthy → Normal
+  # sample_group: TNBC / Her2 / Luminal A / Luminal B → Cancer
+  # sample_group: CellLine → NA (dropped); skip_fallback stops keyword
+  #   search from rescuing them via "breast cancer derived cell line" text
+  GSE65194 = list(
+    skip_global_cell_filter = TRUE,
+    skip_fallback_for_na    = TRUE,
+    label_col               = "characteristics_ch1",
+    normal_val_rx           = "sample_group:\\s*healthy",
+    cancer_val_rx           = "sample_group:\\s*(tnbc|her2|luminal)"
+  ),
+
+  GSE7904 = list(
+    exclude_title_rx = "^normal organelle",
+    normal_title_rx  = "^normal breast",
+    cancer_title_rx  = "^(basal|brca1|non-blc)"
+  )
+)
+
+# =========================================================
+# GEO LOADER — with force_platform support
+# =========================================================
+load_geo_eset <- function(gse_id) {
+
+  cache_dir <- file.path("data", "geo-cache")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+  ovr <- DATASET_OVERRIDES[[gse_id]]
+
+  g <- tryCatch(
+    GEOquery::getGEO(gse_id, destdir = cache_dir, GSEMatrix = TRUE),
+    error = function(e) e
+  )
+  if (inherits(g, "error")) {
+    f <- file.path(cache_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+    if (!file.exists(f)) stop("Missing GEO file: ", gse_id)
+    g <- GEOquery::getGEO(filename = f)
+  }
+
+  if (inherits(g, "ExpressionSet")) return(g)
+
+  if (is.list(g)) {
+    plats <- sapply(g, annotation)
+    message(gse_id, ": found platforms: ", paste(plats, collapse = ", "))
+
+    if (!is.null(ovr$force_platform)) {
+      idx <- which(plats == ovr$force_platform)
+      if (length(idx) == 0)
+        stop(gse_id, ": forced platform ", ovr$force_platform,
+             " not found. Available: ", paste(plats, collapse = ", "))
+      message(gse_id, ": selected forced platform ", ovr$force_platform)
+      return(g[[idx[1]]])
+    }
+
+    idx <- which(plats %in% ALLOWED_PLATFORMS)
+    if (length(idx) == 0) stop(gse_id, ": no allowed platform found")
+    return(g[[idx[1]]])
+  }
+
+  stop("Failed to load ExpressionSet for ", gse_id)
+}
+
+# =========================================================
+# REMOVE DUPLICATE SAMPLES
+# =========================================================
+remove_duplicates <- function(eset, gse_id) {
+  dups <- duplicated(sampleNames(eset))
+  if (any(dups)) {
+    message(gse_id, ": removing ", sum(dups), " duplicate GSM IDs")
+    eset <- eset[, !dups]
+  }
+  eset
+}
+
+# =========================================================
+# FILTER NON-BIOLOGICAL SAMPLES
+# =========================================================
+filter_samples <- function(eset, gse_id) {
+
+  pd  <- pData(eset)
+  ovr <- DATASET_OVERRIDES[[gse_id]]
+
+  make_text <- function(cols) {
+    if (length(cols) == 0) return(rep("", nrow(pd)))
+    apply(pd[, cols, drop = FALSE], 1, function(x)
+      tolower(paste(as.character(x), collapse = " "))
+    )
+  }
+
+  full_text <- make_text(colnames(pd))
+
+  # ---- Cell lines ----
+  cell_rx <- paste0(
+    "(\\bcell line\\b|\\bmcf-?7\\b|\\bmcf10a\\b|\\bmcf12a\\b|",
+    "t47d|bt474|skbr3|hek293|hela|\\batcc\\b|",
+    "\\borganoid\\b|zr-75|184b5|bt-?549|\\bbt20\\b|",
+    "mda-mb-|hs 578t)"
+  )
+  if (!is.null(ovr$skip_global_cell_filter) && ovr$skip_global_cell_filter) {
+    is_cell <- rep(FALSE, nrow(pd))
+    message(gse_id, ": skipping global cell-line filter (handled via label_col)")
+  } else {
+    is_cell <- grepl(cell_rx, full_text, perl = TRUE)
+  }
+
+  # ---- Blood ----
+  blood_rx <- "(\\bpbmc\\b|\\bserum\\b|\\bplasma\\b|lymphocyte|buffy coat|peripheral blood)"
+  is_blood <- grepl(blood_rx, full_text, perl = TRUE)
+
+  # ---- Off-target tissues ----
+  bad_rx <- "(fibroblast|\\bneuron\\b|hepatocyte|\\bcolon\\b|\\bovarian\\b|\\bprostate\\b)"
+  is_bad <- grepl(bad_rx, full_text, perl = TRUE)
+
+  # ---- Dataset-specific: tissue column exclusion ----
+  is_tissue_bad <- rep(FALSE, nrow(pd))
+  if (!is.null(ovr$exclude_tissue_rx)) {
+    tissue_cols <- grep("tissue", colnames(pd), ignore.case = TRUE, value = TRUE)
+    if (length(tissue_cols) > 0) {
+      tissue_text   <- make_text(tissue_cols)
+      is_tissue_bad <- grepl(ovr$exclude_tissue_rx, tissue_text, perl = TRUE)
+    }
+  }
+
+  # ---- Dataset-specific: title exclusion ----
+  is_title_bad <- rep(FALSE, nrow(pd))
+  if (!is.null(ovr$exclude_title_rx) && "title" %in% colnames(pd)) {
+    is_title_bad <- grepl(ovr$exclude_title_rx,
+                          tolower(as.character(pd[["title"]])), perl = TRUE)
+  }
+
+  keep <- !(is_cell | is_blood | is_bad | is_tissue_bad | is_title_bad)
+
+  message(gse_id,
+          " | removed: cell=",      sum(is_cell),
+          " blood=",                sum(is_blood),
+          " off-target=",           sum(is_bad),
+          " tissue-specific=",      sum(is_tissue_bad),
+          " title-specific=",       sum(is_title_bad),
+          " | kept=",               sum(keep))
+
+  eset[, keep]
+}
+
+# =========================================================
+# LOG TRANSFORM
+# =========================================================
+check_and_log_transform <- function(eset) {
+  e     <- exprs(eset)
+  e_fin <- e[is.finite(e)]
+  if (length(e_fin) == 0) return(eset)
+  if (quantile(e_fin, 0.99) > 50) {
+    message("  log2 transform applied")
+    e[e <= 0] <- NA
+    e[is.na(e)] <- min(e, na.rm = TRUE) / 2
+    exprs(eset) <- log2(e)
+  }
+  eset
+}
+
+# =========================================================
+# PROBE → GENE COLLAPSE
+# =========================================================
+collapse_to_genes <- function(eset) {
+  e   <- exprs(eset)
+  fd  <- fData(eset)
+
+  sym_col <- grep("gene.?symbol|^symbol$", colnames(fd),
+                  ignore.case = TRUE, value = TRUE)[1]
+  genes <- if (!is.na(sym_col)) fd[[sym_col]] else rownames(e)
+
+  genes <- sapply(genes, function(x) {
+    if (is.na(x) || trimws(as.character(x)) %in% c("", "---"))
+      return(NA_character_)
+    strsplit(as.character(x), " /// ", fixed = TRUE)[[1]][1]
+  })
+  empty         <- is.na(genes) | trimws(genes) == ""
+  genes[empty]  <- rownames(e)[empty]
+
+  e_g <- limma::avereps(e, ID = genes)
+  list(eMat_g = e_g, pMat = pData(eset))
+}
+
+# =========================================================
+# LABEL INFERENCE
+# =========================================================
+infer_binary_label <- function(pMat, gse_id = "") {
+
+  ovr <- DATASET_OVERRIDES[[gse_id]]
+  n   <- nrow(pMat)
+  label <- rep(NA_character_, n)
+
+  # ---- Override: direct column-value matching ----
+  if (!is.null(ovr$label_col)) {
+    col <- ovr$label_col
+    if (col %in% colnames(pMat)) {
+      vals      <- tolower(trimws(as.character(pMat[[col]])))
+      is_normal <- grepl(ovr$normal_val_rx, vals, perl = TRUE)
+      is_cancer <- if (!is.null(ovr$cancer_val_rx))
+        grepl(ovr$cancer_val_rx, vals, perl = TRUE) else rep(FALSE, n)
+
+      label[is_normal & !is_cancer] <- "Normal"
+      label[is_cancer]              <- "Cancer"
+
+      message(gse_id, ": label_col '", col,
+              "' → Normal=", sum(label == "Normal", na.rm = TRUE),
+              " Cancer=",    sum(label == "Cancer", na.rm = TRUE),
+              " NA=",        sum(is.na(label)),
+              " (NA rows unassigned and dropped)")
+    } else {
+      warning(gse_id, ": label_col '", col, "' not found in pData")
+    }
+  }
+
+  # ---- Override: title matching (GSE7904) ----
+  if (!is.null(ovr$normal_title_rx) && "title" %in% colnames(pMat)) {
+    titles      <- tolower(as.character(pMat[["title"]]))
+    is_normal_t <- grepl(ovr$normal_title_rx, titles, perl = TRUE)
+    is_cancer_t <- grepl(ovr$cancer_title_rx, titles, perl = TRUE)
+    label[is_normal_t & is.na(label)] <- "Normal"
+    label[is_cancer_t & is.na(label)] <- "Cancer"
+    message(gse_id, ": title matching → Normal=",
+            sum(label == "Normal", na.rm = TRUE),
+            " Cancer=", sum(label == "Cancer", na.rm = TRUE))
+  }
+
+  # ---- Standard keyword fallback (skipped when skip_fallback_for_na = TRUE) ----
+  skip_fallback <- !is.null(ovr$skip_fallback_for_na) && ovr$skip_fallback_for_na
+  still_na      <- is.na(label)
+
+  if (any(still_na) && !skip_fallback) {
+    normal_rx <- paste0(
+      "(\\bnormal\\b|\\bhealthy\\b|\\bcontrol\\b|",
+      "adjacent.?normal|reduction mammoplasty|",
+      "non[- ]tumo[ur]+|nontumou?r|\\bbenign\\b)"
+    )
+    cancer_rx <- paste0(
+      "(\\bcancer\\b|\\btumou?r\\b|carcinoma|\\bmalignant\\b|",
+      "\\binvasive\\b|\\bductal\\b|\\blobular\\b|",
+      "\\bher2\\b|\\bluminal\\b|\\bbasal\\b|\\bIDC\\b|\\bILC\\b)"
+    )
+    pri_cols <- grep(
+      "characteristics|source_name|title|tissue|disease|type|group",
+      colnames(pMat), ignore.case = TRUE, value = TRUE
+    )
+    na_rows  <- which(still_na)
+    pri_sub  <- apply(pMat[na_rows, pri_cols, drop = FALSE], 1,
+                      function(x) tolower(paste(as.character(x), collapse = " ")))
+    full_sub <- apply(pMat[na_rows, , drop = FALSE], 1,
+                      function(x) tolower(paste(as.character(x), collapse = " ")))
+
+    has_n <- grepl(normal_rx, pri_sub,  perl = TRUE)
+    has_c <- grepl(cancer_rx, pri_sub,  perl = TRUE) |
+             grepl(cancer_rx, full_sub, perl = TRUE)
+
+    label[na_rows[has_n & !has_c]] <- "Normal"
+    label[na_rows[has_c]]          <- "Cancer"
+    message(gse_id, ": fallback resolved ",
+            sum(!is.na(label[na_rows])), " of ", length(na_rows), " NA rows")
+
+  } else if (any(still_na) && skip_fallback) {
+    message(gse_id, ": fallback SKIPPED — ",
+            sum(still_na), " NA rows will be dropped")
+  }
+
+  label <- factor(label, levels = c("Cancer", "Normal"))
+  message("\n", gse_id, " LABEL SUMMARY:")
+  print(table(label, useNA = "always"))
+
+  list(label = label, method = "column_targeted_v9")
+}
+
+# =========================================================
+# EXTRACT CLEAN SUBTYPE (strips "pam50_class: " prefix)
+# =========================================================
+extract_subtype <- function(pMat, ovr) {
+  col <- ovr$subtype_col
+  if (is.null(col) || !(col %in% colnames(pMat)))
+    return(rep(NA_character_, nrow(pMat)))
+
+  raw    <- tolower(trimws(as.character(pMat[[col]])))
+  prefix <- ovr$subtype_val_prefix
+
+  if (!is.null(prefix)) {
+    # Strip the prefix (e.g. "pam50_class: ") to get clean value
+    cleaned <- sub(prefix, "", raw, ignore.case = TRUE, perl = TRUE)
+  } else {
+    cleaned <- raw
+  }
+
+  # Capitalise first letter for readability
+  paste0(toupper(substr(cleaned, 1, 1)), substr(cleaned, 2, nchar(cleaned)))
+}
+
+# =========================================================
+# CLASS VALIDATION
+# =========================================================
+validate_classes <- function(label, min_per_class = 5) {
+  tab     <- table(label, useNA = "no")
+  has_both   <- all(c("Cancer", "Normal") %in% names(tab))
+  sufficient <- has_both && all(tab[c("Cancer", "Normal")] >= min_per_class)
+  sufficient
+}
+
+# =========================================================
+# FULL PIPELINE
+# =========================================================
+process_gse <- function(id) {
+
+  message("\n====================")
+  message("Processing ", id)
+  message("====================")
+
+  ovr  <- DATASET_OVERRIDES[[id]]
+  eset <- load_geo_eset(id)
+  eset <- remove_duplicates(eset, id)
+  eset <- filter_samples(eset, id)
+
+  if (ncol(eset) < 10) stop(id, ": too few samples after filtering")
+
+  eset <- check_and_log_transform(eset)
+  cc   <- collapse_to_genes(eset)
+  lab  <- infer_binary_label(cc$pMat, id)
+
+  meta         <- cc$pMat
+  meta$Status  <- as.character(lab$label)
+  meta$dataset <- id
+  meta$sample_id <- rownames(meta)
+
+  
+
+  # ---- Drop NA-labelled samples ----
+  keep <- !is.na(meta$Status)
+
+  # ---- Validate two classes present (skip for all-cancer datasets) ----
+  is_all_cancer <- !is.null(ovr$label_col) &&
+    all(meta$Status[keep] == "Cancer", na.rm = TRUE) &&
+    sum(meta$Status[keep] == "Normal", na.rm = TRUE) == 0
+
+  if (is_all_cancer) {
+    message(id, ": single-class Cancer dataset retained by design")
+  } else {
+    if (!validate_classes(lab$label))
+      stop(id, ": failed class validation")
+  }
+
+  list(
+    id   = id,
+    expr = cc$eMat_g[, keep, drop = FALSE],
+    meta = meta[keep, ]
+  )
+}
+
+# =========================================================
+# DIAGNOSIS HELPER
+# =========================================================
+diagnose_gse <- function(gse_id) {
+  eset <- load_geo_eset(gse_id)
+  pd   <- pData(eset)
+  pri  <- grep("characteristics|source_name|title|tissue|type|group|status",
+               colnames(pd), ignore.case = TRUE, value = TRUE)
+
+  message("\n--- DIAGNOSIS: ", gse_id, " (n=", ncol(eset), " samples) ---")
+  message("Priority columns: ", paste(pri, collapse = ", "))
+
+  for (col in pri) {
+    tab <- sort(table(as.character(pd[[col]]), useNA = "ifany"), decreasing = TRUE)
+    tab <- tab[nchar(names(tab)) > 0 & names(tab) != "NA"]
+    if (length(tab) == 0) next
+    message("\n  [", col, "]  (", length(tab), " unique values)")
+    top <- head(tab, 20)
+    message(paste0("    ", formatC(as.integer(top), width = 4),
+                   "  ", names(top), collapse = "\n"))
+  }
+}
+
+group_cols <- c(
+  "Cancer" = "#1B9E77",
+  "Normal" = "#7570B3"
+)
+
+plot_boxplot <- function(expr, meta, title) {
+
+  df <- as.data.frame(expr)
+  df$gene <- rownames(df)
+
+  long <- df %>%
+    pivot_longer(-gene, names_to = "sample", values_to = "value") %>%
+    left_join(meta, by = c("sample" = "sample_id"))
+
+  n_samples <- length(unique(long$sample))
+
+  # 🔥 dynamic width (thicker for large datasets)
+  box_width <- if (n_samples > 200) 1 else 0.5
+
+  ggplot(long, aes(x = sample, y = value, fill = Status)) +
+    geom_boxplot(outlier.size = 0.2, width = box_width) +
+    scale_fill_manual(values = group_cols) +
+    theme_classic() +
+    theme(
+      axis.text.x = element_blank(),   # 🔥 hide labels (critical for large N)
+      axis.ticks.x = element_blank()
+    ) +
+    labs(title = paste0(title, " (n=", n_samples, ")"),
+         x = "Samples", y = "Expression")
+}
+
+plot_pca <- function(expr, meta, title) {
+
+  # remove zero variance genes
+  expr <- expr[apply(expr, 1, var, na.rm = TRUE) > 0, ]
+
+  # safety check
+  if (nrow(expr) < 5 || ncol(expr) < 2) {
+    message("Skipping PCA (insufficient data): ", title)
+    return(NULL)
+  }
+
+  pca <- prcomp(t(expr), scale. = TRUE)
+
+  # 🔥 variance explained
+  var_exp <- (pca$sdev^2) / sum(pca$sdev^2)
+  pc1_lab <- paste0("PC1 (", round(var_exp[1] * 100, 1), "%)")
+  pc2_lab <- paste0("PC2 (", round(var_exp[2] * 100, 1), "%)")
+
+  df <- as.data.frame(pca$x)
+  df$sample <- rownames(df)
+
+  df <- dplyr::left_join(df, meta, by = c("sample" = "sample_id"))
+
+  ggplot(df, aes(PC1, PC2, color = Status)) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = group_cols) +
+    theme_classic(base_size = 16) +
+    theme(
+      plot.title = element_text(face = "bold", size = 18)
+    ) +
+    labs(
+      title = title,
+      x = pc1_lab,
+      y = pc2_lab
+    )
+}
+
+quantile_normalise <- function(expr) {
+  limma::normalizeBetweenArrays(expr, method = "quantile")
+}
+
+run_limma <- function(expr, meta) {
+
+  group  <- factor(meta$Status, levels = c("Normal", "Cancer"))
+  design <- model.matrix(~ group)
+
+  aw  <- limma::arrayWeights(expr, design)
+  fit <- limma::lmFit(expr, design, weights = aw)
+
+  use_trend <- ncol(expr) >= 40
+  fit <- limma::eBayes(fit, trend = use_trend, robust = TRUE)
+
+  # Raw p-values only — correct for QC histograms
+  return(fit$p.value[, "groupCancer"])
+}
+
+plot_pval_hist <- function(pvals, title) {
+
+  df <- data.frame(pval = pvals)
+
+  ggplot(df, aes(x = pval)) +
+    geom_histogram(bins = 50, fill = "#4DAF4A", color = "black") +
+    theme_classic(base_size = 14) +
+    labs(
+      title = title,
+      x = "p-value",
+      y = "Frequency"
+    )
+}
+# =========================================================
+# AUDIT
+# =========================================================
+audit_results <- function(pieces, dataset_ids, overrides) {
+
+  message("\n", strrep("=", 55))
+  message("AUDIT SUMMARY")
+  message(strrep("=", 55))
+
+  rows <- lapply(dataset_ids, function(id) {
+    p   <- pieces[[id]]
+    ovr <- overrides[[id]]
+
+    if (is.null(p)) {
+      return(data.frame(dataset  = id, status = "FAILED",
+                        n_total  = NA_integer_, n_cancer = NA_integer_,
+                        n_normal = NA_integer_,
+                        note     = "FAILED: check error messages above",
+                        stringsAsFactors = FALSE))
+    }
+
+    tab      <- table(p$meta$Status)
+    n_cancer <- as.integer(tab["Cancer"]); n_cancer[is.na(n_cancer)] <- 0L
+    n_normal <- as.integer(tab["Normal"]); n_normal[is.na(n_normal)] <- 0L
+    n_total  <- ncol(p$expr)
+
+    status <- if (n_normal == 0 && n_cancer > 0) {
+      "CANCER_ONLY_BY_DESIGN"
+    } else if (n_cancer == 0 || n_normal == 0) {
+      "SINGLE_CLASS_WARNING"
+    } else {
+      "OK"
+    }
+
+    note <- if (status == "CANCER_ONLY_BY_DESIGN") {
+      sub_tab <- if ("Subtype" %in% colnames(p$meta))
+        paste(names(table(p$meta$Subtype)),
+              table(p$meta$Subtype), sep = "=", collapse = " | ")
+      else ""
+      paste0("Tumour-only cohort. Subtypes: ", sub_tab)
+    } else {
+      paste0(n_cancer, "C / ", n_normal, "N")
+    }
+
+    data.frame(dataset = id, status = status, n_total = n_total,
+               n_cancer = n_cancer, n_normal = n_normal,
+               note = note, stringsAsFactors = FALSE)
+  })
+
+  tbl <- do.call(rbind, rows)
+  rownames(tbl) <- NULL
+  print(tbl, row.names = FALSE)
+
+  problems <- tbl[!tbl$status %in% c("OK", "CANCER_ONLY_BY_DESIGN"), ]
+  if (nrow(problems) > 0) {
+    message("\n--- ACTION REQUIRED ---")
+    for (i in seq_len(nrow(problems)))
+      message(problems$dataset[i], " [", problems$status[i], "]: ", problems$note[i])
+  } else {
+    message("\nAll datasets passed.")
+  }
+  invisible(tbl)
+}
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+dataset_ids <- c(
+  "GSE10810", "GSE29044",
+  "GSE29431", "GSE42568", "GSE45827", "GSE54002",
+  "GSE65194", "GSE7904"
+)
+
+pieces <- list()
+for (id in dataset_ids) {
+  pieces[[id]] <- tryCatch(
+    process_gse(id),
+    error = function(e) {
+      message("FAILED ", id, ": ", conditionMessage(e))
+      tryCatch(diagnose_gse(id), error = function(e2) NULL)
+      NULL
+    }
+  )
+}
+
+pieces <- Filter(Negate(is.null), pieces)
+message("\nDONE: ", length(pieces), " datasets retained")
+
+audit_tbl <- audit_results(pieces, dataset_ids, DATASET_OVERRIDES)
+
+# =========================================================
+# MERGE
+# =========================================================
+all_genes <- Reduce(intersect, lapply(pieces, function(x) rownames(x$expr)))
+cat("\nGenes shared across all datasets:", length(all_genes), "\n")
+
+pad_to_genes <- function(e, genes) {
+  miss <- setdiff(genes, rownames(e))
+  if (length(miss) > 0) {
+    pad <- matrix(NA_real_, nrow = length(miss), ncol = ncol(e),
+                  dimnames = list(miss, colnames(e)))
+    e   <- rbind(e, pad)
+  }
+  e[genes, , drop = FALSE]
+}
+
+merged_expr <- do.call(cbind, lapply(pieces, function(x)
+  pad_to_genes(x$expr, all_genes)
+))
+
+master_meta <- dplyr::bind_rows(lapply(pieces, function(x) {
+  m <- x$meta
+  data.frame(
+    sample_id = rownames(m),
+    dataset   = m$dataset,
+    Status    = m$Status,
+    Subtype   = if ("Subtype" %in% colnames(m)) m$Subtype else NA_character_,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(master_meta) <- master_meta$sample_id
+
+cat("\nMerged matrix:", nrow(merged_expr), "genes x", ncol(merged_expr), "samples\n")
+cat("\nSamples per dataset:\n")
+print(table(master_meta$dataset, master_meta$Status, useNA = "ifany"))
+
+
+
+for (id in names(pieces)) {
+
+  cat("\n\n# =============================\n")
+  cat("## ", id, "\n")
+  cat("# =============================\n")
+
+  expr <- pieces[[id]]$expr
+  meta <- pieces[[id]]$meta
+  if (id %in% c("GSE25066", "GSE54002")) {
+  options(repr.plot.width = 20, repr.plot.height = 5)
+} else {
+  options(repr.plot.width = 10, repr.plot.height = 5)
+}
+
+  # -----------------------------
+  # BEFORE NORMALISATION
+  # -----------------------------
+  # print(
+  #   plot_boxplot(expr, meta,
+  #                paste0(id, " — Boxplot (RAW)"))
+  # )
+
+  #print(
+ #   plot_pca(expr, meta,
+  #           paste0(id, " — PCA (RAW)")))
+  
+    # BEFORE normalisation
+  pvals_raw <- run_limma(expr, meta)
+  
+  print(
+    plot_pval_hist(pvals_raw,
+                   paste0(id, " — P-value distribution (RAW)"))
+  )
+
+  # -----------------------------
+  # AFTER Z-SCORE NORMALISATION
+  # -----------------------------
+   
+  expr_q <- quantile_normalise(expr)
+  
+  #print(plot_boxplot(expr_q, meta,
+   #            paste0(id, " — Boxplot (Quantile normalised)")))
+  
+#  print(plot_pca(expr_q, meta,
+ #          paste0(id, " — PCA (Quantile normalised)")))
+    # AFTER quantile normalisation
+  expr_q <- quantile_normalise(expr)
+  
+  pvals_q <- run_limma(expr_q, meta)
+  
+  print(
+    plot_pval_hist(pvals_q,
+                   paste0(id, " — P-value distribution (Quantile)"))
+  )
+}
+```
+```{r}
+# =========================================================
+# SAVE QUANTILE-NORMALISED DATASETS
+# =========================================================
+
+dir.create("data/normalised", recursive = TRUE, showWarnings = FALSE)
+
+normalised_pieces <- list()
+
+for (id in names(pieces)) {
+  
+  expr_q <- quantile_normalise(pieces[[id]]$expr)
+  meta   <- pieces[[id]]$meta
+  
+  normalised_pieces[[id]] <- list(
+    id   = id,
+    expr = expr_q,
+    meta = meta
+  )
+  
+  # Save individually so each dataset can be loaded without loading all
+  saveRDS(
+    normalised_pieces[[id]],
+    file = file.path("data/normalised", paste0(id, "_normalised.rds")),
+    , compress = "xz"
+  )
+  
+  message("Saved: ", id, 
+          " | genes=", nrow(expr_q), 
+          " | samples=", ncol(expr_q),
+          " | Cancer=", sum(meta$Status == "Cancer"),
+          " | Normal=", sum(meta$Status == "Normal"))
+}
+
+# Also save the merged normalised matrix + master meta together
+merged_expr_q <- do.call(cbind, lapply(normalised_pieces, function(x)
+  pad_to_genes(x$expr, all_genes)
+))
+
+saveRDS(
+  list(
+    expr        = merged_expr_q,
+    meta        = master_meta,
+    all_genes   = all_genes,
+    dataset_ids = names(normalised_pieces)
+  ),
+  file = "data/normalised/merged_normalised.rds",
+  , compress = "xz"
+)
+
+message("\nAll saved. Merged matrix: ", 
+        nrow(merged_expr_q), " genes x ", ncol(merged_expr_q), " samples")
+```
