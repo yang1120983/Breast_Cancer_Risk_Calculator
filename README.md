@@ -9,9 +9,6 @@ This repository contains the main analysis, modelling workflows, report material
 
 ## Repository Structure
 
-### EDA
-
-- `EDA.qmd` contains the initial exploratory data analysis (EDA) for the project.
 
 ### Main Work
 
