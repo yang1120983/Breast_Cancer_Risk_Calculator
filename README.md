@@ -43,9 +43,6 @@ This repository contains the main analysis, modelling workflows, report material
 
 ## 仓库结构
 
-### EDA
-
-- `EDA.qmd` 包含项目最初的探索性数据分析（EDA）部分。
 
 ### Main Work
 
